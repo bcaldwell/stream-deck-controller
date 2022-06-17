@@ -1,0 +1,17 @@
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task: build
+
+  run:
+    cmds:
+      - cargo run
+    silent: true
+
+
+  build:
+    cmds:
+      - cargo build
+    silent: true
