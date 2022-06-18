@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use huehue::models::device_type::DeviceType;
-use huehue::Hue;
+use huehue::{Hue, Light};
 use std::collections::HashMap;
 use std::env;
 use std::time::Duration;
@@ -13,6 +13,12 @@ use crate::integrations::integration;
 enum Actions {
     #[serde(rename = "toggle")]
     Toggle {
+        light: Option<String>,
+        room: Option<String>,
+        brightness: Option<f32>,
+    },
+    #[serde(rename = "set")]
+    Set {
         light: Option<String>,
         room: Option<String>,
         brightness: Option<f32>,
@@ -82,23 +88,44 @@ impl Integration {
     async fn toggle_light_action(&self, light_name: String, brightness: Option<f32>) -> Result<()> {
         let mut light = self.get_light_by_name(&light_name).await?;
         // turn light off if it is on, otherwise turn it on then set the brightness
-        // setting brightness first results in: device (light) is "soft off", command (.dimming.brightness) may not have effect
         if light.on {
             return Ok(light.switch(false).await?);
         }
 
-        light.switch(true).await?;
-        if let Some(b) = brightness {
-            println!("setting brightness: {}", b);
-            light.dimm(b).await?;
+        return self.set_light(light, brightness).await;
+    }
+
+    async fn set_light_action(&self, light_name: String, brightness: Option<f32>) -> Result<()> {
+        let light = self.get_light_by_name(&light_name).await?;
+
+        return self.set_light(light, brightness).await;
+    }
+
+    async fn set_light(&self, mut light: Light, brightness_option: Option<f32>) -> Result<()> {
+        // when brightness is none, just turn on the light
+        // otherwise check if it is 0, and turn off the light
+        // otherwise, turn on the light, then set the brightness
+        // setting brightness first results in: device (light) is "soft off", command (.dimming.brightness) may not have effect
+        let brightness = match brightness_option {
+            Some(b) => b,
+            None => return Ok(light.switch(false).await?),
+        };
+
+        if brightness == 0.0 {
+            return Ok(light.switch(false).await?);
         }
+
+        light.switch(true).await?;
+        light.dimm(brightness).await?;
 
         Ok(())
     }
 
-    async fn toggle_room_action(&self, room_name: String) -> Result<()> {
-        let mut light = self.get_light_by_name(&room_name).await?;
-        Ok(light.switch(!light.on).await?)
+    async fn toggle_room_action(&self, _room_name: String) -> Result<()> {
+        Ok(())
+    }
+    async fn set_room_action(&self, _room_name: String) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -122,6 +149,20 @@ impl integration::Integration for Integration {
                 }
                 if let Some(room_name) = room {
                     return Ok(self.toggle_room_action(room_name).await?);
+                }
+
+                return Err(anyhow!("Either light or room options must be set"));
+            }
+            Actions::Set {
+                light,
+                room,
+                brightness,
+            } => {
+                if let Some(light_name) = light {
+                    return Ok(self.set_light_action(light_name, brightness).await?);
+                }
+                if let Some(room_name) = room {
+                    return Ok(self.set_room_action(room_name).await?);
                 }
 
                 return Err(anyhow!("Either light or room options must be set"));
