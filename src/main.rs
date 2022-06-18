@@ -2,8 +2,8 @@ use crate::integrations::integration::{self, Integration};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::task::JoinHandle;
 use warp::ws::WebSocket;
 use warp::{http, Filter};
 
@@ -15,21 +15,10 @@ const ACTION_SPLIT_CHARS: [char; 2] = [':', ':'];
 
 #[tokio::main]
 async fn main() {
-    let (tx, mut rx) = mpsc::channel::<Actions>(32);
+    let (integration_manager, integration_manager_tx) = IntegrationManager::new().await;
+    let manager_handle = start_integration_manager(integration_manager);
 
-    let integration_manager = IntegrationManager::new().await;
-
-    let manager = tokio::spawn(async move {
-        // Start receiving messages
-        while let Some(actions) = rx.recv().await {
-            match integration_manager.execute_actions(actions).await {
-                Ok(_) => (),
-                Err(e) => println!("err: {}", e),
-            };
-        }
-    });
-
-    let event_processor = warp::any().map(move || tx.clone());
+    let event_processor = warp::any().map(move || integration_manager_tx.clone());
 
     // GET /v1/ws -> websocket upgrade
     let ws_endpoint = warp::path("ws")
@@ -58,7 +47,7 @@ async fn main() {
     let routes = index_endpoint.or(v1_endpoint);
 
     warp::serve(routes).run(([127, 0, 0, 1], 8000)).await;
-    manager.await.unwrap();
+    manager_handle.await.unwrap();
 }
 
 async fn handle_execute_action(
@@ -78,7 +67,7 @@ async fn user_connected(ws: WebSocket, event_processor: mpsc::Sender<Actions>) {
     // eprintln!("new chat user: {}", my_id);
 
     // Split the socket into a sender and receive of messages.
-    let (mut tx, mut rx) = ws.split();
+    let (mut _tx, mut rx) = ws.split();
 
     // Use an unbounded channel to handle buffering and flushing of messages
     // to the websocket...
@@ -129,20 +118,26 @@ async fn user_disconnected(my_id: usize) {
 
 struct IntegrationManager {
     integrations: HashMap<String, Box<dyn Integration + Send + Sync>>,
+    // tx: Sender<Actions>,
+    rx: Receiver<Actions>,
 }
 
 impl IntegrationManager {
-    async fn new() -> IntegrationManager {
+    async fn new() -> (IntegrationManager, Sender<Actions>) {
         let hue_integration = integrations::hue::Integration::new().await;
+        let (tx, rx) = mpsc::channel::<Actions>(32);
 
         let mut manager = IntegrationManager {
             integrations: HashMap::new(),
+            // tx: tx.clone(),
+            rx: rx,
         };
+
         manager
             .integrations
             .insert("hue".to_string(), Box::new(hue_integration));
 
-        return manager;
+        return (manager, tx);
     }
 
     async fn execute_actions(&self, actions: Actions) -> Result<()> {
@@ -178,4 +173,16 @@ impl IntegrationManager {
 
         Ok(())
     }
+}
+
+fn start_integration_manager(mut integration_manager: IntegrationManager) -> JoinHandle<()> {
+    return tokio::spawn(async move {
+        // Start receiving messages
+        while let Some(actions) = integration_manager.rx.recv().await {
+            match integration_manager.execute_actions(actions).await {
+                Ok(_) => (),
+                Err(e) => println!("err: {}", e),
+            };
+        }
+    });
 }

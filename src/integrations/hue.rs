@@ -15,6 +15,7 @@ enum Actions {
     Toggle {
         light: Option<String>,
         room: Option<String>,
+        brightness: Option<f32>,
     },
 }
 
@@ -35,6 +36,13 @@ impl Integration {
         )
         .await
         .expect("Failed to run bridge information.");
+        // let hue = Hue::new_with_key(
+        //     bridges.first().unwrap().address,
+        //     device_type,
+        //     env::var("HUE_USERNAME").unwrap(),
+        // )
+        // .await
+        // .expect("Failed to run bridge information.");
 
         let mut hue_integration = Integration {
             hue: hue,
@@ -71,9 +79,21 @@ impl Integration {
         Ok(self.hue.lights_by_id(id).await?)
     }
 
-    async fn toggle_light_action(&self, light_name: String) -> Result<()> {
+    async fn toggle_light_action(&self, light_name: String, brightness: Option<f32>) -> Result<()> {
         let mut light = self.get_light_by_name(&light_name).await?;
-        Ok(light.switch(!light.on).await?)
+        // turn light off if it is on, otherwise turn it on then set the brightness
+        // setting brightness first results in: device (light) is "soft off", command (.dimming.brightness) may not have effect
+        if light.on {
+            return Ok(light.switch(false).await?);
+        }
+
+        light.switch(true).await?;
+        if let Some(b) = brightness {
+            println!("setting brightness: {}", b);
+            light.dimm(b).await?;
+        }
+
+        Ok(())
     }
 
     async fn toggle_room_action(&self, room_name: String) -> Result<()> {
@@ -92,9 +112,13 @@ impl integration::Integration for Integration {
         let options: Actions = serde_json::from_value(json_options).unwrap();
 
         match options {
-            Actions::Toggle { light, room } => {
+            Actions::Toggle {
+                light,
+                room,
+                brightness,
+            } => {
                 if let Some(light_name) = light {
-                    return Ok(self.toggle_light_action(light_name).await?);
+                    return Ok(self.toggle_light_action(light_name, brightness).await?);
                 }
                 if let Some(room_name) = room {
                     return Ok(self.toggle_room_action(room_name).await?);
