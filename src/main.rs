@@ -1,179 +1,181 @@
+use crate::integrations::integration::{self, Integration};
 use anyhow::{anyhow, Result};
-use huehue::models::device_type::DeviceType;
-use huehue::Hue;
+use futures_util::StreamExt;
 use std::collections::HashMap;
-use std::env;
-use std::time::Duration;
-use tokio::runtime::Builder;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use ws::{listen, Handler, Request, Response, Sender};
+use warp::ws::WebSocket;
+use warp::{http, Filter};
 
-// use std::error::Error;
+mod integrations;
 
-// type BoxResult<T> = Result<T, Box<Error>>;
+type Actions = Vec<integration::Action>;
 
-trait Integration {
-    fn name(&self) -> &str;
-    fn actions(&self) -> Vec<&str>;
-    fn execute_action(&self, action: String);
+const ACTION_SPLIT_CHARS: [char; 2] = [':', ':'];
 
-    // fn resync(&self);
-}
-
-struct HueIntegration {
-    hue: Hue,
-    light_name_to_id: HashMap<String, String>,
-}
-
-impl HueIntegration {
-    async fn new() -> HueIntegration {
-        let bridges = Hue::bridges(Duration::from_secs(5)).await;
-        let device_type = DeviceType::new("benjamin".to_owned(), "streamdeck".to_owned()).unwrap();
-
-        let hue = Hue::new_with_key(
-            bridges.first().unwrap().address,
-            device_type,
-            env::var("HUE_USERNAME").unwrap(),
-        )
-        .await
-        .expect("Failed to run bridge information.");
-
-        println!(
-            "Connected to hue bridge at {}",
-            bridges.first().unwrap().address,
-        );
-
-        let mut hue_integration = HueIntegration {
-            hue: hue,
-            light_name_to_id: HashMap::new(),
-        };
-
-        hue_integration.sync().await;
-
-        return hue_integration;
-    }
-
-    async fn sync(&mut self) {
-        let lights = self.hue.lights().await.unwrap();
-        self.light_name_to_id.clear();
-
-        for light in lights {
-            self.light_name_to_id
-                .insert(light.name, light.id.to_string());
-        }
-    }
-
-    async fn get_light_by_name(&self, name: &str) -> Result<huehue::Light> {
-        let id = match self.light_name_to_id.get(name) {
-            Some(x) => x.to_string(),
-            None => return Err(anyhow!("Light named {} not found", name)),
-        };
-
-        Ok(self.hue.lights_by_id(id).await?)
-    }
-
-    async fn toggle_light_action(&self, light_name: String) -> Result<()> {
-        // let light_name = match options.get("light") {
-        //     Some(x) => x,
-        //     None => return Err(anyhow!("light is a required option for hue toggle action")),
-        // };
-
-        let mut light = self.get_light_by_name(&light_name).await?;
-        Ok(light.switch(!light.on).await?)
-    }
-}
-
-impl HueIntegration {
-    // fn name(&self) -> &str {
-    //     return "Hue";
-    // }
-
-    // fn actions(&self) -> Vec<&str> {
-    //     return vec!["toggle_light"];
-    // }
-
-    async fn execute_action(&self, action: Actions) -> Result<()> {
-        match action {
-            Actions::Toggle { light, room } => {
-                return Ok(self.toggle_light_action(light).await?);
-            }
-        };
-    }
-}
-
-/// Multiple different commands are multiplexed over a single channel.
-#[derive(Debug)]
-enum Actions {
-    Toggle { light: String, room: String },
-}
-
-// Server web application handler
-struct Server {
-    ws: Sender,
-    event_processor: mpsc::Sender<Actions>,
-}
-
-impl Handler for Server {
-    //
-    fn on_request(&mut self, req: &Request) -> ws::Result<Response> {
-        // Using multiple handlers is better (see router example)
-        match req.resource() {
-            // The default trait implementation
-            "/ws" => Response::from_request(req),
-            // // Create a custom response
-            // "/" => Ok(Response::new(200, "OK", INDEX_HTML.to_vec())),
-            _ => Ok(Response::new(404, "Not Found", b"404 - Not Found".to_vec())),
-        }
-    }
-
-    fn on_message(&mut self, msg: ws::Message) -> ws::Result<()> {
-        println!("Echo handler received a message: {}", msg);
-
-        let light = msg.as_text().unwrap().to_string();
-        // todo remove blocking once running in async
-        self.event_processor
-            .blocking_send(Actions::Toggle {
-                light: light,
-                room: "".to_string(),
-            })
-            .unwrap();
-        self.ws.send("accepted")
-    }
-}
-
-// #[tokio::main]
-fn main() {
+#[tokio::main]
+async fn main() {
     let (tx, mut rx) = mpsc::channel::<Actions>(32);
 
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let integration_manager = IntegrationManager::new().await;
 
-    std::thread::spawn(move || {
-        rt.block_on(async move {
-            let hue_integration = HueIntegration::new().await;
-
-            println!("{:?}", hue_integration.light_name_to_id);
-
-            let manager = tokio::spawn(async move {
-                // Start receiving messages
-                while let Some(action) = rx.recv().await {
-                    hue_integration.execute_action(action).await.unwrap();
-                }
-            });
-            manager.await.unwrap();
-        });
+    let manager = tokio::spawn(async move {
+        // Start receiving messages
+        while let Some(actions) = rx.recv().await {
+            match integration_manager.execute_actions(actions).await {
+                Ok(_) => (),
+                Err(e) => println!("err: {}", e),
+            };
+        }
     });
 
-    listen("127.0.0.1:8000", |out| Server {
-        ws: out,
-        event_processor: tx.clone(),
-    })
-    .unwrap()
+    let event_processor = warp::any().map(move || tx.clone());
 
-    // hue_integration
-    //     .execute_action(
-    //         "toggle",
-    //         HashMap::from([("light".to_string(), "Living Room Bottom".to_string())]),
-    //     )
-    //     .await
-    //     .unwrap();
+    // GET /v1/ws -> websocket upgrade
+    let ws_endpoint = warp::path("ws")
+        // The `ws()` filter will prepare Websocket handshake...
+        .and(warp::ws())
+        .and(event_processor.clone())
+        .map(|ws: warp::ws::Ws, event_processor| {
+            // This will call our function if the handshake succeeds.
+            ws.on_upgrade(move |socket| user_connected(socket, event_processor))
+        });
+
+    // POST /v1/actions/execute
+    let execute_action_endpoint = warp::post()
+        .and(warp::path("execute"))
+        .and(warp::path::end())
+        .and(warp::body::json())
+        .and(event_processor.clone())
+        .and_then(handle_execute_action);
+
+    let actions_endpoint = warp::path("actions").and(execute_action_endpoint);
+    let v1_endpoint = warp::path("v1").and(ws_endpoint.or(actions_endpoint));
+
+    // GET / -> index html
+    let index_endpoint = warp::path::end().map(|| warp::reply::reply());
+
+    let routes = index_endpoint.or(v1_endpoint);
+
+    warp::serve(routes).run(([127, 0, 0, 1], 8000)).await;
+    manager.await.unwrap();
+}
+
+async fn handle_execute_action(
+    action: Actions,
+    event_processor: mpsc::Sender<Actions>,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    println!("{:?}", action);
+
+    event_processor.send(action).await.unwrap();
+    Ok(warp::reply::with_status("accepted", http::StatusCode::OK))
+}
+
+async fn user_connected(ws: WebSocket, event_processor: mpsc::Sender<Actions>) {
+    // Use a counter to assign a new unique ID for this user.
+    // let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
+
+    // eprintln!("new chat user: {}", my_id);
+
+    // Split the socket into a sender and receive of messages.
+    let (mut tx, mut rx) = ws.split();
+
+    // Use an unbounded channel to handle buffering and flushing of messages
+    // to the websocket...
+    // let mut rx = UnboundedReceiverStream::new(rx);
+
+    // tokio::task::spawn(async move {
+    //     while let Some(message) = rx.next().await {
+    //         user_ws_tx
+    //             .send(message)
+    //             .unwrap_or_else(|e| {
+    //                 eprintln!("websocket send error: {}", e);
+    //             })
+    //             .await;
+    //     }
+    // });
+
+    // Save the sender in our list of connected users.
+    // users.write().await.insert(my_id, tx);
+
+    // Return a `Future` that is basically a state machine managing
+    // this specific user's connection.
+
+    // Every time the user sends a message, broadcast it to
+    // all other users...
+    while let Some(result) = rx.next().await {
+        let msg = match result {
+            Ok(msg) => msg,
+            Err(e) => {
+                eprintln!("websocket error(uid={}): {}", "my_id", e);
+                break;
+            }
+        };
+        println!("{:?}", msg);
+        event_processor.send(Vec::new()).await.unwrap();
+    }
+
+    // user_ws_rx stream will keep processing as long as the user stays
+    // connected. Once they disconnect, then...
+    user_disconnected(0).await;
+}
+
+async fn user_disconnected(my_id: usize) {
+    eprintln!("good bye user: {}", my_id);
+
+    // Stream closed up, so remove from the user list
+    // users.write().await.remove(&my_id);
+}
+
+struct IntegrationManager {
+    integrations: HashMap<String, Box<dyn Integration + Send + Sync>>,
+}
+
+impl IntegrationManager {
+    async fn new() -> IntegrationManager {
+        let hue_integration = integrations::hue::Integration::new().await;
+
+        let mut manager = IntegrationManager {
+            integrations: HashMap::new(),
+        };
+        manager
+            .integrations
+            .insert("hue".to_string(), Box::new(hue_integration));
+
+        return manager;
+    }
+
+    async fn execute_actions(&self, actions: Actions) -> Result<()> {
+        for action in actions {
+            let split_index = action.action.find(ACTION_SPLIT_CHARS);
+            let (integration_name, action_name) = match split_index {
+                Some(i) => (
+                    &action.action[..i],
+                    &action.action[i + ACTION_SPLIT_CHARS.len()..],
+                ),
+                None => {
+                    return Err(anyhow!(
+                        "action {} was invalid, must contain separator.",
+                        action.action
+                    ))
+                }
+            };
+
+            let mut options = action.options.clone();
+            options["action"] = serde_json::Value::String(action_name.to_string());
+            let integration_option = self.integrations.get(integration_name);
+
+            match integration_option {
+                Some(integration) => {
+                    integration
+                        .as_ref()
+                        .execute_action(action_name.to_string(), options)
+                        .await?;
+                }
+                None => return Err(anyhow!("unknown integration {}", integration_name)),
+            }
+        }
+
+        Ok(())
+    }
 }

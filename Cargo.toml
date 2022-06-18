@@ -12,4 +12,9 @@ huehue = { path = "./lib/huehue" }
 huehue = "0.4.1"
 anyhow = "1.0"
 warp = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tokio = { version = "1.19.2", features = ["full"] } 
+tokio-stream = "0.1.9"
+futures-util = "0.3.21"
+async-trait = "0.1.56"
