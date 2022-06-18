@@ -80,8 +80,10 @@ mod http;
 pub mod hue;
 pub mod light;
 pub mod models;
+pub mod room;
 
 pub use bridge::Bridge;
 pub use http::HueError;
 pub use hue::Hue;
 pub use light::Light;
+pub use room::Room;

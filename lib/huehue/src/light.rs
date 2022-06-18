@@ -6,9 +6,34 @@ use crate::{http, Hue};
 
 pub type Lights = Vec<Light>;
 
+// changes:
+// - added support for grouped light
+
+#[derive(Debug, Clone)]
+pub enum LightResource {
+	Light,
+	GroupedLight,
+}
+impl LightResource {
+	fn endpoint(&self) -> &str {
+		match self {
+			LightResource::Light => "light",
+			LightResource::GroupedLight => "grouped_light",
+		}
+	}
+	fn from_type(s: &str) -> LightResource {
+		match s {
+			"light" => LightResource::Light,
+			"grouped_light" => LightResource::GroupedLight,
+			_ => LightResource::Light,
+		}
+	}
+}
+
 #[derive(Debug, Clone)]
 pub struct Light {
 	pub hue: Hue,
+	pub resource: LightResource,
 	pub id: uuid::Uuid,
 	pub name: String,
 	pub on: bool,
@@ -22,7 +47,11 @@ impl Light {
 		Light {
 			hue: hue.clone(),
 			id: light.id,
-			name: light.metadata.name,
+			resource: LightResource::from_type(&light.r#type),
+			name: match light.metadata {
+				Some(metadata) => metadata.name.to_string(),
+				None => "".to_string(),
+			},
 			on: light.on.on,
 			brightness: light.dimming.map(|dimming| dimming.brightness),
 			color: light.color,
@@ -31,7 +60,9 @@ impl Light {
 	}
 
 	pub async fn switch(&mut self, on: bool) -> Result<(), HueError> {
-		let url = self.hue.url(format!("clip/v2/resource/light/{}", self.id).as_str());
+		let url = self
+			.hue
+			.url(format!("clip/v2/resource/{}/{}", self.resource.endpoint(), self.id).as_str());
 		let application_key = self.hue.application_key().clone().unwrap();
 		let request_payload = LightOnRequest::new(on);
 
@@ -49,7 +80,9 @@ impl Light {
 			return Err(HueError::Unsupported);
 		}
 
-		let url = self.hue.url(format!("clip/v2/resource/light/{}", self.id).as_str());
+		let url = self
+			.hue
+			.url(format!("clip/v2/resource/{}/{}", self.resource.endpoint(), self.id).as_str());
 		let application_key = self.hue.application_key().clone().unwrap();
 		let request_payload = LightSetColorRequest::new(component.clone());
 
@@ -78,7 +111,9 @@ impl Light {
 			return Err(HueError::Unsupported);
 		}
 
-		let url = self.hue.url(format!("clip/v2/resource/light/{}", self.id).as_str());
+		let url = self
+			.hue
+			.url(format!("clip/v2/resource/{}/{}", self.resource.endpoint(), self.id).as_str());
 		let application_key = self.hue.application_key().clone().unwrap();
 		let request_payload = LightSetBrightnessRequest::new(value.clone());
 

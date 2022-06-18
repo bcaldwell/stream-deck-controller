@@ -10,8 +10,13 @@ use crate::models::create_user::{CreateUserRequest, CreateUserResponse};
 use crate::models::device_type::DeviceType;
 use crate::models::devices::GetDevicesResponse;
 use crate::models::lights::GetLightsResponse;
-use crate::{discover, http, models, Bridge, Light};
+use crate::models::rooms::GetRoomsResponse;
+use crate::room::Rooms;
+use crate::{discover, http, models, Bridge, Light, Room};
 
+// changes
+// - added support to get single light
+// - added support for getting rooms and control a grouped light
 #[derive(Debug, Clone)]
 pub struct Hue {
 	bridge: Bridge,
@@ -147,20 +152,43 @@ impl Hue {
 		Err(HueError::Unknown)
 	}
 
-	pub async fn lights_by_id(&self, id: String) -> Result<Light, HueError> {
+	pub async fn light_by_id(&self, id: String) -> Result<Light, HueError> {
+		return self.light_resource_by_id("light".to_string(), id).await;
+	}
+
+	pub async fn light_group_by_id(&self, id: String) -> Result<Light, HueError> {
+		return self.light_resource_by_id("grouped_light".to_string(), id).await;
+	}
+
+	async fn light_resource_by_id(&self, resource: String, id: String) -> Result<Light, HueError> {
 		self.check_authorization()?;
-		let url = format!("clip/v2/resource/light/{}", id);
+		let url = format!("clip/v2/resource/{}/{}", resource, id);
+		println!("{}", url);
 
 		let response: GetLightsResponse = http::get_auth(self.application_key.clone().unwrap(), self.url(&url)).await?;
+		println!("{:?}", response);
 
 		if let Some(mut data) = response.data {
 			if data.len() == 0 {
 				return Err(HueError::Unknown);
 			}
 			return Ok(Light::new(self, data.remove(0)));
-			// return Ok(Light::new(self, data[0]));
-			// return Ok(data.into_iter().map(|datum| Light::new(self, datum)).collect());
-			// return Ok(lights[0]);
+		}
+		if let Some(error) = response.error {
+			return Err(HueError::from(error.r#type.clone()));
+		}
+
+		Err(HueError::Unknown)
+	}
+
+	pub async fn rooms(&self) -> Result<Rooms, HueError> {
+		self.check_authorization()?;
+
+		let response: GetRoomsResponse =
+			http::get_auth(self.application_key.clone().unwrap(), self.url("clip/v2/resource/room")).await?;
+
+		if let Some(data) = response.data {
+			return Ok(data.into_iter().map(|datum| Room::new(datum)).collect());
 		}
 		if let Some(error) = response.error {
 			return Err(HueError::from(error.r#type.clone()));

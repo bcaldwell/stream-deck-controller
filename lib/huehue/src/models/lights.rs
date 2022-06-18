@@ -10,7 +10,7 @@ pub struct On {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dimming {
 	pub brightness: f32,
-	pub min_dim_level: f32,
+	pub min_dim_level: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ pub struct GetLightsResponseItem {
 	pub r#type: String,
 
 	pub id: uuid::Uuid,
-	pub metadata: super::generic::Metadata,
+	pub metadata: Option<super::generic::Metadata>,
 	pub dimming: Option<Dimming>,
 	pub on: On,
 
