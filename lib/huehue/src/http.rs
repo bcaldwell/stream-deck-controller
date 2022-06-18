@@ -22,7 +22,15 @@ pub enum HueError {
 }
 impl Display for HueError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		return write!(f, "hue: {}", self);
+		match self {
+			HueError::Unauthorized => write!(f, "hue unauthorized"),
+			HueError::AlreadyAuthorized => write!(f, "hue is already authorized"),
+			HueError::Connection => write!(f, "hue connection error"),
+			HueError::Response(response_err) => write!(f, "hue response error: {}", response_err),
+			HueError::Unsupported => write!(f, "hue unsupported call"),
+			HueError::Unexpected => write!(f, "hue unexpected call"),
+			HueError::Unknown => write!(f, "hue unknown error"),
+		}
 	}
 }
 impl std::error::Error for HueError {}

@@ -28,6 +28,7 @@ enum Actions {
 pub struct Integration {
     hue: Hue,
     light_name_to_id: HashMap<String, String>,
+    room_name_to_light_group_id: HashMap<String, String>,
 }
 
 impl Integration {
@@ -53,14 +54,16 @@ impl Integration {
         let mut hue_integration = Integration {
             hue: hue,
             light_name_to_id: HashMap::new(),
+            room_name_to_light_group_id: HashMap::new(),
         };
 
         hue_integration.sync().await;
 
         println!(
-            "Connected to hue bridge at {}\n{:?}",
+            "Connected to hue bridge at {}\n{:?}\n{:?}",
             bridges.first().unwrap().address,
             hue_integration.light_name_to_id,
+            hue_integration.room_name_to_light_group_id,
         );
 
         return hue_integration;
@@ -74,6 +77,22 @@ impl Integration {
             self.light_name_to_id
                 .insert(light.name, light.id.to_string());
         }
+
+        let rooms = self.hue.rooms().await.unwrap();
+        self.room_name_to_light_group_id.clear();
+
+        for room in rooms {
+            // seems to be needed to avoid some move issue, idk why
+            let room_name = &room.name;
+            for service_index in 0..room.services.len() {
+                let service = &room.services[service_index];
+                if service.rtype != "grouped_light".to_string() {
+                    continue;
+                }
+                self.room_name_to_light_group_id
+                    .insert(room_name.to_string(), service.rid.to_string());
+            }
+        }
     }
 
     async fn get_light_by_name(&self, name: &str) -> Result<huehue::Light> {
@@ -82,21 +101,40 @@ impl Integration {
             None => return Err(anyhow!("Light named {} not found", name)),
         };
 
-        Ok(self.hue.lights_by_id(id).await?)
+        Ok(self.hue.light_by_id(id).await?)
+    }
+
+    async fn get_room_light_by_name(&self, name: &str) -> Result<huehue::Light> {
+        let id = match self.room_name_to_light_group_id.get(name) {
+            Some(x) => x.to_string(),
+            None => {
+                return Err(anyhow!(
+                    "Room named {} not found or didn't have any lights",
+                    name
+                ))
+            }
+        };
+
+        Ok(self.hue.light_group_by_id(id).await?)
     }
 
     async fn toggle_light_action(&self, light_name: String, brightness: Option<f32>) -> Result<()> {
-        let mut light = self.get_light_by_name(&light_name).await?;
-        // turn light off if it is on, otherwise turn it on then set the brightness
-        if light.on {
-            return Ok(light.switch(false).await?);
-        }
+        let light = self.get_light_by_name(&light_name).await?;
 
-        return self.set_light(light, brightness).await;
+        return self.toggle_light(light, brightness).await;
     }
 
     async fn set_light_action(&self, light_name: String, brightness: Option<f32>) -> Result<()> {
         let light = self.get_light_by_name(&light_name).await?;
+
+        return self.set_light(light, brightness).await;
+    }
+
+    async fn toggle_light(&self, mut light: Light, brightness: Option<f32>) -> Result<()> {
+        // turn light off if it is on, otherwise turn it on then set the brightness
+        if light.on {
+            return Ok(light.switch(false).await?);
+        }
 
         return self.set_light(light, brightness).await;
     }
@@ -121,11 +159,16 @@ impl Integration {
         Ok(())
     }
 
-    async fn toggle_room_action(&self, _room_name: String) -> Result<()> {
-        Ok(())
+    async fn toggle_room_action(&self, room_name: String, brightness: Option<f32>) -> Result<()> {
+        let light = self.get_room_light_by_name(&room_name).await?;
+
+        return self.toggle_light(light, brightness).await;
     }
-    async fn set_room_action(&self, _room_name: String) -> Result<()> {
-        Ok(())
+
+    async fn set_room_action(&self, room_name: String, brightness: Option<f32>) -> Result<()> {
+        let light = self.get_room_light_by_name(&room_name).await?;
+
+        return self.set_light(light, brightness).await;
     }
 }
 
@@ -148,7 +191,7 @@ impl integration::Integration for Integration {
                     return Ok(self.toggle_light_action(light_name, brightness).await?);
                 }
                 if let Some(room_name) = room {
-                    return Ok(self.toggle_room_action(room_name).await?);
+                    return Ok(self.toggle_room_action(room_name, brightness).await?);
                 }
 
                 return Err(anyhow!("Either light or room options must be set"));
@@ -162,7 +205,7 @@ impl integration::Integration for Integration {
                     return Ok(self.set_light_action(light_name, brightness).await?);
                 }
                 if let Some(room_name) = room {
-                    return Ok(self.set_room_action(room_name).await?);
+                    return Ok(self.set_room_action(room_name, brightness).await?);
                 }
 
                 return Err(anyhow!("Either light or room options must be set"));
