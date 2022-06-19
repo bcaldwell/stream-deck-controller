@@ -168,13 +168,11 @@ impl Gamut {
 impl Color {
 	pub fn new(xy: Component, gamut: Gamut) -> Option<Color> {
 		match gamut.contains(&xy) {
-			true => {
-				Some(Color {
-					xy,
-					gamut,
-					gamut_type: "C".to_owned(),
-				})
-			},
+			true => Some(Color {
+				xy,
+				gamut,
+				gamut_type: "C".to_owned(),
+			}),
 			false => None,
 		}
 	}

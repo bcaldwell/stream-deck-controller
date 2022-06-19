@@ -1,0 +1,25 @@
+profiles:
+- name: default
+  buttons:
+  - actions:
+    - action: hue::toggle
+      room: Office
+      brightness: 100
+  - actions:
+    - action: hue::set
+      room: Office
+      brightness: 50
+  - actions:
+    - action: hue::set
+      room: Living Room
+      brightness: 50
+  - actions:
+    - action: hue::toggle
+      room: Bedroom
+      brightness: 100
+    - action: hue::toggle
+      room: Living Room
+      brightness: 100
+    - action: hue::toggle
+      room: Office
+      brightness: 100
