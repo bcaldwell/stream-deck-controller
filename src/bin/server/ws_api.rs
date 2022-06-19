@@ -1,11 +1,11 @@
 use crate::rest_api;
 use futures_util::StreamExt;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self};
 use warp::ws::WebSocket;
 
 pub async fn ws_user_connected(
     ws: WebSocket,
-    event_processor: mpsc::Sender<rest_api::ExecuteActionReq>,
+    _event_processor: mpsc::Sender<rest_api::ExecuteActionReq>,
 ) {
     // Use a counter to assign a new unique ID for this user.
     // let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);

@@ -1,12 +1,13 @@
-use crate::integrations::integration::Integration;
 use crate::profiles::Actions;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
+use streamdeckcontroller::integrations::integration::Integration;
+use streamdeckcontroller::integrations::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
-mod integrations;
+// mod integrations;
 mod profiles;
 mod rest_api;
 mod ws_api;
