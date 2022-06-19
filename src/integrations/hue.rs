@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::integrations::integration;
 
+// mayber use #[serde(untagged)] for this?
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "action")]
 enum Actions {
@@ -37,19 +38,12 @@ impl Integration {
         let device_type = DeviceType::new("benjamin".to_owned(), "streamdeck".to_owned()).unwrap();
 
         let hue = Hue::new_with_key(
-            bridges.first().unwrap().address,
+            bridges.first().expect("getting hue bridges failed").address,
             device_type,
             env::var("HUE_USERNAME").unwrap(),
         )
         .await
         .expect("Failed to run bridge information.");
-        // let hue = Hue::new_with_key(
-        //     bridges.first().unwrap().address,
-        //     device_type,
-        //     env::var("HUE_USERNAME").unwrap(),
-        // )
-        // .await
-        // .expect("Failed to run bridge information.");
 
         let mut hue_integration = Integration {
             hue: hue,
