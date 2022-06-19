@@ -1,7 +1,8 @@
 [package]
-name = "stream-deck-controller"
+name = "streamdeckcontroller"
 version = "0.1.0"
 edition = "2021"
+default-run = "server"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -19,3 +20,4 @@ tokio = { version = "1.19.2", features = ["full"] }
 tokio-stream = "0.1.9"
 futures-util = "0.3.21"
 async-trait = "0.1.56"
+streamdeck = "0.6.2"

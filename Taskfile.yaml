@@ -5,13 +5,20 @@ tasks:
     cmds:
       - task: build
 
-  run:
+  run-server:
     cmds:
-      - cargo run
+      - cargo run --bin server
     silent: true
-
-
-  build:
+  build-server:
     cmds:
-      - cargo build
+      - cargo build --bin server
+    silent: true
+  
+  run-client:
+    cmds:
+      - cargo run --bin client
+    silent: true
+  build-client:
+    cmds:
+      - cargo build --bin client
     silent: true

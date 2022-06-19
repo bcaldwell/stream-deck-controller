@@ -13,3 +13,5 @@ Cargo.lock
 
 /target
 result
+
+node_modules
