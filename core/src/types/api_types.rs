@@ -1,3 +1,17 @@
+use tokio::sync::oneshot;
+
+#[derive(Debug)]
+pub struct ExecuteActionReq {
+    pub tx: oneshot::Sender<String>,
+    pub actions: Actions,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProfileButtonPressed {
+    pub profile: String,
+    pub button: usize,
+}
+
 pub type Profiles = Vec<Profile>;
 pub type Actions = Vec<Action>;
 
@@ -22,13 +36,3 @@ pub struct ProfileButton {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ButtonState {}
-
-pub fn get_profile_by_name(profiles: &Profiles, name: String) -> Option<&Profile> {
-    for profile in profiles {
-        if profile.name == name {
-            return Some(profile);
-        }
-    }
-
-    return None;
-}

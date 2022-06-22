@@ -18,6 +18,8 @@
             pkgs.go-task
             # needed for linker to work with tokio
             pkgs.darwin.apple_sdk.frameworks.Security
+            # needed for linker to work with streamdeck
+            pkgs.darwin.apple_sdk.frameworks.AppKit
           ];
           buildInputs = [ ];
           # Certain Rust tools won't work without this
