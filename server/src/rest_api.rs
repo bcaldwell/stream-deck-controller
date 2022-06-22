@@ -1,24 +1,13 @@
-use crate::profiles::{self, Actions};
+use crate::profiles;
 use crate::ws_api;
 use crate::Config;
 use anyhow::{anyhow, Result};
+use core::types::{Actions, ExecuteActionReq, ProfileButtonPressed, Profiles};
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
 use tokio::time;
 use warp::{http, Filter};
-
-#[derive(Debug)]
-pub struct ExecuteActionReq {
-    pub tx: oneshot::Sender<String>,
-    pub actions: Actions,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct ProfileButtonPressed {
-    profile: String,
-    button: usize,
-}
 
 pub async fn start_rest_api(
     config_ref: Arc<Config>,
@@ -27,14 +16,19 @@ pub async fn start_rest_api(
     let event_processor = warp::any().map(move || integration_manager_tx.clone());
     let with_config = warp::any().map(move || config_ref.clone());
 
+    let log = warp::log("example::api");
+
     // GET /v1/ws -> websocket upgrade
     let ws_endpoint = warp::path("ws")
         // The `ws()` filter will prepare Websocket handshake...
         .and(warp::ws())
         .and(event_processor.clone())
-        .map(|ws: warp::ws::Ws, event_processor| {
+        .and(with_config.clone())
+        .map(|ws: warp::ws::Ws, event_processor, config_ref| {
             // This will call our function if the handshake succeeds.
-            ws.on_upgrade(move |socket| ws_api::ws_user_connected(socket, event_processor))
+            ws.on_upgrade(move |socket| {
+                ws_api::ws_user_connected(socket, event_processor, config_ref)
+            })
         });
 
     // POST /v1/actions/execute
@@ -62,7 +56,7 @@ pub async fn start_rest_api(
     // GET / -> index html
     let index_endpoint = warp::path::end().map(|| warp::reply::reply());
 
-    let routes = index_endpoint.or(v1_endpoint);
+    let routes = index_endpoint.or(v1_endpoint).with(log);
 
     return warp::serve(routes).run(([127, 0, 0, 1], 8000)).await;
 }
@@ -80,7 +74,7 @@ async fn handle_execute_action(
     }
 }
 
-async fn handle_button_pressed_action(
+pub async fn handle_button_pressed_action(
     profile_button_pressed: ProfileButtonPressed,
     event_processor: mpsc::Sender<ExecuteActionReq>,
     config: Arc<Config>,
@@ -133,7 +127,7 @@ async fn execute_action_request(
 }
 
 fn get_actions_for_button_press(
-    profiles: &profiles::Profiles,
+    profiles: &Profiles,
     profile_button_pressed: ProfileButtonPressed,
 ) -> Result<&Actions> {
     let profile =

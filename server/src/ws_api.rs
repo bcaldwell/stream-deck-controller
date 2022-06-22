@@ -1,11 +1,14 @@
-use crate::rest_api;
+use crate::Config;
+use core::types::{ExecuteActionReq, ProfileButtonPressed};
 use futures_util::StreamExt;
+use std::sync::Arc;
 use tokio::sync::mpsc::{self};
 use warp::ws::WebSocket;
 
 pub async fn ws_user_connected(
     ws: WebSocket,
-    _event_processor: mpsc::Sender<rest_api::ExecuteActionReq>,
+    event_processor: mpsc::Sender<ExecuteActionReq>,
+    config: Arc<Config>,
 ) {
     // Use a counter to assign a new unique ID for this user.
     // let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
@@ -46,7 +49,18 @@ pub async fn ws_user_connected(
                 break;
             }
         };
-        println!("{:?}", msg);
+
+        if !msg.is_text() {
+            continue;
+        }
+
+        let msg_str = String::from_utf8(msg.into_bytes().to_vec()).unwrap();
+        let p: ProfileButtonPressed = serde_json::from_str(&msg_str).unwrap();
+
+        println!("{:?}", &p);
+        crate::rest_api::handle_button_pressed_action(p, event_processor.clone(), config.clone())
+            .await;
+
         // event_processor.send(Vec::new()).await.unwrap();
     }
 
@@ -54,6 +68,10 @@ pub async fn ws_user_connected(
     // connected. Once they disconnect, then...
     user_disconnected(0).await;
 }
+
+// async fn handle_msg(result: Result<Message, Error>) -> Result<()> {
+
+// }
 
 async fn user_disconnected(my_id: usize) {
     eprintln!("good bye user: {}", my_id);

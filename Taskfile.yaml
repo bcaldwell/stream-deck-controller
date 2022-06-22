@@ -1,4 +1,4 @@
-version: '3'
+version: "3"
 
 tasks:
   default:
@@ -7,18 +7,18 @@ tasks:
 
   run-server:
     cmds:
-      - cargo run --bin server
+      - cargo run -p server
     silent: true
   build-server:
     cmds:
-      - cargo build --bin server
+      - cargo build -p server
     silent: true
-  
+
   run-client:
     cmds:
-      - cargo run --bin client
+      - cargo run -p client
     silent: true
   build-client:
     cmds:
-      - cargo build --bin client
+      - cargo build -p client
     silent: true

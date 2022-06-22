@@ -1,9 +1,9 @@
-use crate::profiles::Actions;
 use anyhow::{anyhow, Result};
+use core::integrations::integration::Integration;
+use core::integrations::{self};
+use core::types::{Actions, ExecuteActionReq, Profiles};
 use std::collections::HashMap;
 use std::sync::Arc;
-use streamdeckcontroller::integrations::integration::Integration;
-use streamdeckcontroller::integrations::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
@@ -16,7 +16,7 @@ const ACTION_SPLIT_CHARS: [char; 2] = [':', ':'];
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Config {
-    profiles: profiles::Profiles,
+    profiles: Profiles,
 }
 
 #[tokio::main]
@@ -43,13 +43,13 @@ fn read_config(filepath: &str) -> Result<Config> {
 
 struct IntegrationManager {
     integrations: HashMap<String, Box<dyn Integration + Send + Sync>>,
-    rx: Receiver<rest_api::ExecuteActionReq>,
+    rx: Receiver<ExecuteActionReq>,
 }
 
 impl IntegrationManager {
-    async fn new() -> (IntegrationManager, Sender<rest_api::ExecuteActionReq>) {
+    async fn new() -> (IntegrationManager, Sender<ExecuteActionReq>) {
         let hue_integration = integrations::hue::Integration::new().await;
-        let (tx, rx) = mpsc::channel::<rest_api::ExecuteActionReq>(32);
+        let (tx, rx) = mpsc::channel::<ExecuteActionReq>(32);
 
         let mut manager = IntegrationManager {
             integrations: HashMap::new(),
