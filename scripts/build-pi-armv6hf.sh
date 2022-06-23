@@ -19,9 +19,9 @@ DEPS=( \
   "http://mirrordirector.raspbian.org/raspbian/pool/main/libu/libusb-1.0/libusb-1.0-0-dev_${LIBUSB_VER}_armhf.deb" \
   "http://mirrordirector.raspbian.org/raspbian/pool/main/s/systemd/libudev1_${LIBUDEV_VER}_armhf.deb" \
   "http://mirrordirector.raspbian.org/raspbian/pool/main/s/systemd/libudev-dev_${LIBUDEV_VER}_armhf.deb" \
-  "http://mirrordirector.raspbian.org/raspbian/pool/main/g/glibc/libc6_${LIBC_VER}_armhf.deb" \
-  "http://mirrordirector.raspbian.org/raspbian/pool/main/o/openssl/libssl1.1_${OPENSSL_VER}_armhf.deb" \
-  "http://mirrordirector.raspbian.org/raspbian/pool/main/o/openssl/libssl-dev_${OPENSSL_VER}_armhf.deb"
+  "http://mirrordirector.raspbian.org/raspbian/pool/main/g/glibc/libc6_${LIBC_VER}_armhf.deb" 
+  # "http://mirrordirector.raspbian.org/raspbian/pool/main/o/openssl/libssl1.1_${OPENSSL_VER}_armhf.deb" \
+  # "http://mirrordirector.raspbian.org/raspbian/pool/main/o/openssl/libssl-dev_${OPENSSL_VER}_armhf.deb"
 )
 
 # Collect Paths

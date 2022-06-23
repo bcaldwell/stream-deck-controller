@@ -5,6 +5,10 @@ tasks:
     cmds:
       - task: build
 
+  build:
+    cmds:
+      - cargo build
+
   run-server:
     cmds:
       - cargo run -p server

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::env;
 use std::time::Duration;
 
-use crate::integrations::integration;
+use crate::integration;
 
 // mayber use #[serde(untagged)] for this?
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
