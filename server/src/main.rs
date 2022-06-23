@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
-use core::integrations::integration::Integration;
-use core::integrations::{self};
 use core::types::{Actions, ExecuteActionReq, Profiles};
+use integrations::Integration;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};

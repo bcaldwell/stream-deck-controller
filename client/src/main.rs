@@ -1,14 +1,12 @@
+use core::types::ProfileButtonPressed;
 use rand::Rng;
 use std::{env, str::FromStr};
 use streamdeck::{Colour, Error, Filter, ImageOptions, StreamDeck};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+// use tokio::sync::mpsc::{self, Receiver, Sender};
+use futures_util::stream::StreamExt;
+use futures_util::SinkExt;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct ProfileButtonPressed {
-    profile: String,
-    button: usize,
-}
 
 #[tokio::main]
 async fn main() {
@@ -38,17 +36,32 @@ async fn main() {
         .expect("Failed to connect");
 
     deck.set_blocking(true);
-    let mut rng = rand::thread_rng();
-    for i in 0..15 {
-        let color = format!(
-            "{:02X}{:02X}{:02X}",
-            rng.gen_range(1..256),
-            rng.gen_range(1..256),
-            rng.gen_range(1..256)
-        );
-        println!("{} {}", i, color);
-        deck.set_button_rgb(i, &Colour::from_str(&color).unwrap());
-    }
+    // let mut rng = rand::thread_rng();
+    // for i in 0..15 {
+    //     let color = format!(
+    //         "{:02X}{:02X}{:02X}",
+    //         rng.gen_range(1..256),
+    //         rng.gen_range(1..256),
+    //         rng.gen_range(1..256)
+    //     );
+    //     println!("{} {}", i, color);
+    //     deck.set_button_rgb(i, &Colour::from_str(&color).unwrap());
+    // }
+
+    // let (tx, rx) = mpsc::unbounded_channel();
+
+    // tokio::spawn(listen_for_button_press(tx))
+    println!("WebSocket handshake has been successfully completed");
+
+    let (mut write, read) = ws_stream.split();
+
+    // let stdin_to_ws = stdin_rx.map(Ok).forward(write);
+    // let ws_to_stdout = {
+    //     read.for_each(|message| async {
+    //         let data = message.unwrap().into_data();
+    //         tokio::io::stdout().write_all(&data).await.unwrap();
+    //     })
+    // };
 
     loop {
         let button_state = deck.read_buttons(None).unwrap();
@@ -64,15 +77,20 @@ async fn main() {
                 button: i,
             };
 
-            let client = reqwest::blocking::Client::new();
-            let root_url =
-                env::var("STREAM_DECK_API_URL").unwrap_or("http://127.0.0.1:8000".to_string());
-            let res = client
-                .post(format!("{}/v1/profiles/button_press", root_url))
-                .json(&map)
-                .header("Content-Type", "application/json")
-                .send();
-            println!("{:?}", res);
+            write
+                .send(Message::text(serde_json::to_string(&map).unwrap()))
+                .await
+                .unwrap();
+
+            // let client = reqwest::blocking::Client::new();
+            // let root_url =
+            //     env::var("STREAM_DECK_API_URL").unwrap_or("http://127.0.0.1:8000".to_string());
+            // let res = client
+            //     .post(format!("{}/v1/profiles/button_press", root_url))
+            //     .json(&map)
+            //     .header("Content-Type", "application/json")
+            //     .send();
+            // println!("{:?}", res);
         }
 
         println!("{:?}", deck.read_buttons(None));
