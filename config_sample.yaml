@@ -22,7 +22,8 @@ profiles:
       room: Living Room
       brightness: 50
   - states:
-    - image: ./images/noun-desk-1197857.png
+    - image: ./images/background.png
+      color: 768523
     actions:
     - action: hue::toggle
       room: Bedroom
@@ -34,7 +35,7 @@ profiles:
       room: Office
       brightness: 100
   - states:
-    - image: ./images/noun-desk-1197857.png
+    - color: 768554
     actions:
     - action: hue::toggle
       room: Bedroom
@@ -46,7 +47,7 @@ profiles:
       room: Office
       brightness: 100
   - states:
-    - image: ./images/noun-desk-1197857.png
+    - color: 768423
     actions:
     - action: hue::toggle
       room: Bedroom

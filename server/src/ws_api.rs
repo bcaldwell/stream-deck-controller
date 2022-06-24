@@ -16,6 +16,7 @@ pub struct Client {
     pub profile: String,
 }
 pub type Clients = Arc<RwLock<HashMap<uuid::Uuid, Client>>>;
+type ImageCache = Arc<RwLock<HashMap<String, String>>>;
 
 pub async fn ws_client_connected(
     ws: WebSocket,
@@ -24,6 +25,7 @@ pub async fn ws_client_connected(
     clients: Clients,
 ) {
     let id = uuid::Uuid::new_v4();
+    let image_cache = ImageCache::default();
 
     clients.write().await.insert(
         id,
@@ -45,6 +47,7 @@ pub async fn ws_client_connected(
         clients.clone(),
         tx,
         profile_sync_rx,
+        image_cache,
     ));
 
     profile_sync_tx.send(()).unwrap();
@@ -107,8 +110,10 @@ async fn set_button_for_profile(
     clients: Clients,
     mut tx: SplitSink<WebSocket, Message>,
     mut profile_sync_rx: mpsc::UnboundedReceiver<()>,
+    image_cache: ImageCache,
 ) {
     while let Some(_) = profile_sync_rx.recv().await {
+        let start_time = std::time::SystemTime::now();
         let mut button_config = Vec::new();
         let profile = profiles::get_profile_by_name(
             &config.as_ref().profiles,
@@ -121,28 +126,48 @@ async fn set_button_for_profile(
 
             let image = match &button_state.image {
                 Some(image) => {
-                    let mut loaded_image = image::open(&image).unwrap();
+                    let cache_key = format!(
+                        "{}-{}",
+                        image,
+                        button_state.color.as_ref().unwrap_or(&"".to_string())
+                    );
+                    let cached_locked = image_cache.read().await;
+                    let cached_image = cached_locked.get(&cache_key);
+                    if cached_image.is_some() {
+                        let response = cached_image.unwrap().to_string();
+                        // need to force drop this so it doesn't block
+                        drop(cached_locked);
+                        Some(response)
+                    } else {
+                        drop(cached_locked);
+                        let mut loaded_image = image::open(&image).unwrap();
 
-                    // apply background if color is also set
-                    // steal this from the streamdeck library, to avoid it as a dependency for the api
-                    if let Some(color) = &button_state.color {
-                        let (r, g, b) = hex_color_components_from_str(&color).unwrap();
-                        let rgba = loaded_image.as_mut_rgba8().unwrap();
+                        // apply background if color is also set
+                        // steal this from the streamdeck library, to avoid it as a dependency for the api
+                        if let Some(color) = &button_state.color {
+                            let (r, g, b) = hex_color_components_from_str(&color).unwrap();
+                            let rgba = loaded_image.as_mut_rgba8().unwrap();
 
-                        let mut r = image::Rgba([r, g, b, 0]);
-                        for p in rgba.pixels_mut() {
-                            r.0[3] = 255 - p.0[3];
+                            let mut r = image::Rgba([r, g, b, 0]);
+                            for p in rgba.pixels_mut() {
+                                r.0[3] = 255 - p.0[3];
 
-                            p.blend(&r);
+                                p.blend(&r);
+                            }
                         }
+
+                        let mut buffered_image = std::io::BufWriter::new(Vec::new());
+                        loaded_image
+                            .write_to(&mut buffered_image, image::ImageOutputFormat::Png)
+                            .unwrap();
+
+                        let base64_encoded = base64::encode(&buffered_image.into_inner().unwrap());
+                        image_cache
+                            .write()
+                            .await
+                            .insert(cache_key, base64_encoded.to_string());
+                        Some(base64_encoded)
                     }
-
-                    let mut buffered_image = std::io::BufWriter::new(Vec::new());
-                    loaded_image
-                        .write_to(&mut buffered_image, image::ImageOutputFormat::Png)
-                        .unwrap();
-
-                    Some(base64::encode(&buffered_image.into_inner().unwrap()))
                 }
                 None => None,
             };
@@ -157,6 +182,13 @@ async fn set_button_for_profile(
             buttons: button_config,
         };
 
+        println!(
+            "time taken: {}",
+            std::time::SystemTime::now()
+                .duration_since(start_time)
+                .unwrap()
+                .as_micros()
+        );
         tx.send(Message::text(serde_json::to_string(&msg).unwrap()))
             .await
             .unwrap();
