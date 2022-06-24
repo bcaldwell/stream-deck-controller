@@ -1,19 +1,27 @@
 profiles:
 - name: default
   buttons:
-  - actions:
+  - states:
+    - color: 435465
+    actions:
     - action: hue::toggle
       room: Office
       brightness: 100
-  - actions:
+  - states:
+    - image: ./images/noun-desk-1197857.png
+    actions:
     - action: hue::set
       room: Office
       brightness: 50
-  - actions:
+  - states:
+    - image: ./images/background.jpg
+    actions:
     - action: hue::set
       room: Living Room
       brightness: 50
-  - actions:
+  - states:
+    - image: ./images/noun-desk-1197857.png
+    actions:
     - action: hue::toggle
       room: Bedroom
       brightness: 100
@@ -22,4 +30,46 @@ profiles:
       brightness: 100
     - action: hue::toggle
       room: Office
+      brightness: 100
+  - states:
+    - image: ./images/noun-desk-1197857.png
+    actions:
+    - action: hue::toggle
+      room: Bedroom
+      brightness: 100
+    - action: hue::toggle
+      room: Living Room
+      brightness: 100
+    - action: hue::toggle
+      room: Office
+      brightness: 100
+  - states:
+    - image: ./images/noun-desk-1197857.png
+    actions:
+    - action: hue::toggle
+      room: Bedroom
+      brightness: 100
+  - states:
+    - image: ./images/noun-desk-1197857.png
+    actions:
+    - action: hue::toggle
+      room: Bedroom
+      brightness: 100
+  - states:
+    - image: ./images/noun-desk-1197857.png
+    actions:
+    - action: hue::toggle
+      room: Bedroom
+      brightness: 100
+  - states:
+    - image: ./images/noun-desk-1197857.png
+    actions:
+    - action: hue::toggle
+      room: Bedroom
+      brightness: 100
+  - states:
+    - image: ./images/noun-desk-1197857.png
+    actions:
+    - action: hue::toggle
+      room: Bedroom
       brightness: 100
