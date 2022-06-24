@@ -49,8 +49,14 @@ async fn main() {
     ));
 
     let stream_deck_listener_join = tokio::spawn(start_stream_deck_listener(deck_ref, write));
-
     read.for_each(|msg| async {
+        println!(
+            "{:?}: got response",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        );
         handle_socket_message(msg.unwrap(), image_update_tx.clone(), &device).await;
     })
     .await;
@@ -217,6 +223,14 @@ async fn start_stream_deck_listener(
                     continue;
                 }
 
+                println!(
+                    "{:?}: pressed: {}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis(),
+                    i
+                );
                 let map = ProfileButtonPressed {
                     profile: None,
                     button: i,
