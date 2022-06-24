@@ -13,8 +13,10 @@ pub async fn start_rest_api(
     config_ref: Arc<Config>,
     integration_manager_tx: Sender<ExecuteActionReq>,
 ) {
+    let ws_clients = ws_api::Clients::default();
     let event_processor = warp::any().map(move || integration_manager_tx.clone());
     let with_config = warp::any().map(move || config_ref.clone());
+    let with_ws_clients = warp::any().map(move || ws_clients.clone());
 
     let log = warp::log("example::api");
 
@@ -24,10 +26,11 @@ pub async fn start_rest_api(
         .and(warp::ws())
         .and(event_processor.clone())
         .and(with_config.clone())
-        .map(|ws: warp::ws::Ws, event_processor, config_ref| {
+        .and(with_ws_clients)
+        .map(|ws: warp::ws::Ws, event_processor, config_ref, clients| {
             // This will call our function if the handshake succeeds.
             ws.on_upgrade(move |socket| {
-                ws_api::ws_user_connected(socket, event_processor, config_ref)
+                ws_api::ws_client_connected(socket, event_processor, config_ref, clients)
             })
         });
 

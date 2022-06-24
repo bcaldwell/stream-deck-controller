@@ -1,3 +1,4 @@
+use crate::types;
 use tokio::sync::oneshot;
 
 #[derive(Debug)]
@@ -30,9 +31,6 @@ pub struct Profile {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProfileButton {
-    // pub states: Vec<ButtonState>,
+    pub states: Option<Vec<types::SetButtonUI>>,
     pub actions: Actions,
 }
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct ButtonState {}
