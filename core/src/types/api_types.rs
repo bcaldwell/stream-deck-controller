@@ -5,11 +5,12 @@ use tokio::sync::oneshot;
 pub struct ExecuteActionReq {
     pub tx: oneshot::Sender<String>,
     pub actions: Actions,
+    pub requestor_uuid: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProfileButtonPressed {
-    pub profile: String,
+    pub profile: Option<String>,
     pub button: usize,
 }
 

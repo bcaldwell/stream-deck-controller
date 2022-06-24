@@ -217,9 +217,8 @@ async fn start_stream_deck_listener(
                     continue;
                 }
 
-                println!("pressed: {}", i);
                 let map = ProfileButtonPressed {
-                    profile: "default".to_string(),
+                    profile: None,
                     button: i,
                 };
 

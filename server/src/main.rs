@@ -24,10 +24,13 @@ async fn main() {
     println!("config: {:?}", config);
     let config_ref = Arc::new(config);
 
-    let (integration_manager, integration_manager_tx) = IntegrationManager::new().await;
+    let ws_clients = ws_api::Clients::default();
+
+    let (integration_manager, integration_manager_tx) =
+        IntegrationManager::new(ws_clients.clone()).await;
     let manager_handle = start_integration_manager(integration_manager);
 
-    let api_service = rest_api::start_rest_api(config_ref, integration_manager_tx);
+    let api_service = rest_api::start_rest_api(config_ref, integration_manager_tx, ws_clients);
 
     api_service.await;
     manager_handle.await.unwrap();
@@ -43,16 +46,18 @@ fn read_config(filepath: &str) -> Result<Config> {
 struct IntegrationManager {
     integrations: HashMap<String, Box<dyn Integration + Send + Sync>>,
     rx: Receiver<ExecuteActionReq>,
+    ws_clients: ws_api::Clients,
 }
 
 impl IntegrationManager {
-    async fn new() -> (IntegrationManager, Sender<ExecuteActionReq>) {
+    async fn new(ws_clients: ws_api::Clients) -> (IntegrationManager, Sender<ExecuteActionReq>) {
         let hue_integration = integrations::hue::Integration::new().await;
         let (tx, rx) = mpsc::channel::<ExecuteActionReq>(32);
 
         let mut manager = IntegrationManager {
             integrations: HashMap::new(),
             rx: rx,
+            ws_clients: ws_clients,
         };
 
         manager
@@ -62,7 +67,11 @@ impl IntegrationManager {
         return (manager, tx);
     }
 
-    async fn execute_actions(&self, actions: Actions) -> Result<()> {
+    async fn execute_actions(
+        &self,
+        requestor_uuid: Option<uuid::Uuid>,
+        actions: Actions,
+    ) -> Result<()> {
         for action in actions {
             let split_index = action.action.find(ACTION_SPLIT_CHARS);
             let (integration_name, action_name) = match split_index {
@@ -77,6 +86,33 @@ impl IntegrationManager {
                     ))
                 }
             };
+
+            if integration_name == "profile" {
+                if action_name != "set" {
+                    return Err(anyhow!(
+                        "unknown action for profile integration {}",
+                        action_name
+                    ));
+                }
+
+                let profile_value = &action
+                    .options
+                    .get("profile")
+                    .expect("invalid profile selection");
+
+                let r = match profile_value {
+                    serde_json::Value::String(profile_name) => {
+                        let u = requestor_uuid.unwrap();
+                        let mut clients = self.ws_clients.write().await;
+                        let client = clients.get_mut(&u).unwrap();
+                        client.profile = profile_name.to_string();
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                };
+
+                return r;
+            }
 
             let mut options = action.options.clone();
             options["action"] = serde_json::Value::String(action_name.to_string());
@@ -102,7 +138,10 @@ fn start_integration_manager(mut integration_manager: IntegrationManager) -> Joi
         // Start receiving messages
         while let Some(execute_actions_req) = integration_manager.rx.recv().await {
             let response = match integration_manager
-                .execute_actions(execute_actions_req.actions)
+                .execute_actions(
+                    execute_actions_req.requestor_uuid,
+                    execute_actions_req.actions,
+                )
                 .await
             {
                 Ok(_) => "success".to_string(),

@@ -12,11 +12,12 @@ use warp::{http, Filter};
 pub async fn start_rest_api(
     config_ref: Arc<Config>,
     integration_manager_tx: Sender<ExecuteActionReq>,
+    ws_clients: ws_api::Clients,
 ) {
-    let ws_clients = ws_api::Clients::default();
     let event_processor = warp::any().map(move || integration_manager_tx.clone());
     let with_config = warp::any().map(move || config_ref.clone());
     let with_ws_clients = warp::any().map(move || ws_clients.clone());
+    let with_none = warp::any().map(move || None);
 
     let log = warp::log("example::api");
 
@@ -40,6 +41,7 @@ pub async fn start_rest_api(
         .and(warp::path::end())
         .and(warp::body::json())
         .and(event_processor.clone())
+        .and(with_none)
         .and_then(handle_execute_action);
 
     // POST /v1/profiles/button_press
@@ -49,6 +51,7 @@ pub async fn start_rest_api(
         .and(warp::body::json())
         .and(event_processor.clone())
         .and(with_config)
+        .and(with_none)
         .and_then(handle_button_pressed_action);
 
     let actions_endpoint = warp::path("actions").and(execute_action_endpoint);
@@ -67,8 +70,9 @@ pub async fn start_rest_api(
 async fn handle_execute_action(
     actions: Actions,
     event_processor: Sender<ExecuteActionReq>,
+    requestor_uuid: Option<uuid::Uuid>,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    match execute_action_request(actions.to_owned(), event_processor).await {
+    match execute_action_request(actions.to_owned(), event_processor, requestor_uuid).await {
         Ok(r) => Ok(warp::reply::with_status(r, http::StatusCode::OK)),
         Err(e) => Ok(warp::reply::with_status(
             e.to_string(),
@@ -81,6 +85,7 @@ pub async fn handle_button_pressed_action(
     profile_button_pressed: ProfileButtonPressed,
     event_processor: mpsc::Sender<ExecuteActionReq>,
     config: Arc<Config>,
+    requestor_uuid: Option<uuid::Uuid>,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     println!("{:?}", profile_button_pressed);
 
@@ -94,7 +99,7 @@ pub async fn handle_button_pressed_action(
         }
     };
 
-    match execute_action_request(actions.to_owned(), event_processor).await {
+    match execute_action_request(actions.to_owned(), event_processor, requestor_uuid).await {
         Ok(r) => Ok(warp::reply::with_status(r, http::StatusCode::OK)),
         Err(e) => Ok(warp::reply::with_status(
             e.to_string(),
@@ -106,6 +111,7 @@ pub async fn handle_button_pressed_action(
 async fn execute_action_request(
     actions: Actions,
     event_processor: mpsc::Sender<ExecuteActionReq>,
+    requestor_uuid: Option<uuid::Uuid>,
 ) -> Result<String> {
     println!("{:?}", actions);
     let (resp_tx, resp_rx) = oneshot::channel::<String>();
@@ -113,6 +119,7 @@ async fn execute_action_request(
     let execute_action_req = ExecuteActionReq {
         actions: actions,
         tx: resp_tx,
+        requestor_uuid: requestor_uuid,
     };
 
     event_processor.send(execute_action_req).await.unwrap();
@@ -133,16 +140,11 @@ fn get_actions_for_button_press(
     profiles: &Profiles,
     profile_button_pressed: ProfileButtonPressed,
 ) -> Result<&Actions> {
-    let profile =
-        match profiles::get_profile_by_name(profiles, profile_button_pressed.profile.clone()) {
-            Some(profile) => profile,
-            None => {
-                return Err(anyhow!(
-                    "profile {} not found",
-                    profile_button_pressed.profile.to_string()
-                ))
-            }
-        };
+    let profile = profile_button_pressed.profile.unwrap();
+    let profile = match profiles::get_profile_by_name(profiles, profile.clone()) {
+        Some(profile) => profile,
+        None => return Err(anyhow!("profile {} not found", profile.to_string())),
+    };
 
     let button = match profile.buttons.get(profile_button_pressed.button) {
         Some(button) => button,
