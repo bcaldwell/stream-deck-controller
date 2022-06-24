@@ -8,13 +8,15 @@ profiles:
       room: Office
       brightness: 100
   - states:
-    - image: ./images/noun-desk-1197857.png
+    - image: ./images/background.png
+      color: 768743
     actions:
     - action: hue::set
       room: Office
       brightness: 50
   - states:
-    - image: ./images/background.jpg
+    - image: ./images/background.png
+      color: 768523
     actions:
     - action: hue::set
       room: Living Room
@@ -50,26 +52,14 @@ profiles:
       room: Bedroom
       brightness: 100
   - states:
-    - image: ./images/noun-desk-1197857.png
+    - color: 235478
     actions:
-    - action: hue::toggle
-      room: Bedroom
-      brightness: 100
+    - action: profile::set
+      profile: second
+- name: second
+  buttons:
   - states:
-    - image: ./images/noun-desk-1197857.png
+    - color: 235478
     actions:
-    - action: hue::toggle
-      room: Bedroom
-      brightness: 100
-  - states:
-    - image: ./images/noun-desk-1197857.png
-    actions:
-    - action: hue::toggle
-      room: Bedroom
-      brightness: 100
-  - states:
-    - image: ./images/noun-desk-1197857.png
-    actions:
-    - action: hue::toggle
-      room: Bedroom
-      brightness: 100
+    - action: profile::set
+      profile: default
