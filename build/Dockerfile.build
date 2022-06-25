@@ -3,6 +3,7 @@ FROM $CROSS_BASE_IMAGE
 
 ARG DEB_ARCH
 ARG TARGET
+ARG PKG_CONFIG_PATH
 
 RUN dpkg --add-architecture $DEB_ARCH && \
     apt-get update && \
