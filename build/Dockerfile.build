@@ -1,0 +1,12 @@
+ARG CROSS_BASE_IMAGE
+FROM $CROSS_BASE_IMAGE
+
+ARG DEB_ARCH
+ARG TARGET
+ARG PKG_CONFIG_PATH
+
+RUN dpkg --add-architecture $DEB_ARCH && \
+    apt-get update && \
+    apt-get install --assume-yes libhidapi-dev:$DEB_ARCH libudev-dev:$DEB_ARCH libusb-1.0-0-dev:$DEB_ARCH
+
+ENV PKG_CONFIG_LIBDIR_$TARGET=$PKG_CONFIG_PATH

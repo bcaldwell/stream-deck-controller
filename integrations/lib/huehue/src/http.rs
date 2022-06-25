@@ -38,7 +38,9 @@ impl std::error::Error for HueError {}
 fn build_base() -> ClientBuilder {
 	reqwest::Client::builder()
 		.add_root_certificate(Certificate::from_pem(CERTIFICATE.as_bytes()).unwrap())
-		.danger_accept_invalid_hostnames(true)
+		.danger_accept_invalid_certs(true)
+	// todo: rusttls doesn't support this so allow any cert, just internal so not the worst
+	// .danger_accept_invalid_hostnames(true)
 }
 
 pub fn build() -> Client {

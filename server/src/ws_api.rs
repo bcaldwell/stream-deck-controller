@@ -158,6 +158,7 @@ async fn set_button_for_profile(
 
                         let mut buffered_image = std::io::BufWriter::new(Vec::new());
                         loaded_image
+                            .resize(100, 100, image::imageops::FilterType::Nearest)
                             .write_to(&mut buffered_image, image::ImageOutputFormat::Png)
                             .unwrap();
 

@@ -1,0 +1,9 @@
+profiles:
+- name: default
+  buttons:
+  - states:
+    - color: 435465
+    actions:
+    - action: hue::set
+      room: Office
+      rel_brightness: 10
