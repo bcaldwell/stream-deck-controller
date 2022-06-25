@@ -1,0 +1,28 @@
+version: "3"
+
+tasks:
+  default:
+    cmds:
+      - task: build
+
+  build:
+    cmds:
+      - cargo build
+
+  run-server:
+    cmds:
+      - cargo run -p server
+    silent: true
+  build-server:
+    cmds:
+      - cargo build -p server
+    silent: true
+
+  run-client:
+    cmds:
+      - cargo run -p client
+    silent: true
+  build-client:
+    cmds:
+      - cargo build -p client
+    silent: true

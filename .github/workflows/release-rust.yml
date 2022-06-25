@@ -1,0 +1,120 @@
+name: Release
+on: push
+#     tags:
+#       - "v*"
+
+jobs:
+  build_rpi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2.3.4
+      - name: Setup rpi build environment
+        run: docker build -t rpirust -f scripts/Dockerfile.rpi scripts/
+      - name: Run build
+        run: docker run --rm -v $(pwd):/src -w /src rpirust ./scripts/build-pi-armv6hf.sh build --release --locked -p client
+      - name: Upload artifact
+        uses: actions/upload-artifact@v2.2.1
+        with:
+          name: stream-deck-client-rpi-arm
+          path: target/arm-unknown-linux-gnueabihf/release/client
+          if-no-files-found: error
+  # build_artifacts:
+  #   name: Build artifacts for ${{ matrix.asset_name_suffix }}
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     matrix:
+  #       include:
+  #         # - os: ubuntu-latest
+  #         #   target: x86_64-unknown-linux-gnu
+  #         #   asset_name_suffix: x86_64-linux
+  #         # - os: ubuntu-latest
+  #         #   target: aarch64-unknown-linux-gnu
+  #         #   asset_name_suffix: arm-linux
+  #         - os: ubuntu-latest
+  #           target: arm-unknown-linux-gnueabihf
+  #           asset_name_suffix: arm-linux
+  #         # - os: macos-latest
+  #         #   target: x86_64-apple-darwin
+  #         #   asset_name_suffix: x86_64-darwin
+  #         # - os: macos-latest
+  #         #   target: aarch64-apple-darwin
+  #         #   asset_name_suffix: aarch64-darwin
+
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v2
+
+  #     # - name: Install c dependencies
+  #     #   if: matrix.os == 'ubuntu-latest'
+  #     #   run: sudo apt-get install -qq libssl-dev libusb-1.0-0-dev libhidapi-dev
+
+  #     # - name: Install arm linker dependencies
+  #     #   if: matrix.target == 'arm-unknown-linux-gnueabihf'
+  #     #   run: sudo apt-get install -qq gcc-arm-linux-gnueabihf libc6-armhf-cross libc6-dev-armhf-cross
+
+  #     - name: Setup toolchain
+  #       uses: actions-rs/toolchain@v1
+  #       with:
+  #         profile: minimal
+  #         toolchain: stable
+  #         target: ${{ matrix.target }}
+  #         override: true
+
+  #     - name: Install arm linker dependencies
+  #       if: matrix.target == 'arm-unknown-linux-gnueabihf'
+  #       run: docker build -t arm-unknown-linux-gnueabihf -f Dockerfile-arm-build .
+
+  #     - name: Setup upterm session
+  #       uses: lhotari/action-upterm@v1
+  #     - uses: actions-rs/cargo@v1
+  #       with:
+  #         use-cross: true
+  #         command: build
+  #         args: --release --locked --target ${{ matrix.target }} --bin client
+  #     # - name: Build
+  #     #   run: cargo build --release --locked --target ${{ matrix.target }} --bin client
+
+  #     - name: Rename artifacts
+  #       run: mv target/release/client target/release/stream-deck-controller-client-${{ matrix.asset_name_suffix }}
+
+  #     - name: Upload artifacts
+  #       uses: actions/upload-artifact@v3
+  #       with:
+  #         name: stream-deck-controller-client-${{ matrix.asset_name_suffix }}
+  #         path: target/release/stream-deck-controller-client-${{ matrix.asset_name_suffix }}
+
+  # deploy_artifacts:
+  #   name: Create release
+  #   needs: [build_artifacts]
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Create release directory
+  #       run: mkdir release
+  #     - name: Get artifacts
+  #       uses: actions/download-artifact@v3
+  #       with:
+  #         path: release
+  #     - name: Generate Checksum
+  #       uses: jmgilman/actions-generate-checksum@v1.0.0
+  #       with:
+  #         patterns: "release/*/*"
+  #     - run: ls -R release && cat checksum.txt
+  # - name: Create release with artifact
+  #   uses: softprops/action-gh-release@v1
+  #   with:
+  #     tag_name: ${{ github.event.inputs.tag }}
+  #     fail_on_unmatched_files: true
+  #     generate_release_notes: true
+  #     files: |
+  #       release/*/*
+  #       checksum.txt
+# docker run \
+#     --volume $(pwd):/home/cross/project \
+#     --volume /home/runner/work/stream-deck-controller/rust-on-raspberry-docker/apt:/home/cross/deb-deps \
+#     --volume ~/.cargo/registry:/home/cross/.cargo/registry \
+#     ragnaroek/rust-raspberry:1.61.0 \
+#     build --release
+
+# # Added due to reqwest dependency problems when cross-compiling for RPi
+# openssl = { version = "0.10", features = ["vendored"] }
+# hidapi = { version = "1.4", default-features = false, features = ["linux-static-hidraw"] }

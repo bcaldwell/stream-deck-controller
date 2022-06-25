@@ -1,0 +1,27 @@
+[package]
+name = "huehue"
+version = "0.4.1"
+edition = "2021"
+description = "Rust wrapper for Hue v2 API."
+homepage = "https://github.com/vgobbo/huehue#huehue"
+repository = "https://github.com/vgobbo/huehue"
+readme = "CRATE.md"
+license = "MIT OR Apache-2.0"
+keywords = [ "hue" ]
+authors = [ "Vinicius Gobbo Antunes de Oliveira <vgobbo@gmail.com>" ]
+
+[dependencies]
+mdns-sd = { version = "0.2" }
+regex = { version = "1.5" }
+reqwest = { version = "0.11", features = [ "json", "native-tls" ] }
+serde = { version = "1.0", features = [ "derive" ] }
+serde_json = { version = "1.0" }
+serde_repr = { version = "0.1" }
+tokio = { version = "1.16" }
+url = { version = "2.2" }
+uuid = { version = "0.8", features = [ "serde" ] }
+
+[dev-dependencies]
+assert_approx_eq = { version = "1.1" }
+structopt = { version = "0.3" }
+tokio = { version = "1.16", features = [ "rt-multi-thread", "macros" ] }

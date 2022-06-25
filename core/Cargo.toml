@@ -1,0 +1,12 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# trying to keep this small since the client depends on it
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.19.2", features = ["full"] } 
+uuid = { version = "1.1.2", features = ["v4", "fast-rng"] }
