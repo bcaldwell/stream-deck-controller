@@ -15,6 +15,7 @@ const ACTION_SPLIT_CHARS: [char; 2] = [':', ':'];
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Config {
+    devices: Vec<integrations::airplay::Device>,
     profiles: Profiles,
 }
 
@@ -27,7 +28,7 @@ async fn main() {
     let ws_clients = ws_api::Clients::default();
 
     let (integration_manager, integration_manager_tx) =
-        IntegrationManager::new(ws_clients.clone()).await;
+        IntegrationManager::new(ws_clients.clone(), &config_ref).await;
     let manager_handle = start_integration_manager(integration_manager);
 
     let api_service = rest_api::start_rest_api(config_ref, integration_manager_tx, ws_clients);
@@ -50,8 +51,12 @@ struct IntegrationManager {
 }
 
 impl IntegrationManager {
-    async fn new(ws_clients: ws_api::Clients) -> (IntegrationManager, Sender<ExecuteActionReq>) {
+    async fn new(
+        ws_clients: ws_api::Clients,
+        config_ref: &Arc<Config>,
+    ) -> (IntegrationManager, Sender<ExecuteActionReq>) {
         let hue_integration = integrations::hue::Integration::new().await;
+        let airplay_integration = integrations::airplay::Integration::new(&config_ref.devices);
         let (tx, rx) = mpsc::channel::<ExecuteActionReq>(32);
 
         let mut manager = IntegrationManager {
@@ -63,6 +68,10 @@ impl IntegrationManager {
         manager
             .integrations
             .insert("hue".to_string(), Box::new(hue_integration));
+
+        manager
+            .integrations
+            .insert("airplay".to_string(), Box::new(airplay_integration));
 
         return (manager, tx);
     }

@@ -781,6 +781,7 @@ dependencies = [
  "huehue",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
