@@ -16,7 +16,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v2.2.1
         with:
-          name: stream-deck-client-rpi-arm
+          name: stream-deck-client-arm-raspberry-pi
           path: target/arm-unknown-linux-gnueabihf/release/client
           if-no-files-found: error
   build_artifacts:
@@ -58,6 +58,9 @@ jobs:
           toolchain: stable
           target: ${{ matrix.target }}
           override: true
+      - uses: Swatinem/rust-cache@v1
+        with:
+          key: ${{ matrix.target }}
 
       - uses: actions-rs/cargo@v1
         if: matrix.use_cross == true
@@ -152,7 +155,7 @@ jobs:
         with:
           context: ./build
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/stream-deck-controller:latest
