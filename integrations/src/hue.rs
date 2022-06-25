@@ -17,12 +17,14 @@ enum Actions {
         light: Option<String>,
         room: Option<String>,
         brightness: Option<f32>,
+        rel_brightness: Option<f32>,
     },
     #[serde(rename = "set")]
     Set {
         light: Option<String>,
         room: Option<String>,
         brightness: Option<f32>,
+        rel_brightness: Option<f32>,
     },
 }
 
@@ -112,35 +114,64 @@ impl Integration {
         Ok(self.hue.light_group_by_id(id).await?)
     }
 
-    async fn toggle_light_action(&self, light_name: String, brightness: Option<f32>) -> Result<()> {
+    async fn toggle_light_action(
+        &self,
+        light_name: String,
+        brightness: Option<f32>,
+        rel_brightness: Option<f32>,
+    ) -> Result<()> {
         let light = self.get_light_by_name(&light_name).await?;
 
-        return self.toggle_light(light, brightness).await;
+        return self.toggle_light(light, brightness, rel_brightness).await;
     }
 
-    async fn set_light_action(&self, light_name: String, brightness: Option<f32>) -> Result<()> {
+    async fn set_light_action(
+        &self,
+        light_name: String,
+        brightness: Option<f32>,
+        rel_brightness: Option<f32>,
+    ) -> Result<()> {
         let light = self.get_light_by_name(&light_name).await?;
 
-        return self.set_light(light, brightness).await;
+        return self.set_light(light, brightness, rel_brightness).await;
     }
 
-    async fn toggle_light(&self, mut light: Light, brightness: Option<f32>) -> Result<()> {
+    async fn toggle_light(
+        &self,
+        mut light: Light,
+        brightness: Option<f32>,
+        rel_brightness: Option<f32>,
+    ) -> Result<()> {
         // turn light off if it is on, otherwise turn it on then set the brightness
         if light.on {
             return Ok(light.switch(false).await?);
         }
 
-        return self.set_light(light, brightness).await;
+        return self.set_light(light, brightness, rel_brightness).await;
     }
 
-    async fn set_light(&self, mut light: Light, brightness_option: Option<f32>) -> Result<()> {
-        // when brightness is none, just turn on the light
-        // otherwise check if it is 0, and turn off the light
-        // otherwise, turn on the light, then set the brightness
+    async fn set_light(
+        &self,
+        mut light: Light,
+        brightness_option: Option<f32>,
+        rel_brightness_option: Option<f32>,
+    ) -> Result<()> {
+        // when brightness and rel_brightness is none, just turn off the light
+        // otherwise check brightness:
+        //   if it is 0, and turn off the light
+        //   otherwise, turn on the light, then set the brightness
+        // then check rel_brightness
         // setting brightness first results in: device (light) is "soft off", command (.dimming.brightness) may not have effect
+        if rel_brightness_option.is_none() && brightness_option.is_none() {
+            return Ok(light.switch(false).await?);
+        }
+
         let brightness = match brightness_option {
             Some(b) => b,
-            None => return Ok(light.switch(false).await?),
+            None => {
+                self.determine_rel_brightness_val(&light, rel_brightness_option)
+                    .await
+            }
         };
 
         if brightness == 0.0 {
@@ -153,16 +184,39 @@ impl Integration {
         Ok(())
     }
 
-    async fn toggle_room_action(&self, room_name: String, brightness: Option<f32>) -> Result<()> {
-        let light = self.get_room_light_by_name(&room_name).await?;
-
-        return self.toggle_light(light, brightness).await;
+    async fn determine_rel_brightness_val(
+        &self,
+        light: &Light,
+        rel_brightness_option: Option<f32>,
+    ) -> f32 {
+        // default to 0, aka do nothing
+        let rel_brightness = rel_brightness_option.unwrap_or(0.0);
+        // not sure what to do here...
+        let current_brightness = light.brightness.unwrap_or(0.0);
+        let desired_brightness = current_brightness + rel_brightness;
+        return desired_brightness.min(100.0).max(0.0);
     }
 
-    async fn set_room_action(&self, room_name: String, brightness: Option<f32>) -> Result<()> {
+    async fn toggle_room_action(
+        &self,
+        room_name: String,
+        brightness: Option<f32>,
+        rel_brightness: Option<f32>,
+    ) -> Result<()> {
         let light = self.get_room_light_by_name(&room_name).await?;
 
-        return self.set_light(light, brightness).await;
+        return self.toggle_light(light, brightness, rel_brightness).await;
+    }
+
+    async fn set_room_action(
+        &self,
+        room_name: String,
+        brightness: Option<f32>,
+        rel_brightness: Option<f32>,
+    ) -> Result<()> {
+        let light = self.get_room_light_by_name(&room_name).await?;
+
+        return self.set_light(light, brightness, rel_brightness).await;
     }
 }
 
@@ -180,12 +234,17 @@ impl integration::Integration for Integration {
                 light,
                 room,
                 brightness,
+                rel_brightness,
             } => {
                 if let Some(light_name) = light {
-                    return Ok(self.toggle_light_action(light_name, brightness).await?);
+                    return Ok(self
+                        .toggle_light_action(light_name, brightness, rel_brightness)
+                        .await?);
                 }
                 if let Some(room_name) = room {
-                    return Ok(self.toggle_room_action(room_name, brightness).await?);
+                    return Ok(self
+                        .toggle_room_action(room_name, brightness, rel_brightness)
+                        .await?);
                 }
 
                 return Err(anyhow!("Either light or room options must be set"));
@@ -194,12 +253,17 @@ impl integration::Integration for Integration {
                 light,
                 room,
                 brightness,
+                rel_brightness,
             } => {
                 if let Some(light_name) = light {
-                    return Ok(self.set_light_action(light_name, brightness).await?);
+                    return Ok(self
+                        .set_light_action(light_name, brightness, rel_brightness)
+                        .await?);
                 }
                 if let Some(room_name) = room {
-                    return Ok(self.set_room_action(room_name, brightness).await?);
+                    return Ok(self
+                        .set_room_action(room_name, brightness, rel_brightness)
+                        .await?);
                 }
 
                 return Err(anyhow!("Either light or room options must be set"));
