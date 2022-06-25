@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use core::types::{Actions, ExecuteActionReq, Profiles};
 use integrations::Integration;
 use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
@@ -21,7 +22,10 @@ pub struct Config {
 
 #[tokio::main]
 async fn main() {
-    let config = read_config("./config_sample.yaml").expect("failed to read config file");
+    let config = read_config(
+        &env::var("STREAM_DECK_CONTROLLER_CONFIG").unwrap_or("./config.yaml".to_string()),
+    )
+    .expect("failed to read config file");
     println!("config: {:?}", config);
     let config_ref = Arc::new(config);
 

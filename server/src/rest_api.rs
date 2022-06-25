@@ -64,7 +64,8 @@ pub async fn start_rest_api(
 
     let routes = index_endpoint.or(v1_endpoint).with(log);
 
-    return warp::serve(routes).run(([127, 0, 0, 1], 8000)).await;
+    // todo: allow this though config
+    return warp::serve(routes).run(([0, 0, 0, 0], 8000)).await;
 }
 
 async fn handle_execute_action(
