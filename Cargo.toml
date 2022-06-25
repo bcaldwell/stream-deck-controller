@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "core",
+    "integrations",
+    "server",
+    "client",
+]
+
+default-members = [
+  "server",
+  "client",
+]

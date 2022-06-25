@@ -1,0 +1,66 @@
+profiles:
+- name: default
+  buttons:
+  - states:
+    - color: 435465
+    actions:
+    - action: hue::toggle
+      room: Office
+      brightness: 100
+  - states:
+    - image: ./images/background.png
+      color: 768743
+    actions:
+    - action: hue::set
+      room: Office
+      brightness: 50
+  - states:
+    - image: ./images/background.png
+      color: 768523
+    actions:
+    - action: hue::set
+      room: Living Room
+      brightness: 50
+  - states:
+    - image: ./images/background.png
+      color: 768523
+    actions:
+    - action: hue::toggle
+      room: Bedroom
+      brightness: 100
+    - action: hue::toggle
+      room: Living Room
+      brightness: 100
+    - action: hue::toggle
+      room: Office
+      brightness: 100
+  - states:
+    - color: 768554
+    actions:
+    - action: hue::toggle
+      room: Bedroom
+      brightness: 100
+    - action: hue::toggle
+      room: Living Room
+      brightness: 100
+    - action: hue::toggle
+      room: Office
+      brightness: 100
+  - states:
+    - color: 768423
+    actions:
+    - action: hue::toggle
+      room: Bedroom
+      brightness: 100
+  - states:
+    - color: 235478
+    actions:
+    - action: profile::set
+      profile: second
+- name: second
+  buttons:
+  - states:
+    - color: 235478
+    actions:
+    - action: profile::set
+      profile: default
