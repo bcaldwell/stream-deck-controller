@@ -1,10 +1,10 @@
 use crate::profiles;
 use crate::Config;
 use anyhow::{anyhow, Result};
-use core::types::{ExecuteActionReq, ProfileButtonPressed, SetButtonUI, WsActions};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use image::{self, Pixel};
+use sdc_core::types::{ExecuteActionReq, ProfileButtonPressed, SetButtonUI, WsActions};
 use std::collections::HashMap;
 use std::io::{self, Cursor};
 use std::sync::Arc;
@@ -125,51 +125,7 @@ async fn set_button_for_profile(
             let button_state: &SetButtonUI = &button.states.as_ref().unwrap()[0];
 
             let image = match &button_state.image {
-                Some(image) => {
-                    let cache_key = format!(
-                        "{}-{}",
-                        image,
-                        button_state.color.as_ref().unwrap_or(&"".to_string())
-                    );
-                    let cached_locked = image_cache.read().await;
-                    let cached_image = cached_locked.get(&cache_key);
-                    if cached_image.is_some() {
-                        let response = cached_image.unwrap().to_string();
-                        // need to force drop this so it doesn't block
-                        drop(cached_locked);
-                        Some(response)
-                    } else {
-                        drop(cached_locked);
-                        let mut loaded_image = image::open(&image).unwrap();
-
-                        // apply background if color is also set
-                        // steal this from the streamdeck library, to avoid it as a dependency for the api
-                        if let Some(color) = &button_state.color {
-                            let (r, g, b) = hex_color_components_from_str(&color).unwrap();
-                            let rgba = loaded_image.as_mut_rgba8().unwrap();
-
-                            let mut r = image::Rgba([r, g, b, 0]);
-                            for p in rgba.pixels_mut() {
-                                r.0[3] = 255 - p.0[3];
-
-                                p.blend(&r);
-                            }
-                        }
-
-                        let mut buffered_image = std::io::BufWriter::new(Vec::new());
-                        loaded_image
-                            .resize(100, 100, image::imageops::FilterType::Nearest)
-                            .write_to(&mut buffered_image, image::ImageOutputFormat::Png)
-                            .unwrap();
-
-                        let base64_encoded = base64::encode(&buffered_image.into_inner().unwrap());
-                        image_cache
-                            .write()
-                            .await
-                            .insert(cache_key, base64_encoded.to_string());
-                        Some(base64_encoded)
-                    }
-                }
+                Some(image) => get_image(image, button_state, &image_cache).await.ok(),
                 None => None,
             };
 
@@ -194,6 +150,71 @@ async fn set_button_for_profile(
             .await
             .unwrap();
     }
+}
+
+async fn get_image(
+    image: &String,
+    button_state: &SetButtonUI,
+    image_cache: &Arc<RwLock<HashMap<String, String>>>,
+) -> Result<String> {
+    let cache_key = format!(
+        "{}-{}",
+        image,
+        button_state.color.as_ref().unwrap_or(&"".to_string())
+    );
+
+    let cached_locked = image_cache.read().await;
+    let cached_image = cached_locked.get(&cache_key);
+    if cached_image.is_some() {
+        let response = cached_image.unwrap().to_string();
+        // need to force drop this so it doesn't block
+        return Ok(response);
+    }
+
+    drop(cached_locked);
+    let mut loaded_image = fetch_image(image).await?;
+
+    // apply background if color is also set
+    // steal this from the streamdeck library, to avoid it as a dependency for the api
+    if let Some(color) = &button_state.color {
+        let (r, g, b) = hex_color_components_from_str(&color).unwrap();
+        let rgba = loaded_image.as_mut_rgba8().unwrap();
+
+        let mut r = image::Rgba([r, g, b, 0]);
+        for p in rgba.pixels_mut() {
+            r.0[3] = 255 - p.0[3];
+
+            p.blend(&r);
+        }
+    }
+
+    let mut buffered_image = std::io::BufWriter::new(Vec::new());
+    loaded_image
+        .resize(100, 100, image::imageops::FilterType::Nearest)
+        .write_to(&mut buffered_image, image::ImageOutputFormat::Png)
+        .unwrap();
+
+    let base64_encoded = base64::encode(&buffered_image.into_inner().unwrap());
+    image_cache
+        .write()
+        .await
+        .insert(cache_key, base64_encoded.to_string());
+    Ok(base64_encoded)
+}
+
+async fn fetch_image(image: &String) -> Result<image::DynamicImage> {
+    if image.starts_with("http") {
+        return load_image_from_url(image).await;
+    }
+
+    let loaded_image = image::open(&image)?;
+    Ok(loaded_image)
+}
+
+async fn load_image_from_url(image: &String) -> Result<image::DynamicImage> {
+    let img_bytes = reqwest::get(image).await?.bytes().await?;
+    let image = image::load_from_memory(&img_bytes)?;
+    Ok(image)
 }
 
 // steal this from the streamdeck library, to avoid it as a dependency for the api

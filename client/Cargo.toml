@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-core = {path = "../core"}
+sdc_core = {path = "../sdc_core"}
 streamdeck = "0.6.2"
 image = "0.23.3"
 serde = { version = "1.0", features = ["derive"] }

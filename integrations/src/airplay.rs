@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use huehue::device;
 use std::{collections::HashMap, process::ExitStatus};
 use tokio::process::Command;
 
@@ -34,7 +33,15 @@ impl Integration {
     pub fn new(devices: &Vec<Device>) -> Integration {
         let mut devices_map = HashMap::new();
         for device in devices {
-            devices_map.insert(device.name.to_string(), device.clone().to_owned());
+            let mut device_copy = device.clone().to_owned();
+            if let Some(creds) = device_copy.credentials {
+                device_copy.credentials = Some(shellexpand::env(&creds).unwrap().to_string());
+            }
+            device_copy.identifier = shellexpand::env(&device_copy.identifier)
+                .unwrap()
+                .to_string();
+            // device_copy.credentials = ;
+            devices_map.insert(device.name.to_string(), device_copy);
         }
 
         return Integration {
