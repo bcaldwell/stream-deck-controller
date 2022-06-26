@@ -9,6 +9,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2.3.4
+      - name: Setup toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: arm-unknown-linux-gnueabihf
+          override: true
+      - uses: Swatinem/rust-cache@v1
+        with:
+          key: arm-unknown-linux-gnueabihf
       - name: Setup rpi build environment
         run: docker build -t rpirust -f ./build/rpi/Dockerfile.rpi ./build/rpi/
       - name: Run build

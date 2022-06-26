@@ -28,13 +28,13 @@ async fn main() {
         .await
         .expect("connecting to streamdeck failed");
 
-    let root_url = env::var("STREAM_DECK_API_URL").unwrap_or("127.0.0.1:8000".to_string());
+    let root_url = env::var("STREAM_DECK_API_URL").unwrap_or("ws://127.0.0.1:8000".to_string());
     println!(
         "using {} as the stream deck url, can be set via `STREAM_DECK_API_URL` env var",
         &root_url
     );
 
-    let (ws_stream, _) = connect_async(format!("ws://{}/v1/ws", root_url))
+    let (ws_stream, _) = connect_async(format!("{}/v1/ws", root_url))
         .await
         .expect("Failed to connect to server");
     println!("WebSocket handshake has been successfully completed");
