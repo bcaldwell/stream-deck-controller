@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
-use core::types::{ProfileButtonPressed, SetButtonUI, WsActions};
 use futures_util::stream::{self, SplitSink, StreamExt};
 use futures_util::SinkExt;
+use sdc_core::types::{ProfileButtonPressed, SetButtonUI, WsActions};
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;

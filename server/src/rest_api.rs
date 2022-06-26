@@ -2,7 +2,7 @@ use crate::profiles;
 use crate::ws_api;
 use crate::Config;
 use anyhow::{anyhow, Result};
-use core::types::{Actions, ExecuteActionReq, ProfileButtonPressed, Profiles};
+use sdc_core::types::{Actions, ExecuteActionReq, ProfileButtonPressed, Profiles};
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
-use core::types::{Actions, ExecuteActionReq, Profiles};
 use integrations::Integration;
+use sdc_core::types::{Actions, ExecuteActionReq, Profiles};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
