@@ -16,3 +16,4 @@ serde = { version = "1.0", features = ["derive"] }
 tokio = { version =  "1.19.2", features=["process"] }
 sdc_core = {path = "../sdc_core"}
 shellexpand = "2.1.0"
+reqwest = { version = "0.11", default-features = false, features = [ "json", "rustls-tls" ] }

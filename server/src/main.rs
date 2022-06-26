@@ -16,6 +16,7 @@ const ACTION_SPLIT_CHARS: [char; 2] = [':', ':'];
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Config {
+    atv_api_endpoint: String,
     devices: Vec<integrations::airplay::Device>,
     profiles: Profiles,
 }
@@ -60,7 +61,10 @@ impl IntegrationManager {
         config_ref: &Arc<Config>,
     ) -> (IntegrationManager, Sender<ExecuteActionReq>) {
         let hue_integration = integrations::hue::Integration::new().await;
-        let airplay_integration = integrations::airplay::Integration::new(&config_ref.devices);
+        let airplay_integration = integrations::airplay::Integration::new(
+            &config_ref.atv_api_endpoint,
+            &config_ref.devices,
+        );
         let (tx, rx) = mpsc::channel::<ExecuteActionReq>(32);
 
         let mut manager = IntegrationManager {

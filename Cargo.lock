@@ -758,6 +758,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "huehue",
+ "reqwest",
  "sdc_core",
  "serde",
  "serde_json",
