@@ -49,8 +49,11 @@ async fn main() {
     ));
 
     let stream_deck_listener_join = tokio::spawn(start_stream_deck_listener(deck_ref, write));
-    read.for_each(|msg| async {
-        handle_socket_message(msg.unwrap(), image_update_tx.clone(), &device).await;
+    read.for_each(|message| async {
+        match message {
+            Ok(msg) => handle_socket_message(msg, image_update_tx.clone(), &device).await,
+            Err(err) => println!("Error opening message: {}", err),
+        }
     })
     .await;
 
