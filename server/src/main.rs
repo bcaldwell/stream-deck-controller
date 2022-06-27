@@ -61,6 +61,7 @@ impl IntegrationManager {
         config_ref: &Arc<Config>,
     ) -> (IntegrationManager, Sender<ExecuteActionReq>) {
         let hue_integration = integrations::hue::Integration::new().await;
+        let http_integration = integrations::http::Integration::new();
         let airplay_integration = integrations::airplay::Integration::new(
             &config_ref.atv_api_endpoint,
             &config_ref.devices,
@@ -80,6 +81,10 @@ impl IntegrationManager {
         manager
             .integrations
             .insert("airplay".to_string(), Box::new(airplay_integration));
+
+        manager
+            .integrations
+            .insert("http".to_string(), Box::new(http_integration));
 
         return (manager, tx);
     }
