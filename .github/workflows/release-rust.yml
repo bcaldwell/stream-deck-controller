@@ -19,10 +19,22 @@ jobs:
       - uses: Swatinem/rust-cache@v1
         with:
           key: arm-unknown-linux-gnueabihf
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Setup rpi build environment
-        run: docker build -t rpirust -f ./build/rpi/Dockerfile.rpi ./build/rpi/
+        uses: docker/build-push-action@v3
+        with:
+          context: ./build/rpi
+          file: ./build/rpi/Dockerfile.rpi
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/build-cache:stream-deck-controller-rpi-builder
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/build-cache:stream-deck-controller-rpi-builder
+          cache-to: type=inline
       - name: Run build
-        run: docker run --rm -v $(pwd):/src -w /src rpirust /build-pi-armv6hf.sh build --release --locked -p client
+        run: docker run --rm -v $(pwd):/src -w /src ${{ secrets.DOCKERHUB_USERNAME }}/build-cache:stream-deck-controller-rpi-builder /build-pi-armv6hf.sh build --release --locked -p client
       - name: Upload artifact
         uses: actions/upload-artifact@v2.2.1
         with:
