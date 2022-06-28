@@ -2,50 +2,80 @@ use crate::profiles;
 use crate::Config;
 use anyhow::{anyhow, Result};
 use futures_util::stream::SplitSink;
+use futures_util::FutureExt;
 use futures_util::{SinkExt, StreamExt};
 use image::{self, Pixel};
 use sdc_core::types::{ExecuteActionReq, ProfileButtonPressed, SetButtonUI, WsActions};
 use std::collections::HashMap;
-use std::io::{self, Cursor};
 use std::sync::Arc;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use warp::ws::{Message, WebSocket};
 
+const PING_INTERVAL_MIN: u64 = 15;
+
 pub struct Client {
+    pub uuid: uuid::Uuid,
     pub profile: String,
+    pub sender: mpsc::UnboundedSender<std::result::Result<Message, warp::Error>>,
 }
 pub type Clients = Arc<RwLock<HashMap<uuid::Uuid, Client>>>;
-type ImageCache = Arc<RwLock<HashMap<String, String>>>;
+pub type ImageCache = Arc<RwLock<HashMap<String, String>>>;
+
+pub async fn ping_ws_clients(clients: Clients) {
+    loop {
+        ping_all_ws_clients(clients.clone()).await;
+        // ping every 10 minutes
+        sleep(std::time::Duration::from_secs(60 * PING_INTERVAL_MIN)).await;
+    }
+}
+
+async fn ping_all_ws_clients(clients: Clients) {
+    let lock = clients.read().await;
+    for (_, client) in lock.iter() {
+        client.sender.send(Ok(Message::ping("ping")));
+    }
+}
 
 pub async fn ws_client_connected(
     ws: WebSocket,
     event_processor: mpsc::Sender<ExecuteActionReq>,
     config: Arc<Config>,
     clients: Clients,
+    image_cache: ImageCache,
 ) {
     let id = uuid::Uuid::new_v4();
-    let image_cache = ImageCache::default();
+
+    let (client_ws_sender, mut rx) = ws.split();
+    let (client_sender, client_rcv) = mpsc::unbounded_channel();
+
+    let client_rcv = UnboundedReceiverStream::new(client_rcv);
+    tokio::task::spawn(client_rcv.forward(client_ws_sender).map(|result| {
+        if let Err(e) = result {
+            eprintln!("error sending websocket msg: {}", e);
+        }
+    }));
 
     clients.write().await.insert(
         id,
         Client {
+            uuid: id,
             profile: "default".to_string(),
+            sender: client_sender,
         },
     );
-
     eprintln!("new websocket client: {}", id);
 
     // Split the socket into a sender and receive of messages.
-    let (tx, mut rx) = ws.split();
 
     let (profile_sync_tx, profile_sync_rx) = mpsc::unbounded_channel::<()>();
 
-    let set_button_for_profile_join = tokio::spawn(set_button_for_profile(
+    tokio::spawn(set_button_for_profile(
         config.clone(),
         id,
         clients.clone(),
-        tx,
         profile_sync_rx,
         image_cache,
     ));
@@ -56,12 +86,17 @@ pub async fn ws_client_connected(
         let msg = match result {
             Ok(msg) => msg,
             Err(e) => {
-                eprintln!("websocket error(uid={}): {}", "my_id", e);
+                eprintln!("websocket error(uid={}): {}", id, e);
                 break;
             }
         };
 
+        if msg.is_ping() || msg.is_pong() {
+            continue;
+        }
+
         if !msg.is_text() {
+            println!("unknown message type from {:?}, ignoring", id);
             continue;
         }
 
@@ -84,13 +119,12 @@ pub async fn ws_client_connected(
 
         // todo: this is pretty silly, since every button press will trigger a full ui resyn, really
         // this should be smart and only resync if there are changes
+        println!("Sending profile");
         profile_sync_tx.send(()).unwrap();
     }
-    set_button_for_profile_join.await.unwrap();
-
+    client_disconnected(clients, id).await;
     // user_ws_rx stream will keep processing as long as the user stays
     // connected. Once they disconnect, then...
-    client_disconnected(clients, id).await;
 }
 
 // async fn handle_msg(result: Result<Message, Error>) -> Result<()> {
@@ -108,7 +142,6 @@ async fn set_button_for_profile(
     config: Arc<Config>,
     id: uuid::Uuid,
     clients: Clients,
-    mut tx: SplitSink<WebSocket, Message>,
     mut profile_sync_rx: mpsc::UnboundedReceiver<()>,
     image_cache: ImageCache,
 ) {
@@ -146,13 +179,29 @@ async fn set_button_for_profile(
                 .unwrap()
                 .as_micros()
         );
-        tx.send(Message::text(serde_json::to_string(&msg).unwrap()))
-            .await
-            .unwrap();
+        send_ws_message(
+            &id,
+            clients.clone(),
+            Message::text(serde_json::to_string(&msg).unwrap()),
+        )
+        .await
+        .unwrap();
     }
 }
 
-async fn get_image(
+async fn send_ws_message(
+    id: &uuid::Uuid,
+    clients: Clients,
+    message: Message,
+) -> Result<(), mpsc::error::SendError<Result<Message, warp::Error>>> {
+    let locked = clients.read().await;
+    match locked.get(&id) {
+        Some(c) => return c.sender.send(Ok(message)),
+        None => Ok(()),
+    }
+}
+
+pub async fn get_image(
     image: &String,
     button_state: &SetButtonUI,
     image_cache: &Arc<RwLock<HashMap<String, String>>>,

@@ -9,10 +9,12 @@ use streamdeck::{Colour, StreamDeck};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_tungstenite::{
     connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
 };
 mod stream_deck_device;
+use futures_util::FutureExt;
 use stream_deck_device::{StreamDeckDevice, StreamDeckDeviceTypes};
 
 struct SetButtonRequest {
@@ -40,7 +42,15 @@ async fn main() {
     println!("WebSocket handshake has been successfully completed");
 
     let (image_update_tx, image_update_rx) = mpsc::unbounded_channel::<SetButtonRequest>();
-    let (write, read) = ws_stream.split();
+    let (ws_write, ws_read) = ws_stream.split();
+    let (client_sender, client_rcv) = mpsc::unbounded_channel();
+
+    let client_rcv = UnboundedReceiverStream::new(client_rcv);
+    tokio::task::spawn(client_rcv.map(|x| Ok(x)).forward(ws_write).map(|result| {
+        if let Err(e) = result {
+            eprintln!("error sending websocket msg: {}", e);
+        }
+    }));
 
     let handle_button_requests_join = tokio::spawn(handle_set_button_requests(
         image_update_rx,
@@ -48,14 +58,22 @@ async fn main() {
         device,
     ));
 
-    let stream_deck_listener_join = tokio::spawn(start_stream_deck_listener(deck_ref, write));
-    read.for_each(|message| async {
-        match message {
-            Ok(msg) => handle_socket_message(msg, image_update_tx.clone(), &device).await,
-            Err(err) => println!("Error opening message: {}", err),
-        }
-    })
-    .await;
+    let stream_deck_listener_join =
+        tokio::spawn(start_stream_deck_listener(deck_ref, client_sender.clone()));
+    ws_read
+        .for_each(|message| async {
+            // tokio_tungstenite responds to ping with pong already, no need to worry about it
+            let message = message.unwrap();
+            handle_socket_message(message, image_update_tx.clone(), &device).await;
+            // match message {
+            // Ok(msg) => handle_socket_message(msg, image_update_tx.clone(), &device).await,
+            //     Err(err) => {
+            //         println!("Error opening message: {}", err);
+            //         return Err(anyhow!("connection likely closed"));
+            //     }
+            // }
+        })
+        .await;
 
     handle_button_requests_join.await.unwrap();
     stream_deck_listener_join.await.unwrap();
@@ -157,6 +175,15 @@ async fn handle_socket_message(
     image_update_tx: mpsc::UnboundedSender<SetButtonRequest>,
     device: &StreamDeckDevice,
 ) {
+    if msg.is_ping() || msg.is_pong() {
+        return;
+    }
+
+    if !msg.is_text() {
+        println!("unknown message type, ignoring");
+        return;
+    }
+
     let p: WsActions = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     let r = match p {
         WsActions::SetButton { index, button } => image_update_tx
@@ -208,8 +235,10 @@ async fn send_button_update_requests(
 
 async fn start_stream_deck_listener(
     deck_ref: Arc<Mutex<StreamDeck>>,
-    mut write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    write: mpsc::UnboundedSender<Message>,
 ) {
+    // let last_button_press_time = std::time::SystemTime::now();
+    // let is_asleep = false;
     loop {
         let button_state_option = read_stream_deck(&deck_ref).await;
 
@@ -224,10 +253,9 @@ async fn start_stream_deck_listener(
                     button: i,
                 };
 
-                write
-                    .send(Message::text(serde_json::to_string(&map).unwrap()))
-                    .await
-                    .unwrap();
+                let msg = Message::text(serde_json::to_string(&map).unwrap());
+                println!("Sending profile {:?}", msg);
+                write.send(msg).unwrap();
             }
         }
 
