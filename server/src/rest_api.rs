@@ -13,10 +13,12 @@ pub async fn start_rest_api(
     config_ref: Arc<Config>,
     integration_manager_tx: Sender<ExecuteActionReq>,
     ws_clients: ws_api::Clients,
+    image_cache: ws_api::ImageCache,
 ) {
     let event_processor = warp::any().map(move || integration_manager_tx.clone());
     let with_config = warp::any().map(move || config_ref.clone());
     let with_ws_clients = warp::any().map(move || ws_clients.clone());
+    let with_image_cache = warp::any().map(move || image_cache.clone());
     let with_none = warp::any().map(move || None);
 
     let log = warp::log("example::api");
@@ -28,12 +30,21 @@ pub async fn start_rest_api(
         .and(event_processor.clone())
         .and(with_config.clone())
         .and(with_ws_clients)
-        .map(|ws: warp::ws::Ws, event_processor, config_ref, clients| {
-            // This will call our function if the handshake succeeds.
-            ws.on_upgrade(move |socket| {
-                ws_api::ws_client_connected(socket, event_processor, config_ref, clients)
-            })
-        });
+        .and(with_image_cache)
+        .map(
+            |ws: warp::ws::Ws, event_processor, config_ref, clients, image_cache| {
+                // This will call our function if the handshake succeeds.
+                ws.on_upgrade(move |socket| {
+                    ws_api::ws_client_connected(
+                        socket,
+                        event_processor,
+                        config_ref,
+                        clients,
+                        image_cache,
+                    )
+                })
+            },
+        );
 
     // POST /v1/actions/execute
     let execute_action_endpoint = warp::post()

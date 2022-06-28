@@ -6,6 +6,7 @@ use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
+use warp::ws;
 
 // mod integrations;
 mod profiles;
@@ -31,12 +32,21 @@ async fn main() {
     let config_ref = Arc::new(config);
 
     let ws_clients = ws_api::Clients::default();
+    let image_cache = ws_api::ImageCache::default();
+    tokio::task::spawn(populat_image_cache(config_ref.clone(), image_cache.clone()));
 
     let (integration_manager, integration_manager_tx) =
         IntegrationManager::new(ws_clients.clone(), &config_ref).await;
     let manager_handle = start_integration_manager(integration_manager);
 
-    let api_service = rest_api::start_rest_api(config_ref, integration_manager_tx, ws_clients);
+    let api_service = rest_api::start_rest_api(
+        config_ref,
+        integration_manager_tx,
+        ws_clients.clone(),
+        image_cache.clone(),
+    );
+
+    tokio::task::spawn(ws_api::ping_ws_clients(ws_clients.clone()));
 
     api_service.await;
     manager_handle.await.unwrap();
@@ -47,6 +57,20 @@ fn read_config(filepath: &str) -> Result<Config> {
 
     let map: Config = serde_yaml::from_str(&file_contents)?;
     Ok(map)
+}
+
+async fn populat_image_cache(config_ref: Arc<Config>, image_cache: ws_api::ImageCache) {
+    for profile in &config_ref.as_ref().profiles {
+        for button in &profile.buttons {
+            if let Some(states) = &button.states {
+                for state in states {
+                    if let Some(image) = &state.image {
+                        ws_api::get_image(&image, &state, &image_cache).await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct IntegrationManager {
@@ -60,7 +84,7 @@ impl IntegrationManager {
         ws_clients: ws_api::Clients,
         config_ref: &Arc<Config>,
     ) -> (IntegrationManager, Sender<ExecuteActionReq>) {
-        let hue_integration = integrations::hue::Integration::new().await;
+        // let hue_integration = integrations::hue::Integration::new().await;
         let http_integration = integrations::http::Integration::new();
         let airplay_integration = integrations::airplay::Integration::new(
             &config_ref.atv_api_endpoint,
@@ -74,9 +98,9 @@ impl IntegrationManager {
             ws_clients: ws_clients,
         };
 
-        manager
-            .integrations
-            .insert("hue".to_string(), Box::new(hue_integration));
+        // manager
+        //     .integrations
+        //     .insert("hue".to_string(), Box::new(hue_integration));
 
         manager
             .integrations
