@@ -84,7 +84,7 @@ impl IntegrationManager {
         ws_clients: ws_api::Clients,
         config_ref: &Arc<Config>,
     ) -> (IntegrationManager, Sender<ExecuteActionReq>) {
-        // let hue_integration = integrations::hue::Integration::new().await;
+        let hue_integration = integrations::hue::Integration::new().await;
         let http_integration = integrations::http::Integration::new();
         let airplay_integration = integrations::airplay::Integration::new(
             &config_ref.atv_api_endpoint,
@@ -98,9 +98,9 @@ impl IntegrationManager {
             ws_clients: ws_clients,
         };
 
-        // manager
-        //     .integrations
-        //     .insert("hue".to_string(), Box::new(hue_integration));
+        manager
+            .integrations
+            .insert("hue".to_string(), Box::new(hue_integration));
 
         manager
             .integrations
