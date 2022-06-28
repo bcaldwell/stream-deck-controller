@@ -12,3 +12,4 @@
 result
 
 node_modules
+.env.ejson
