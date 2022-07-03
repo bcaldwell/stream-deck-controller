@@ -8,34 +8,47 @@ use std::time::Duration;
 
 use crate::integration;
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct IntegrationConfig {
+    pub auth: String,
+}
+
+#[async_trait]
+impl integration::IntegrationConfig for IntegrationConfig {
+    async fn to_integration(&self, name: Option<String>) -> integration::IntegrationResult {
+        return Ok(Box::new(
+            Integration::new(name.unwrap_or("hue".to_string())).await,
+        ));
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ToggleOrSetAction {
+    light: Option<String>,
+    room: Option<String>,
+    brightness: Option<f32>,
+    rel_brightness: Option<f32>,
+}
+
 // mayber use #[serde(untagged)] for this?
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "action")]
 enum Actions {
     #[serde(rename = "toggle")]
-    Toggle {
-        light: Option<String>,
-        room: Option<String>,
-        brightness: Option<f32>,
-        rel_brightness: Option<f32>,
-    },
+    Toggle(ToggleOrSetAction),
     #[serde(rename = "set")]
-    Set {
-        light: Option<String>,
-        room: Option<String>,
-        brightness: Option<f32>,
-        rel_brightness: Option<f32>,
-    },
+    Set(ToggleOrSetAction),
 }
 
 pub struct Integration {
+    name: String,
     hue: Hue,
     light_name_to_id: HashMap<String, String>,
     room_name_to_light_group_id: HashMap<String, String>,
 }
 
 impl Integration {
-    pub async fn new() -> Integration {
+    pub async fn new(name: String) -> Integration {
         let bridges = Hue::bridges(Duration::from_secs(5)).await;
         let device_type = DeviceType::new("benjamin".to_owned(), "streamdeck".to_owned()).unwrap();
 
@@ -48,6 +61,7 @@ impl Integration {
         .expect("Failed to run bridge information.");
 
         let mut hue_integration = Integration {
+            name: name,
             hue: hue,
             light_name_to_id: HashMap::new(),
             room_name_to_light_group_id: HashMap::new(),
@@ -222,6 +236,10 @@ impl Integration {
 
 #[async_trait]
 impl integration::Integration for Integration {
+    fn name(&self) -> &str {
+        return &self.name;
+    }
+
     async fn execute_action(
         &self,
         _action: String,
@@ -230,39 +248,45 @@ impl integration::Integration for Integration {
         let options: Actions = serde_json::from_value(json_options).unwrap();
 
         match options {
-            Actions::Toggle {
-                light,
-                room,
-                brightness,
-                rel_brightness,
-            } => {
-                if let Some(light_name) = light {
+            Actions::Toggle(toggle_action) => {
+                if let Some(light_name) = toggle_action.light {
                     return Ok(self
-                        .toggle_light_action(light_name, brightness, rel_brightness)
+                        .toggle_light_action(
+                            light_name,
+                            toggle_action.brightness,
+                            toggle_action.rel_brightness,
+                        )
                         .await?);
                 }
-                if let Some(room_name) = room {
+                if let Some(room_name) = toggle_action.room {
                     return Ok(self
-                        .toggle_room_action(room_name, brightness, rel_brightness)
+                        .toggle_room_action(
+                            room_name,
+                            toggle_action.brightness,
+                            toggle_action.rel_brightness,
+                        )
                         .await?);
                 }
 
                 return Err(anyhow!("Either light or room options must be set"));
             }
-            Actions::Set {
-                light,
-                room,
-                brightness,
-                rel_brightness,
-            } => {
-                if let Some(light_name) = light {
+            Actions::Set(set_action) => {
+                if let Some(light_name) = set_action.light {
                     return Ok(self
-                        .set_light_action(light_name, brightness, rel_brightness)
+                        .set_light_action(
+                            light_name,
+                            set_action.brightness,
+                            set_action.rel_brightness,
+                        )
                         .await?);
                 }
-                if let Some(room_name) = room {
+                if let Some(room_name) = set_action.room {
                     return Ok(self
-                        .set_room_action(room_name, brightness, rel_brightness)
+                        .set_room_action(
+                            room_name,
+                            set_action.brightness,
+                            set_action.rel_brightness,
+                        )
                         .await?);
                 }
 

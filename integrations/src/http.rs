@@ -1,24 +1,40 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use serde::__private::de;
-use std::{collections::HashMap, process::ExitStatus};
-use tokio::process::Command;
 
 use crate::integration;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct IntegrationConfig {}
+
+#[async_trait]
+impl integration::IntegrationConfig for IntegrationConfig {
+    async fn to_integration(&self, name: Option<String>) -> integration::IntegrationResult {
+        return Ok(Box::new(Integration::new(
+            name.unwrap_or("http".to_string()),
+        )));
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct GetAction {
+    url: String,
+}
 
 // mayber use #[serde(untagged)] for this?
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "action")]
 enum Actions {
     #[serde(rename = "get")]
-    Get { url: String },
+    Get(GetAction),
 }
 
-pub struct Integration {}
+pub struct Integration {
+    name: String,
+}
 
 impl Integration {
-    pub fn new() -> Integration {
-        return Integration {};
+    pub fn new(name: String) -> Integration {
+        return Integration { name: name };
     }
 
     async fn execute_get_request(&self, url: String) -> Result<()> {
@@ -40,6 +56,10 @@ impl Integration {
 
 #[async_trait]
 impl integration::Integration for Integration {
+    fn name(&self) -> &str {
+        return &self.name;
+    }
+
     async fn execute_action(
         &self,
         _action: String,
@@ -48,7 +68,7 @@ impl integration::Integration for Integration {
         let options: Actions = serde_json::from_value(json_options).unwrap();
 
         match options {
-            Actions::Get { url } => self.execute_get_request(url).await,
+            Actions::Get(get_action) => self.execute_get_request(get_action.url).await,
         }
     }
 }
