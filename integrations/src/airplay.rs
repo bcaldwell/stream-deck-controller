@@ -1,19 +1,27 @@
+use crate::integration;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use serde::__private::de;
-use std::{collections::HashMap, process::ExitStatus};
+use std::collections::HashMap;
 use tokio::process::Command;
 
-use crate::integration;
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub enum Protocol {
+    #[serde(rename = "companion")]
+    Companion,
+    #[serde(rename = "airplay")]
+    AirPlay,
+    #[serde(rename = "raop")]
+    RAOP,
+}
 
-// mayber use #[serde(untagged)] for this?
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "action")]
-enum Actions {
-    #[serde(rename = "command")]
-    Command { device: String, command: String },
-    #[serde(rename = "open_app")]
-    OpenApp { device: String, identifer: String },
+impl Protocol {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Protocol::Companion => "companion",
+            Protocol::AirPlay => "airplay",
+            Protocol::RAOP => "raop",
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
@@ -22,17 +30,57 @@ pub struct Device {
     identifier: String,
     credentials: Option<String>,
     // todo: make this an enum
-    protocol: Option<String>,
+    protocol: Option<Protocol>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct IntegrationConfig {
+    api_endpoint: String,
+    devices: Vec<Device>,
+}
+
+#[async_trait]
+impl integration::IntegrationConfig for IntegrationConfig {
+    async fn to_integration(&self, name: Option<String>) -> integration::IntegrationResult {
+        return Ok(Box::new(Integration::new(
+            name.unwrap_or("airplay".to_string()),
+            &self.api_endpoint,
+            &self.devices,
+        )));
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CommandAction {
+    device: String,
+    command: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct OpenAppAction {
+    device: String,
+    identifier: String,
+}
+
+// mayber use #[serde(untagged)] for this?
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action")]
+enum Actions {
+    #[serde(rename = "command")]
+    Command(CommandAction),
+    #[serde(rename = "open_app")]
+    OpenApp(OpenAppAction),
 }
 
 pub struct Integration {
+    name: String,
     binary: Option<String>,
     atv_api_endpoint: Option<String>,
     devices: HashMap<String, Device>,
 }
 
 impl Integration {
-    pub fn new(atv_api_endpoint: &str, devices: &Vec<Device>) -> Integration {
+    pub fn new(name: String, atv_api_endpoint: &str, devices: &Vec<Device>) -> Integration {
         let mut devices_map = HashMap::new();
         for device in devices {
             let mut device_copy = device.clone().to_owned();
@@ -47,6 +95,7 @@ impl Integration {
         }
 
         return Integration {
+            name: name,
             binary: Some("atvremote".to_string()),
             atv_api_endpoint: Some(atv_api_endpoint.to_string()),
             devices: devices_map,
@@ -84,11 +133,12 @@ impl Integration {
         let client = reqwest::Client::new();
         let mut r = client.get(format!("{}/{}", atv_api_endpoint, endpoint));
 
-        let default_protocol = "airplay".to_string();
+        let default_protocol = Protocol::AirPlay;
         let protocol = device
             .protocol
             .as_ref()
             .unwrap_or(&default_protocol)
+            .as_str()
             .to_lowercase();
 
         if let Some(credentials) = &device.credentials {
@@ -112,24 +162,22 @@ impl Integration {
 
     fn get_url_for_action(&self, action: &Actions) -> (&Device, String) {
         match action {
-            Actions::Command {
-                device: device_name,
-                command,
-            } => {
-                let device = self.devices.get(device_name).unwrap();
+            Actions::Command(command_action) => {
+                let device = self.devices.get(&command_action.device).unwrap();
                 (
                     device,
-                    format!("command/{}/{}", device.identifier, command).to_string(),
+                    format!("command/{}/{}", device.identifier, command_action.command).to_string(),
                 )
             }
-            Actions::OpenApp {
-                device: device_name,
-                identifer,
-            } => {
-                let device = self.devices.get(device_name).unwrap();
+            Actions::OpenApp(open_action) => {
+                let device = self.devices.get(&open_action.device).unwrap();
                 (
                     device,
-                    format!("apps/{}/open/{}", device.identifier, identifer).to_string(),
+                    format!(
+                        "apps/{}/open/{}",
+                        device.identifier, &open_action.identifier
+                    )
+                    .to_string(),
                 )
             }
         }
@@ -160,21 +208,25 @@ impl Integration {
 
     fn get_command_for_action(&self, action: &Actions) -> (String, String) {
         match action {
-            Actions::Command { device, command } => (device.to_string(), command.to_string()),
-            Actions::OpenApp { device, identifer } => (
-                device.to_string(),
-                format!("launch_app={}", identifer).to_string(),
+            Actions::Command(command_action) => (
+                command_action.device.to_owned(),
+                command_action.command.to_owned(),
+            ),
+            Actions::OpenApp(open_app_action) => (
+                open_app_action.device.to_owned(),
+                format!("launch_app={}", open_app_action.identifier),
             ),
         }
     }
 
     async fn atvremote_command_for_device(&self, device: &Device, binary: String) -> Command {
         let mut cmd = Command::new(binary);
-        let default_protocol = "airplay".to_string();
+        let default_protocol = Protocol::AirPlay;
         let protocol = device
             .protocol
             .as_ref()
             .unwrap_or(&default_protocol)
+            .as_str()
             .to_lowercase();
 
         cmd.arg("-i").arg(&device.identifier);
@@ -192,6 +244,10 @@ impl Integration {
 
 #[async_trait]
 impl integration::Integration for Integration {
+    fn name(&self) -> &str {
+        return &self.name;
+    }
+
     async fn execute_action(
         &self,
         _action: String,

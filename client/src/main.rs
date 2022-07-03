@@ -1,18 +1,14 @@
 use anyhow::{anyhow, Result};
-use futures_util::stream::{self, SplitSink, StreamExt};
-use futures_util::SinkExt;
+use futures_util::stream::StreamExt;
 use sdc_core::types::{ProfileButtonPressed, SetButtonUI, WsActions};
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
 use streamdeck::{Colour, StreamDeck};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_tungstenite::{
-    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 mod stream_deck_device;
 use futures_util::FutureExt;
 use stream_deck_device::{StreamDeckDevice, StreamDeckDeviceTypes};
