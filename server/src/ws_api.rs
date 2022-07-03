@@ -1,9 +1,8 @@
 use crate::profiles;
 use crate::Config;
 use anyhow::{anyhow, Result};
-use futures_util::stream::SplitSink;
 use futures_util::FutureExt;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use image::{self, Pixel};
 use sdc_core::types::{ExecuteActionReq, ProfileButtonPressed, SetButtonUI, WsActions};
 use std::collections::HashMap;
@@ -35,7 +34,8 @@ pub async fn ping_ws_clients(clients: Clients) {
 async fn ping_all_ws_clients(clients: Clients) {
     let lock = clients.read().await;
     for (_, client) in lock.iter() {
-        client.sender.send(Ok(Message::ping("ping")));
+        // ignore the response, since its just a ping, doesn't really matter
+        _ = client.sender.send(Ok(Message::ping("ping")));
     }
 }
 

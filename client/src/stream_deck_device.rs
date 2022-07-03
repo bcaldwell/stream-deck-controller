@@ -8,6 +8,7 @@ pub struct StreamDeckDevice {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum StreamDeckDeviceTypes {
     Original,
     OriginalV2,
