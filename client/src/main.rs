@@ -1,17 +1,22 @@
 use anyhow::{anyhow, Result};
 use futures_util::stream::StreamExt;
+use futures_util::FutureExt;
 use sdc_core::types::{ProfileButtonPressed, SetButtonUI, WsActions};
 use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
+use stream_deck_device::{StreamDeckDevice, StreamDeckDeviceTypes};
 use streamdeck::{Colour, StreamDeck};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+
 mod stream_deck_device;
-use futures_util::FutureExt;
-use stream_deck_device::{StreamDeckDevice, StreamDeckDeviceTypes};
+
+const STREAMDECK_DEFAULT_BRIGHTNESS: u8 = 50;
+const SCREEN_SLEEP_MIN: u64 = 1;
+const MIN_TO_SEC: u64 = 60;
 
 struct SetButtonRequest {
     state: SetButtonUI,
@@ -36,6 +41,11 @@ async fn main() {
         .await
         .expect("Failed to connect to server");
     println!("WebSocket handshake has been successfully completed");
+
+    // set brightness correctly
+    set_stream_deck_brightness(&deck_ref, desired_stream_deck_brightness())
+        .await
+        .expect("failed to set streamdeck brightness, check streamdeck connection");
 
     let (image_update_tx, image_update_rx) = mpsc::unbounded_channel::<SetButtonRequest>();
     let (ws_write, ws_read) = ws_stream.split();
@@ -233,8 +243,15 @@ async fn start_stream_deck_listener(
     deck_ref: Arc<Mutex<StreamDeck>>,
     write: mpsc::UnboundedSender<Message>,
 ) {
-    // let last_button_press_time = std::time::SystemTime::now();
-    // let is_asleep = false;
+    let mut last_button_press_time = std::time::SystemTime::now();
+    let mut is_asleep = false;
+    let sleep_timeout = env::var("STREAM_DECK_SLEEP_TIMEOUT_MIN")
+        .unwrap_or("".to_string())
+        .parse::<u64>()
+        .unwrap_or(SCREEN_SLEEP_MIN);
+    let sleep_timeout = std::time::Duration::from_secs(sleep_timeout * MIN_TO_SEC);
+    let stream_deck_brightness = desired_stream_deck_brightness();
+
     loop {
         let button_state_option = read_stream_deck(&deck_ref).await;
 
@@ -244,15 +261,33 @@ async fn start_stream_deck_listener(
                     continue;
                 }
 
+                if is_asleep {
+                    is_asleep = false;
+                    last_button_press_time = std::time::SystemTime::now();
+                    println!("waking up from sleep");
+                    set_stream_deck_brightness(&deck_ref, stream_deck_brightness)
+                        .await
+                        .unwrap_or_else(|e| println!("{}", e));
+                    break;
+                }
+
                 let map = ProfileButtonPressed {
                     profile: None,
                     button: i,
                 };
 
                 let msg = Message::text(serde_json::to_string(&map).unwrap());
-                println!("Sending profile {:?}", msg);
+                println!("Sending button press: {:?}", msg);
                 write.send(msg).unwrap();
             }
+        }
+
+        if is_time_to_toggle_sleep(is_asleep, last_button_press_time, sleep_timeout) {
+            is_asleep = true;
+            println!("going to sleep");
+            set_stream_deck_brightness(&deck_ref, 0)
+                .await
+                .unwrap_or_else(|e| println!("{}", e));
         }
 
         sleep(std::time::Duration::from_millis(100)).await;
@@ -271,4 +306,51 @@ async fn read_stream_deck(deck_ref: &Arc<Mutex<StreamDeck>>) -> Option<Vec<u8>> 
             }
         },
     }
+}
+
+async fn set_stream_deck_brightness(
+    deck_ref: &Arc<Mutex<StreamDeck>>,
+    brightness: u8,
+) -> Result<()> {
+    let mut deck = deck_ref.lock().await;
+    deck.set_brightness(brightness).map_err(|e| {
+        anyhow!(
+            "failed to set streamdeck brightness to {}: {}",
+            brightness,
+            e
+        )
+    })
+}
+
+// is_time_to_toggle_sleep returns true if it is time to transition from awake to asleep
+fn is_time_to_toggle_sleep(
+    is_asleep: bool,
+    last_button_press_time: std::time::SystemTime,
+    sleep_timeout: std::time::Duration,
+) -> bool {
+    // no change needed
+    if is_asleep {
+        return false;
+    }
+
+    let time_since_last_sleep =
+        match std::time::SystemTime::now().duration_since(last_button_press_time) {
+            Ok(t) => t,
+            Err(e) => {
+                print!(
+                    "failed to determine the time since last sleep, assuming no change: {}",
+                    e
+                );
+                return false;
+            }
+        };
+
+    return time_since_last_sleep > sleep_timeout;
+}
+
+fn desired_stream_deck_brightness() -> u8 {
+    return env::var("STREAM_DECK_BRIGHTNESS")
+        .unwrap_or("".to_string())
+        .parse::<u8>()
+        .unwrap_or(STREAMDECK_DEFAULT_BRIGHTNESS);
 }

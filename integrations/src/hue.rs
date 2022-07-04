@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use huehue::models::device_type::DeviceType;
 use huehue::{Hue, Light};
 use std::collections::HashMap;
-use std::env;
 use std::time::Duration;
 
 use crate::integration;
@@ -16,9 +15,9 @@ pub struct IntegrationConfig {
 #[async_trait]
 impl integration::IntegrationConfig for IntegrationConfig {
     async fn to_integration(&self, name: Option<String>) -> integration::IntegrationResult {
-        return Ok(Box::new(
-            Integration::new(name.unwrap_or("hue".to_string())).await,
-        ));
+        let auth = shellexpand::env(&self.auth)?.to_string();
+        let i = Integration::new(name.unwrap_or("hue".to_string()).as_ref(), &auth).await;
+        return Ok(Box::new(i));
     }
 }
 
@@ -48,20 +47,20 @@ pub struct Integration {
 }
 
 impl Integration {
-    pub async fn new(name: String) -> Integration {
+    pub async fn new(name: &str, application_key: &str) -> Integration {
         let bridges = Hue::bridges(Duration::from_secs(5)).await;
         let device_type = DeviceType::new("benjamin".to_owned(), "streamdeck".to_owned()).unwrap();
 
         let hue = Hue::new_with_key(
             bridges.first().expect("getting hue bridges failed").address,
             device_type,
-            env::var("HUE_USERNAME").unwrap(),
+            application_key.to_string(),
         )
         .await
         .expect("Failed to run bridge information.");
 
         let mut hue_integration = Integration {
-            name: name,
+            name: name.to_string(),
             hue: hue,
             light_name_to_id: HashMap::new(),
             room_name_to_light_group_id: HashMap::new(),

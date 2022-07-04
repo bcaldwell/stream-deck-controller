@@ -42,11 +42,12 @@ pub struct IntegrationConfig {
 #[async_trait]
 impl integration::IntegrationConfig for IntegrationConfig {
     async fn to_integration(&self, name: Option<String>) -> integration::IntegrationResult {
-        return Ok(Box::new(Integration::new(
+        let i = Integration::new(
             name.unwrap_or("airplay".to_string()),
             &self.api_endpoint,
             &self.devices,
-        )));
+        )?;
+        return Ok(Box::new(i));
     }
 }
 
@@ -80,26 +81,24 @@ pub struct Integration {
 }
 
 impl Integration {
-    pub fn new(name: String, atv_api_endpoint: &str, devices: &Vec<Device>) -> Integration {
+    pub fn new(name: String, atv_api_endpoint: &str, devices: &Vec<Device>) -> Result<Integration> {
         let mut devices_map = HashMap::new();
         for device in devices {
             let mut device_copy = device.clone().to_owned();
             if let Some(creds) = device_copy.credentials {
-                device_copy.credentials = Some(shellexpand::env(&creds).unwrap().to_string());
+                device_copy.credentials = Some(shellexpand::env(&creds)?.to_string());
             }
-            device_copy.identifier = shellexpand::env(&device_copy.identifier)
-                .unwrap()
-                .to_string();
+            device_copy.identifier = shellexpand::env(&device_copy.identifier)?.to_string();
             // device_copy.credentials = ;
             devices_map.insert(device.name.to_string(), device_copy);
         }
 
-        return Integration {
+        return Ok(Integration {
             name: name,
             binary: Some("atvremote".to_string()),
             atv_api_endpoint: Some(atv_api_endpoint.to_string()),
             devices: devices_map,
-        };
+        });
     }
 
     async fn run_atvremote_command(&self, options: Actions) -> Result<()> {
