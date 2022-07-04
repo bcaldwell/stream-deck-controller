@@ -11,11 +11,17 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tracing::{debug, error, info};
+use tracing_subscriber;
 
 mod stream_deck_device;
 
+const STREAM_DECK_API_URL_VAR: &str = "STREAM_DECK_API_URL";
+const STREAM_DECK_BRIGHTNESS_VAR: &str = "STREAM_DECK_BRIGHTNESS";
+const STREAM_DECK_SLEEP_TIMEOUT_MIN_VAR: &str = "STREAM_DECK_SLEEP_TIMEOUT_MIN";
+
 const STREAMDECK_DEFAULT_BRIGHTNESS: u8 = 50;
-const SCREEN_SLEEP_MIN: u64 = 1;
+const SCREEN_SLEEP_MIN: u64 = 5;
 const MIN_TO_SEC: u64 = 60;
 
 struct SetButtonRequest {
@@ -25,24 +31,26 @@ struct SetButtonRequest {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
+
     let device = StreamDeckDevice::new(StreamDeckDeviceTypes::Mk2);
 
     let deck_ref = connect_to_stream_deck(device)
         .await
         .expect("connecting to streamdeck failed");
 
-    let root_url = env::var("STREAM_DECK_API_URL").unwrap_or("ws://127.0.0.1:8000".to_string());
-    println!(
-        "using {} as the stream deck url, can be set via `STREAM_DECK_API_URL` env var",
-        &root_url
+    let root_url = env::var(STREAM_DECK_API_URL_VAR).unwrap_or("ws://127.0.0.1:8000".to_string());
+    info!(
+        root_url,
+        "connecting to stream deck api, url can be set via `{}` env var", STREAM_DECK_API_URL_VAR
     );
 
     let (ws_stream, _) = connect_async(format!("{}/v1/ws", root_url))
         .await
         .expect("Failed to connect to server");
-    println!("WebSocket handshake has been successfully completed");
+    info!("WebSocket handshake has been successfully completed");
 
-    // set brightness correctly
+    // set brightness correctly on initial boot
     set_stream_deck_brightness(&deck_ref, desired_stream_deck_brightness())
         .await
         .expect("failed to set streamdeck brightness, check streamdeck connection");
@@ -54,7 +62,7 @@ async fn main() {
     let client_rcv = UnboundedReceiverStream::new(client_rcv);
     tokio::task::spawn(client_rcv.map(|x| Ok(x)).forward(ws_write).map(|result| {
         if let Err(e) = result {
-            eprintln!("error sending websocket msg: {}", e);
+            error!("error sending websocket msg: {}", e);
         }
     }));
 
@@ -74,7 +82,7 @@ async fn main() {
             // match message {
             // Ok(msg) => handle_socket_message(msg, image_update_tx.clone(), &device).await,
             //     Err(err) => {
-            //         println!("Error opening message: {}", err);
+            //         info!("Error opening message: {}", err);
             //         return Err(anyhow!("connection likely closed"));
             //     }
             // }
@@ -98,7 +106,7 @@ async fn connect_to_stream_deck(device: StreamDeckDevice) -> Result<Arc<Mutex<St
         .await
         .serial()
         .map_err(|e| anyhow!("failed to get serial for stream deck connection: {:?}", e))?;
-    println!(
+    info!(
         "Connected to device (vid: {:04x} pid: {:04x} serial: {} name: {})",
         vid,
         &device.pid(),
@@ -124,7 +132,7 @@ async fn handle_set_button_requests(
         match set_button_state(&set_button_request, &deck_ref, &device).await {
             Ok(_) => (),
             Err(e) => {
-                println!(
+                info!(
                     "failed to set button {} image: {}",
                     set_button_request.button, e
                 )
@@ -186,7 +194,7 @@ async fn handle_socket_message(
     }
 
     if !msg.is_text() {
-        println!("unknown message type, ignoring");
+        info!("unknown message type, ignoring");
         return;
     }
 
@@ -205,7 +213,7 @@ async fn handle_socket_message(
     };
     match r {
         Ok(_) => (),
-        Err(e) => println!("{}", e),
+        Err(e) => info!("{}", e),
     };
 }
 
@@ -245,7 +253,7 @@ async fn start_stream_deck_listener(
 ) {
     let mut last_button_press_time = std::time::SystemTime::now();
     let mut is_asleep = false;
-    let sleep_timeout = env::var("STREAM_DECK_SLEEP_TIMEOUT_MIN")
+    let sleep_timeout = env::var(STREAM_DECK_SLEEP_TIMEOUT_MIN_VAR)
         .unwrap_or("".to_string())
         .parse::<u64>()
         .unwrap_or(SCREEN_SLEEP_MIN);
@@ -261,13 +269,13 @@ async fn start_stream_deck_listener(
                     continue;
                 }
 
+                last_button_press_time = std::time::SystemTime::now();
                 if is_asleep {
                     is_asleep = false;
-                    last_button_press_time = std::time::SystemTime::now();
-                    println!("waking up from sleep");
+                    info!("waking up from sleep");
                     set_stream_deck_brightness(&deck_ref, stream_deck_brightness)
                         .await
-                        .unwrap_or_else(|e| println!("{}", e));
+                        .unwrap_or_else(|e| info!("{}", e));
                     break;
                 }
 
@@ -277,17 +285,17 @@ async fn start_stream_deck_listener(
                 };
 
                 let msg = Message::text(serde_json::to_string(&map).unwrap());
-                println!("Sending button press: {:?}", msg);
+                info!("Sending button press: {:?}", msg);
                 write.send(msg).unwrap();
             }
         }
 
         if is_time_to_toggle_sleep(is_asleep, last_button_press_time, sleep_timeout) {
             is_asleep = true;
-            println!("going to sleep");
+            info!("going to sleep");
             set_stream_deck_brightness(&deck_ref, 0)
                 .await
-                .unwrap_or_else(|e| println!("{}", e));
+                .unwrap_or_else(|e| info!("{}", e));
         }
 
         sleep(std::time::Duration::from_millis(100)).await;
@@ -301,7 +309,7 @@ async fn read_stream_deck(deck_ref: &Arc<Mutex<StreamDeck>>) -> Option<Vec<u8>> 
         Err(e) => match e {
             streamdeck::Error::NoData => None,
             _ => {
-                println!("failed to read from streamdeck: {}", e);
+                info!("failed to read from streamdeck: {}", e);
                 None
             }
         },
@@ -349,7 +357,7 @@ fn is_time_to_toggle_sleep(
 }
 
 fn desired_stream_deck_brightness() -> u8 {
-    return env::var("STREAM_DECK_BRIGHTNESS")
+    return env::var(STREAM_DECK_BRIGHTNESS_VAR)
         .unwrap_or("".to_string())
         .parse::<u8>()
         .unwrap_or(STREAMDECK_DEFAULT_BRIGHTNESS);

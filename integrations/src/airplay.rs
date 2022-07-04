@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::process::Command;
+use tracing::{debug, error, info};
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub enum Protocol {
@@ -109,7 +110,7 @@ impl Integration {
             }
             None => Err(anyhow!("airplay: both binary and api are disabled")),
         };
-        println!("{:?}", &api_result);
+        info!("{:?}", &api_result);
         if api_result.is_ok() {
             return api_result;
         }
@@ -141,7 +142,7 @@ impl Integration {
             .to_lowercase();
 
         if let Some(credentials) = &device.credentials {
-            println!("adding creds");
+            info!("adding creds");
 
             // cmd.env("CREDENTIALS", credentials);
             r = r.header("auto-connect", "true");

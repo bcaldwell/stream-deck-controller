@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::{debug, error, info};
 use warp::ws::{Message, WebSocket};
 
 const PING_INTERVAL_MIN: u64 = 15;
@@ -54,7 +55,7 @@ pub async fn ws_client_connected(
     let client_rcv = UnboundedReceiverStream::new(client_rcv);
     tokio::task::spawn(client_rcv.forward(client_ws_sender).map(|result| {
         if let Err(e) = result {
-            eprintln!("error sending websocket msg: {}", e);
+            error!("error sending websocket msg: {}", e);
         }
     }));
 
@@ -66,7 +67,7 @@ pub async fn ws_client_connected(
             sender: client_sender,
         },
     );
-    eprintln!("new websocket client: {}", id);
+    info!("new websocket client: {}", id);
 
     // Split the socket into a sender and receive of messages.
 
@@ -86,7 +87,7 @@ pub async fn ws_client_connected(
         let msg = match result {
             Ok(msg) => msg,
             Err(e) => {
-                eprintln!("websocket error(uid={}): {}", id, e);
+                error!("websocket error(uid={}): {}", id, e);
                 break;
             }
         };
@@ -96,7 +97,7 @@ pub async fn ws_client_connected(
         }
 
         if !msg.is_text() {
-            println!("unknown message type from {:?}, ignoring", id);
+            info!("unknown message type from {:?}, ignoring", id);
             continue;
         }
 
@@ -106,7 +107,7 @@ pub async fn ws_client_connected(
             p.profile = Some(clients.read().await.get(&id).unwrap().profile.to_string())
         }
 
-        println!("{:?}", &p);
+        info!("{:?}", &p);
         // p.profile = p.profile.unwrap_or()
         crate::rest_api::handle_button_pressed_action(
             p,
@@ -119,7 +120,7 @@ pub async fn ws_client_connected(
 
         // todo: this is pretty silly, since every button press will trigger a full ui resyn, really
         // this should be smart and only resync if there are changes
-        println!("Sending profile");
+        info!("Sending profile");
         profile_sync_tx.send(()).unwrap();
     }
     client_disconnected(clients, id).await;
@@ -132,7 +133,7 @@ pub async fn ws_client_connected(
 // }
 
 async fn client_disconnected(clients: Clients, id: uuid::Uuid) {
-    eprintln!("websocket disconnected: {}", id);
+    error!("websocket disconnected: {}", id);
 
     // Stream closed up, so remove from the user list
     clients.write().await.remove(&id);
@@ -172,7 +173,7 @@ async fn set_button_for_profile(
             buttons: button_config,
         };
 
-        println!(
+        info!(
             "time taken: {}",
             std::time::SystemTime::now()
                 .duration_since(start_time)
