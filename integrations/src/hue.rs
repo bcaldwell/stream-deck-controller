@@ -4,6 +4,7 @@ use huehue::models::device_type::DeviceType;
 use huehue::{Hue, Light};
 use std::collections::HashMap;
 use std::time::Duration;
+use tracing::{debug, error, info};
 
 use crate::integration;
 
@@ -68,11 +69,11 @@ impl Integration {
 
         hue_integration.sync().await;
 
-        println!(
-            "Connected to hue bridge at {}\n{:?}\n{:?}",
-            bridges.first().unwrap().address,
-            hue_integration.light_name_to_id,
-            hue_integration.room_name_to_light_group_id,
+        info!(
+            lights = format!("{:?}", hue_integration.light_name_to_id.keys()),
+            rooms = format!("{:?}", hue_integration.room_name_to_light_group_id.keys()),
+            address = bridges.first().unwrap().address.to_string(),
+            "Connected to hue bridge",
         );
 
         return hue_integration;

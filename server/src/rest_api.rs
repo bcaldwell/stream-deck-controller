@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
 use tokio::time;
+use tracing::{debug, error, info};
 use warp::{http, Filter};
 
 pub async fn start_rest_api(
@@ -99,7 +100,7 @@ pub async fn handle_button_pressed_action(
     config: Arc<Config>,
     requestor_uuid: Option<uuid::Uuid>,
 ) -> Result<impl warp::Reply, warp::Rejection> {
-    println!("{:?}", profile_button_pressed);
+    info!("{:?}", profile_button_pressed);
 
     let actions = match get_actions_for_button_press(&config.profiles, profile_button_pressed) {
         Ok(actions) => actions,
@@ -125,7 +126,7 @@ async fn execute_action_request(
     event_processor: mpsc::Sender<ExecuteActionReq>,
     requestor_uuid: Option<uuid::Uuid>,
 ) -> Result<String> {
-    println!("{:?}", actions);
+    info!("{:?}", actions);
     let (resp_tx, resp_rx) = oneshot::channel::<String>();
 
     let execute_action_req = ExecuteActionReq {

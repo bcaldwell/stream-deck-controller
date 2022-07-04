@@ -6,6 +6,8 @@ use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
+use tracing::{debug, error, info};
+use tracing_subscriber;
 
 mod profiles;
 mod rest_api;
@@ -54,11 +56,16 @@ pub struct Config {
 
 #[tokio::main]
 async fn main() {
-    let config = read_config(
-        &env::var("STREAM_DECK_CONTROLLER_CONFIG").unwrap_or("./config.yaml".to_string()),
-    )
-    .expect("failed to read config file");
-    println!("config: {:?}", config);
+    tracing_subscriber::fmt::init();
+
+    let config_file =
+        &env::var("STREAM_DECK_CONTROLLER_CONFIG").unwrap_or("./config.yaml".to_string());
+    let config = read_config(config_file).expect("failed to read config file");
+    info!(
+        config_file,
+        config = format!("{:?}", config),
+        "parsed config file"
+    );
     let config_ref = Arc::new(config);
 
     let ws_clients = ws_api::Clients::default();
@@ -128,7 +135,7 @@ impl IntegrationManager {
             manager.add_integration(i);
         }
 
-        println!(
+        info!(
             "enabled integration names: {:?}",
             manager.integrations.keys()
         );
@@ -221,7 +228,7 @@ fn start_integration_manager(mut integration_manager: IntegrationManager) -> Joi
                 Ok(_) => "success".to_string(),
                 Err(e) => {
                     let msg = format!("error executing request: {}", e);
-                    println!("{}", msg);
+                    info!("{}", msg);
                     msg
                 }
             };
