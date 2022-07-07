@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::sleep;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use tracing_subscriber;
 
 mod stream_deck_device;

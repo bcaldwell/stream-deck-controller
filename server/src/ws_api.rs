@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use warp::ws::{Message, WebSocket};
 
 const PING_INTERVAL_MIN: u64 = 15;
@@ -97,7 +97,7 @@ pub async fn ws_client_connected(
         }
 
         if !msg.is_text() {
-            info!("unknown message type from {:?}, ignoring", id);
+            info!(?id, "unknown message type, ignoring");
             continue;
         }
 

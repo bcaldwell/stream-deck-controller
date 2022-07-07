@@ -4,9 +4,9 @@ use huehue::models::device_type::DeviceType;
 use huehue::{Hue, Light};
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::info;
 
-use crate::integration;
+use crate::integrations::integration;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct IntegrationConfig {
@@ -70,8 +70,8 @@ impl Integration {
         hue_integration.sync().await;
 
         info!(
-            lights = format!("{:?}", hue_integration.light_name_to_id.keys()),
-            rooms = format!("{:?}", hue_integration.room_name_to_light_group_id.keys()),
+            lights = ?hue_integration.light_name_to_id.keys(),
+            rooms = ?hue_integration.room_name_to_light_group_id.keys(),
             address = bridges.first().unwrap().address.to_string(),
             "Connected to hue bridge",
         );

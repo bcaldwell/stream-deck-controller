@@ -1,9 +1,10 @@
-use crate::integration;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::process::Command;
-use tracing::{debug, error, info};
+use tracing::info;
+
+use crate::integrations::integration;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub enum Protocol {

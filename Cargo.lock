@@ -768,6 +768,7 @@ dependencies = [
  "shellexpand",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2172,6 +2173,7 @@ dependencies = [
  "idna",
  "matches",
  "percent-encoding",
+ "serde",
 ]
 
 [[package]]
