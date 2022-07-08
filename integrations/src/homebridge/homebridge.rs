@@ -89,11 +89,31 @@ impl Homebridge {
         return Ok(());
     }
 
-    pub async fn get_device(&self, uuid: String) -> Result<HomebridgeDevice> {
+    pub async fn device_by_id(&self, uuid: String) -> Result<HomebridgeDevice> {
         return self
             .make_get_request(&format!("api/accessories/{}", &uuid))
             .await
             .map(|r| HomebridgeDevice::new(self.clone(), r));
+    }
+
+    pub async fn devices(&self) -> Result<Vec<HomebridgeDevice>> {
+        let response: Vec<HomebridgeDeviceResponse> =
+            self.make_get_request("api/accessories").await?;
+
+        return Ok(response
+            .into_iter()
+            .map(|r| HomebridgeDevice::new(self.clone(), r))
+            .collect());
+    }
+
+    async fn client(&self, method: reqwest::Method, path: &str) -> Result<reqwest::RequestBuilder> {
+        let token = self.auth_token().await?;
+        let url = self.url_for_path(path);
+
+        let client = reqwest::Client::new();
+        return Ok(client
+            .request(method, url)
+            .header("Authorization", format!("Bearer {}", token)));
     }
 
     async fn make_put_request<T: DeserializeOwned, U: Serialize>(
@@ -101,37 +121,23 @@ impl Homebridge {
         path: &str,
         data: &U,
     ) -> Result<T> {
-        let token = self.auth_token().await?;
-        let client = reqwest::Client::new();
-        let url = self.url_for_path(path);
-        println!("{:?}", url);
-        let r = client
-            .put(url)
-            .header("Authorization", format!("Bearer {}", token))
+        let r = self
+            .client(reqwest::Method::PUT, path)
+            .await?
             .json(data)
             .send()
             .await?;
 
-        // println!("{:?}", serde_json::to_string(&data)?);
-        // println!("{:?}", &r);
-        // r.send().await?;
-        // println!("{:?} {:?}", &r.status(), &r.text().await?);
-
-        return r.json::<T>().await.map_err(|err| anyhow!("{}", err));
+        return r.json::<T>().await.map_err(anyhow::Error::msg);
     }
 
     async fn make_get_request<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let token = self.auth_token().await?;
-        let client = reqwest::Client::new();
-        let url = self.url_for_path(path);
-        println!("{:?}", url);
-        let r = client
-            .get(url)
-            .header("Authorization", format!("Bearer {}", token))
+        let r = self
+            .client(reqwest::Method::GET, path)
+            .await?
             .send()
             .await?;
-        println!("{:?}", &r.status());
-        return r.json::<T>().await.map_err(|err| anyhow!("{}", err));
+        return r.json::<T>().await.map_err(anyhow::Error::msg);
     }
 
     async fn auth_token(&self) -> Result<String> {
@@ -201,12 +207,24 @@ impl HomebridgeDevice {
         return format!("api/accessories/{}", self.response.unique_id);
     }
 
+    pub fn name(&self) -> String {
+        return self.response.service_name.clone();
+    }
+
+    pub fn unique_id(&self) -> String {
+        return self.response.unique_id.clone();
+    }
+
     pub fn on(&self) -> Option<bool> {
         match self.response.values.on {
             Some(1) => Some(true),
             Some(0) => Some(false),
             _ => None,
         }
+    }
+
+    pub fn brightness(&self) -> Option<u64> {
+        return self.response.values.brightness;
     }
 
     pub async fn switch(&mut self, on: bool) -> Result<()> {
@@ -222,6 +240,24 @@ impl HomebridgeDevice {
         let data = AccessoriesPutRequest {
             characteristic_type: "On".to_string(),
             value: serde_json::value::Value::Number(serde_json::value::Number::from(value)),
+        };
+
+        self.response = self
+            .homebridge
+            .make_put_request(&self.endpoint(), &data)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn dimm(&mut self, brightness: u64) -> Result<()> {
+        if self.response.values.brightness.is_none() {
+            return Err(anyhow!("device does not impliment dimm"));
+        }
+
+        let data = AccessoriesPutRequest {
+            characteristic_type: "Brightness".to_string(),
+            value: serde_json::value::Value::Number(serde_json::value::Number::from(brightness)),
         };
 
         self.response = self

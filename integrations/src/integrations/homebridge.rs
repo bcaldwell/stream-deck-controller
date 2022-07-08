@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
@@ -32,7 +34,10 @@ impl integration::IntegrationConfig for IntegrationConfig {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ToggleAction {
-    device: String,
+    uuid: Option<String>,
+    device: Option<String>,
+    brightness: Option<u64>,
+    rel_brightness: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -45,6 +50,7 @@ enum Actions {
 pub struct Integration {
     name: String,
     homebridge: Homebridge,
+    device_name_to_id: HashMap<String, String>,
 }
 
 impl Integration {
@@ -56,10 +62,22 @@ impl Integration {
     ) -> Result<Integration> {
         let homebridge = Homebridge::new(endpoint, username, password).await?;
 
-        return Ok(Integration {
+        let devices = homebridge.devices().await?;
+        let mut integration = Integration {
             name: name,
             homebridge: homebridge,
-        });
+            device_name_to_id: HashMap::new(),
+        };
+
+        integration.device_name_to_id.clear();
+
+        for device in devices {
+            integration
+                .device_name_to_id
+                .insert(device.name(), device.unique_id());
+        }
+
+        return Ok(integration);
     }
 }
 
@@ -78,7 +96,9 @@ impl integration::Integration for Integration {
 
         match options {
             Actions::Toggle(action) => {
-                let mut response = self.homebridge.get_device(action.device).await?;
+                let id = self.device_name_to_id.get(&action.device.unwrap()).unwrap();
+
+                let mut response = self.homebridge.device_by_id(id.to_string()).await?;
                 let on = match response.on() {
                     Some(true) => false,
                     Some(false) => true,
@@ -86,6 +106,10 @@ impl integration::Integration for Integration {
                 };
 
                 response.switch(on).await?;
+                match action.brightness {
+                    Some(brightness) => response.dimm(brightness).await?,
+                    None => (),
+                }
             }
         }
 
