@@ -31,7 +31,7 @@ struct HomebridgeAuthResponse {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HomebridgeDeviceResponse {
+struct HomebridgeDeviceResponse {
     #[serde(rename = "uuid")]
     uuid: String,
     #[serde(rename = "type")]

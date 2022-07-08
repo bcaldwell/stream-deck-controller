@@ -7,6 +7,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::integrations::integration;
+use crate::integrations::utils;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct IntegrationConfig {
@@ -170,45 +171,20 @@ impl Integration {
         brightness_option: Option<f32>,
         rel_brightness_option: Option<f32>,
     ) -> Result<()> {
-        // when brightness and rel_brightness is none, just turn off the light
-        // otherwise check brightness:
-        //   if it is 0, and turn off the light
-        //   otherwise, turn on the light, then set the brightness
-        // then check rel_brightness
-        // setting brightness first results in: device (light) is "soft off", command (.dimming.brightness) may not have effect
-        if rel_brightness_option.is_none() && brightness_option.is_none() {
-            return Ok(light.switch(false).await?);
-        }
+        let light_state = crate::utils::light_utils::calc_light_state(
+            light.brightness,
+            brightness_option,
+            rel_brightness_option,
+        );
 
-        let brightness = match brightness_option {
-            Some(b) => b,
-            None => {
-                self.determine_rel_brightness_val(&light, rel_brightness_option)
-                    .await
-            }
+        light.switch(light_state.on).await?;
+
+        match light_state.brightness {
+            Some(brightness) => light.dimm(brightness).await?,
+            None => (),
         };
 
-        if brightness == 0.0 {
-            return Ok(light.switch(false).await?);
-        }
-
-        light.switch(true).await?;
-        light.dimm(brightness).await?;
-
         Ok(())
-    }
-
-    async fn determine_rel_brightness_val(
-        &self,
-        light: &Light,
-        rel_brightness_option: Option<f32>,
-    ) -> f32 {
-        // default to 0, aka do nothing
-        let rel_brightness = rel_brightness_option.unwrap_or(0.0);
-        // not sure what to do here...
-        let current_brightness = light.brightness.unwrap_or(0.0);
-        let desired_brightness = current_brightness + rel_brightness;
-        return desired_brightness.min(100.0).max(0.0);
     }
 
     async fn toggle_room_action(

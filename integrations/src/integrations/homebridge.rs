@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 
-use crate::homebridge::Homebridge;
+use crate::homebridge::{Homebridge, HomebridgeDevice};
 use crate::integrations::integration;
 
 const DEFAULT_NAME: &str = "homebridge";
@@ -33,11 +33,32 @@ impl integration::IntegrationConfig for IntegrationConfig {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct ToggleAction {
+struct BaseAction {
     uuid: Option<String>,
     device: Option<String>,
-    brightness: Option<u64>,
-    rel_brightness: Option<u64>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct BrightnessAction {
+    brightness: Option<f32>,
+    rel_brightness: Option<f32>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ToggleAction {
+    #[serde(flatten)]
+    base_action: BaseAction,
+    #[serde(flatten)]
+    brightness_action: BrightnessAction,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SetAction {
+    #[serde(flatten)]
+    base_action: BaseAction,
+    #[serde(flatten)]
+    brightness_action: BrightnessAction,
+    on: Option<bool>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -45,6 +66,8 @@ struct ToggleAction {
 enum Actions {
     #[serde(rename = "toggle")]
     Toggle(ToggleAction),
+    #[serde(rename = "set")]
+    Set(SetAction),
 }
 
 pub struct Integration {
@@ -79,6 +102,94 @@ impl Integration {
 
         return Ok(integration);
     }
+
+    async fn get_device_by_name_or_id(
+        &self,
+        id: &Option<String>,
+        name: &Option<String>,
+    ) -> Result<HomebridgeDevice> {
+        match name {
+            Some(name) => return self.get_device_by_name(&name).await,
+            None => (),
+        };
+
+        match id {
+            Some(id) => return self.get_device_by_id(&id).await,
+            None => (),
+        };
+
+        Err(anyhow!("either uuid or device fields must be set"))
+    }
+
+    async fn get_device_by_id(&self, id: &str) -> Result<HomebridgeDevice> {
+        return self.homebridge.device_by_id(id.to_string()).await;
+    }
+
+    async fn get_device_by_name(&self, name: &str) -> Result<HomebridgeDevice> {
+        let id = self
+            .device_name_to_id
+            .get(name)
+            .context(format!("unable to find device named: {}", name))?;
+
+        return self.homebridge.device_by_id(id.to_string()).await;
+    }
+
+    async fn set_device(&self, device: &mut HomebridgeDevice, action: &SetAction) -> Result<()> {
+        // set brightness action if anything is set there
+        if action.brightness_action.brightness.is_some()
+            || action.brightness_action.rel_brightness.is_some()
+        {
+            match action.on {
+                None | Some(true) => {
+                    return self.set_dimmable(device, &action.brightness_action).await
+                }
+                Some(false) => return device.switch(false).await,
+            }
+        }
+
+        match action.on {
+            Some(true) => device.switch(true).await,
+            None | Some(false) => device.switch(false).await,
+        }
+    }
+
+    async fn toggle_device(
+        &self,
+        device: &mut HomebridgeDevice,
+        on: bool,
+        action: &ToggleAction,
+    ) -> Result<()> {
+        if on {
+            return device.switch(false).await;
+        }
+
+        return self.set_dimmable(device, &action.brightness_action).await;
+    }
+
+    async fn set_dimmable(
+        &self,
+        device: &mut HomebridgeDevice,
+        action: &BrightnessAction,
+    ) -> Result<()> {
+        let brightness = match device.brightness() {
+            Some(brightness) => Some(brightness as f32),
+            None => None,
+        };
+        let device_state = crate::utils::light_utils::calc_light_state(
+            brightness,
+            action.brightness,
+            action.rel_brightness,
+        );
+
+        device.switch(device_state.on).await?;
+
+        match device_state.brightness {
+            Some(brightness) => device.dimm(brightness as u64).await?,
+            None => (),
+        };
+
+        return Ok(());
+    }
 }
 
 #[async_trait]
@@ -96,23 +207,22 @@ impl integration::Integration for Integration {
 
         match options {
             Actions::Toggle(action) => {
-                let id = self.device_name_to_id.get(&action.device.unwrap()).unwrap();
+                let mut device = self
+                    .get_device_by_name_or_id(&action.base_action.uuid, &action.base_action.device)
+                    .await?;
 
-                let mut response = self.homebridge.device_by_id(id.to_string()).await?;
-                let on = match response.on() {
-                    Some(true) => false,
-                    Some(false) => true,
-                    _ => return Err(anyhow!("device does not support switch")),
+                return match device.on() {
+                    Some(on) => self.toggle_device(&mut device, on, &action).await,
+                    None => Err(anyhow!("device {:?} does not support on", device.name())),
                 };
+            }
+            Actions::Set(action) => {
+                let mut device = self
+                    .get_device_by_name_or_id(&action.base_action.uuid, &action.base_action.device)
+                    .await?;
 
-                response.switch(on).await?;
-                match action.brightness {
-                    Some(brightness) => response.dimm(brightness).await?,
-                    None => (),
-                }
+                return self.set_device(&mut device, &action).await;
             }
         }
-
-        Ok(())
     }
 }
