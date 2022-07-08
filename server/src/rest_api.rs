@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
 use tokio::time;
-use tracing::{debug, error, info};
+use tracing::info;
 use warp::{http, Filter};
 
 pub async fn start_rest_api(

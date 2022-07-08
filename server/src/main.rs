@@ -6,7 +6,7 @@ use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::info;
 use tracing_subscriber;
 
 mod profiles;
@@ -33,6 +33,7 @@ impl<T: integrations::IntegrationConfig> IntegrationConfiguration<T> {
 #[serde(rename_all = "snake_case")]
 enum IntegrationsConfiguration {
     Hue(IntegrationConfiguration<integrations::hue::IntegrationConfig>),
+    Homebridge(IntegrationConfiguration<integrations::integrations::homebridge::IntegrationConfig>),
     Airplay(IntegrationConfiguration<integrations::airplay::IntegrationConfig>),
     Http(IntegrationConfiguration<integrations::http::IntegrationConfig>),
 }
@@ -41,6 +42,7 @@ impl IntegrationsConfiguration {
     async fn as_integration(&self) -> integrations::IntegrationResult {
         match self {
             IntegrationsConfiguration::Hue(c) => c.as_integration().await,
+            IntegrationsConfiguration::Homebridge(c) => c.as_integration().await,
             IntegrationsConfiguration::Airplay(c) => c.as_integration().await,
             IntegrationsConfiguration::Http(c) => c.as_integration().await,
         }
@@ -61,11 +63,7 @@ async fn main() {
     let config_file =
         &env::var("STREAM_DECK_CONTROLLER_CONFIG").unwrap_or("./config.yaml".to_string());
     let config = read_config(config_file).expect("failed to read config file");
-    info!(
-        config_file,
-        config = format!("{:?}", config),
-        "parsed config file"
-    );
+    info!(config_file, config = ?config, "parsed config file");
     let config_ref = Arc::new(config);
 
     let ws_clients = ws_api::Clients::default();

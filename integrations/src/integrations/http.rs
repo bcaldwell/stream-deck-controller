@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use crate::integration;
+use crate::integrations::integration;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct IntegrationConfig {}
