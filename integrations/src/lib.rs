@@ -1,6 +1,4 @@
-pub mod airplay;
-pub mod http;
-pub mod hue;
-mod integration;
+pub mod homebridge;
+pub mod integrations;
 
-pub use integration::*;
+pub use integrations::*;
