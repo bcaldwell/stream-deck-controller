@@ -163,7 +163,10 @@ impl Integration {
             return device.switch(false).await;
         }
 
-        return self.set_dimmable(device, &action.brightness_action).await;
+        return match device.brightness() {
+            Some(_) => self.set_dimmable(device, &action.brightness_action).await,
+            None => device.switch(true).await,
+        };
     }
 
     async fn set_dimmable(
