@@ -135,7 +135,7 @@ async fn execute_action_request(
         requestor_uuid: requestor_uuid,
     };
 
-    event_processor.send(execute_action_req).await.unwrap();
+    event_processor.send(execute_action_req).await?;
 
     // Wrap the future with a `Timeout` set to expire in 5 seconds.
     match time::timeout(time::Duration::from_secs(5), resp_rx).await {
@@ -153,7 +153,9 @@ fn get_actions_for_button_press(
     profiles: &Profiles,
     profile_button_pressed: ProfileButtonPressed,
 ) -> Result<&Actions> {
-    let profile = profile_button_pressed.profile.unwrap();
+    let profile = profile_button_pressed
+        .profile
+        .ok_or_else(|| anyhow!("button press was not associated with any profile"))?;
     let profile = match profiles::get_profile_by_name(profiles, profile.clone()) {
         Some(profile) => profile,
         None => return Err(anyhow!("profile {} not found", profile.to_string())),

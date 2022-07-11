@@ -6,7 +6,7 @@ use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber;
 
 mod profiles;
@@ -49,6 +49,17 @@ impl IntegrationsConfiguration {
     }
 }
 
+impl std::fmt::Display for IntegrationsConfiguration {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            IntegrationsConfiguration::Hue(_) => write!(f, "hue"),
+            IntegrationsConfiguration::Homebridge(_) => write!(f, "homebridge"),
+            IntegrationsConfiguration::Airplay(_) => write!(f, "airplay"),
+            IntegrationsConfiguration::Http(_) => write!(f, "http"),
+        }
+    }
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Config {
@@ -71,7 +82,12 @@ async fn main() {
     tokio::task::spawn(populat_image_cache(config_ref.clone(), image_cache.clone()));
 
     let (integration_manager, integration_manager_tx) =
-        IntegrationManager::new(ws_clients.clone(), &config_ref).await;
+        IntegrationManager::new(ws_clients.clone(), &config_ref)
+            .await
+            .unwrap_or_else(|err| {
+                error!(error = ?err, "failed to create integration manager, cannot recover");
+                std::process::exit(1);
+            });
     let manager_handle = start_integration_manager(integration_manager);
 
     let api_service = rest_api::start_rest_api(
@@ -83,8 +99,11 @@ async fn main() {
 
     tokio::task::spawn(ws_api::ping_ws_clients(ws_clients.clone()));
 
-    api_service.await;
-    manager_handle.await.unwrap();
+    let (_, manager_handle) = tokio::join!(api_service, manager_handle);
+    match manager_handle {
+        Ok(_) => (),
+        Err(err) => error!(error = ?err, "failure in integration manager"),
+    }
 }
 
 fn read_config(filepath: &str) -> Result<Config> {
@@ -101,7 +120,10 @@ async fn populat_image_cache(config_ref: Arc<Config>, image_cache: ws_api::Image
                 for state in states {
                     if let Some(image) = &state.image {
                         // eat this error, we will try again later when the client requests the image
-                        _ = ws_api::get_image(&image, &state, &image_cache).await;
+                        match ws_api::get_image(&image, &state, &image_cache).await {
+                            Ok(_) => (),
+                            Err(err) => error!(error=?err, "error populating image cache"),
+                        };
                     }
                 }
             }
@@ -119,7 +141,7 @@ impl IntegrationManager {
     async fn new(
         ws_clients: ws_api::Clients,
         config_ref: &Arc<Config>,
-    ) -> (IntegrationManager, Sender<ExecuteActionReq>) {
+    ) -> Result<(IntegrationManager, Sender<ExecuteActionReq>)> {
         let (tx, rx) = mpsc::channel::<ExecuteActionReq>(32);
 
         let mut manager = IntegrationManager {
@@ -129,7 +151,19 @@ impl IntegrationManager {
         };
 
         for integration in &config_ref.as_ref().integrations {
-            let i = integration.as_integration().await.unwrap();
+            info!(
+                integration = integration.to_string(),
+                "setting up integration"
+            );
+            let i = integration.as_integration().await.map_err(|err| {
+                error!(?integration, error = ?err, "failed to create integration");
+                anyhow!(
+                    "failed to create integration {:?} with {:?}",
+                    integration.to_string(),
+                    err
+                )
+            })?;
+
             manager.add_integration(i);
         }
 
@@ -138,7 +172,7 @@ impl IntegrationManager {
             manager.integrations.keys()
         );
 
-        return (manager, tx);
+        return Ok((manager, tx));
     }
 
     fn add_integration(&mut self, integration: Box<dyn Integration + Send + Sync>) {
@@ -152,6 +186,9 @@ impl IntegrationManager {
         actions: Actions,
     ) -> Result<()> {
         for action in actions {
+            let requestor_uuid = requestor_uuid
+                .ok_or_else(|| anyhow!("recieved excute actions request for unknown requestor"))?;
+
             let split_index = action.action.find(ACTION_SPLIT_CHARS);
             let (integration_name, action_name) = match split_index {
                 Some(i) => (
@@ -181,9 +218,10 @@ impl IntegrationManager {
 
                 let r = match profile_value {
                     serde_json::Value::String(profile_name) => {
-                        let u = requestor_uuid.unwrap();
                         let mut clients = self.ws_clients.write().await;
-                        let client = clients.get_mut(&u).unwrap();
+                        let client = clients.get_mut(&requestor_uuid).ok_or_else(|| {
+                            anyhow!("unable to get websocket client for {:?}", requestor_uuid)
+                        })?;
                         client.profile = profile_name.to_string();
                         Ok(())
                     }

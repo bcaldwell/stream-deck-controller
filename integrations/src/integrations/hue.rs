@@ -7,7 +7,6 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::integrations::integration;
-use crate::integrations::utils;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct IntegrationConfig {
@@ -18,7 +17,7 @@ pub struct IntegrationConfig {
 impl integration::IntegrationConfig for IntegrationConfig {
     async fn to_integration(&self, name: Option<String>) -> integration::IntegrationResult {
         let auth = shellexpand::env(&self.auth)?.to_string();
-        let i = Integration::new(name.unwrap_or("hue".to_string()).as_ref(), &auth).await;
+        let i = Integration::new(name.unwrap_or("hue".to_string()).as_ref(), &auth).await?;
         return Ok(Box::new(i));
     }
 }
@@ -49,17 +48,18 @@ pub struct Integration {
 }
 
 impl Integration {
-    pub async fn new(name: &str, application_key: &str) -> Integration {
+    pub async fn new(name: &str, application_key: &str) -> Result<Integration> {
         let bridges = Hue::bridges(Duration::from_secs(5)).await;
-        let device_type = DeviceType::new("benjamin".to_owned(), "streamdeck".to_owned()).unwrap();
+        let device_type = DeviceType::new("benjamin".to_owned(), "streamdeck".to_owned())
+            .map_err(|err| anyhow!("failed to create hue device type: {:?}", err))?;
 
-        let hue = Hue::new_with_key(
-            bridges.first().expect("getting hue bridges failed").address,
-            device_type,
-            application_key.to_string(),
-        )
-        .await
-        .expect("Failed to run bridge information.");
+        let bridge_address = bridges
+            .first()
+            .ok_or_else(|| anyhow!("getting hue bridges failed"))?
+            .address;
+        let hue = Hue::new_with_key(bridge_address, device_type, application_key.to_string())
+            .await
+            .map_err(|err| anyhow!("failed to determine bridge information: {:?}", err))?;
 
         let mut hue_integration = Integration {
             name: name.to_string(),
@@ -68,20 +68,20 @@ impl Integration {
             room_name_to_light_group_id: HashMap::new(),
         };
 
-        hue_integration.sync().await;
+        hue_integration.sync().await?;
 
         info!(
             lights = ?hue_integration.light_name_to_id.keys(),
             rooms = ?hue_integration.room_name_to_light_group_id.keys(),
-            address = bridges.first().unwrap().address.to_string(),
+            address = ?bridge_address,
             "Connected to hue bridge",
         );
 
-        return hue_integration;
+        return Ok(hue_integration);
     }
 
-    async fn sync(&mut self) {
-        let lights = self.hue.lights().await.unwrap();
+    async fn sync(&mut self) -> Result<()> {
+        let lights = self.hue.lights().await?;
         self.light_name_to_id.clear();
 
         for light in lights {
@@ -89,7 +89,7 @@ impl Integration {
                 .insert(light.name, light.id.to_string());
         }
 
-        let rooms = self.hue.rooms().await.unwrap();
+        let rooms = self.hue.rooms().await?;
         self.room_name_to_light_group_id.clear();
 
         for room in rooms {
@@ -104,6 +104,8 @@ impl Integration {
                     .insert(room_name.to_string(), service.rid.to_string());
             }
         }
+
+        Ok(())
     }
 
     async fn get_light_by_name(&self, name: &str) -> Result<huehue::Light> {
@@ -221,7 +223,13 @@ impl integration::Integration for Integration {
         _action: String,
         json_options: serde_json::value::Value,
     ) -> Result<()> {
-        let options: Actions = serde_json::from_value(json_options).unwrap();
+        let options: Actions = serde_json::from_value(json_options).map_err(|err| {
+            anyhow!(
+                "unable to convert action to {} action: {:?}",
+                self.name(),
+                err
+            )
+        })?;
 
         match options {
             Actions::Toggle(toggle_action) => {

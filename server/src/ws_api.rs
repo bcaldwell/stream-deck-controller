@@ -6,8 +6,10 @@ use futures_util::StreamExt;
 use image::{self, Pixel};
 use sdc_core::types::{ExecuteActionReq, ProfileButtonPressed, SetButtonUI, WsActions};
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -72,8 +74,8 @@ pub async fn ws_client_connected(
     // Split the socket into a sender and receive of messages.
 
     let (profile_sync_tx, profile_sync_rx) = mpsc::unbounded_channel::<()>();
-
-    tokio::spawn(set_button_for_profile(
+    let profile_sync_tx = Arc::new(profile_sync_tx);
+    tokio::spawn(profile_sync_task(
         config.clone(),
         id,
         clients.clone(),
@@ -81,65 +83,95 @@ pub async fn ws_client_connected(
         image_cache,
     ));
 
-    profile_sync_tx.send(()).unwrap();
+    match profile_sync_tx.send(()) {
+        Ok(_) => (),
+        Err(err) => error!(error=?err, uuid=?id, "failed to sending initial profile"),
+    };
 
     while let Some(result) = rx.next().await {
-        let msg = match result {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!("websocket error(uid={}): {}", id, e);
-                break;
-            }
-        };
-
-        if msg.is_ping() || msg.is_pong() {
-            continue;
-        }
-
-        if !msg.is_text() {
-            info!(?id, "unknown message type, ignoring");
-            continue;
-        }
-
-        let msg_str = String::from_utf8(msg.into_bytes().to_vec()).unwrap();
-        let mut p: ProfileButtonPressed = serde_json::from_str(&msg_str).unwrap();
-        if p.profile.is_none() {
-            p.profile = Some(clients.read().await.get(&id).unwrap().profile.to_string())
-        }
-
-        info!("{:?}", &p);
-        // p.profile = p.profile.unwrap_or()
-        crate::rest_api::handle_button_pressed_action(
-            p,
+        match handle_msg(
+            id,
+            clients.clone(),
+            profile_sync_tx.clone(),
             event_processor.clone(),
             config.clone(),
-            Some(id),
+            result,
         )
         .await
-        .unwrap();
-
-        // todo: this is pretty silly, since every button press will trigger a full ui resyn, really
-        // this should be smart and only resync if there are changes
-        info!("Sending profile");
-        profile_sync_tx.send(()).unwrap();
+        {
+            Ok(_) => (),
+            Err(err) => error!(error=?err, uuid=?id, "error handling message"),
+        }
     }
     client_disconnected(clients, id).await;
     // user_ws_rx stream will keep processing as long as the user stays
     // connected. Once they disconnect, then...
 }
 
-// async fn handle_msg(result: Result<Message, Error>) -> Result<()> {
+async fn handle_msg(
+    id: uuid::Uuid,
+    clients: Arc<RwLock<HashMap<uuid::Uuid, Client>>>,
+    profile_sync_tx: Arc<UnboundedSender<()>>,
+    event_processor: mpsc::Sender<ExecuteActionReq>,
+    config: Arc<Config>,
+    result: Result<Message, warp::Error>,
+) -> Result<()> {
+    let msg = match result {
+        Ok(msg) => msg,
+        Err(e) => {
+            error!(error=?e, uuid=?id, "websocket error");
+            return Err(anyhow::Error::msg(e));
+        }
+    };
 
-// }
+    if msg.is_ping() || msg.is_pong() {
+        return Ok(());
+    }
+
+    if !msg.is_text() {
+        info!(?id, "unknown message type, ignoring");
+        return Ok(());
+    }
+
+    let msg_str = String::from_utf8(msg.into_bytes().to_vec())?;
+    let mut p: ProfileButtonPressed = serde_json::from_str(&msg_str)?;
+    if p.profile.is_none() {
+        p.profile = Some(
+            clients
+                .read()
+                .await
+                .get(&id)
+                .ok_or_else(|| anyhow!("failed to find client"))?
+                .profile
+                .to_string(),
+        )
+    }
+
+    info!("{:?}", &p);
+    // p.profile = p.profile.unwrap_or()
+    crate::rest_api::handle_button_pressed_action(
+        p,
+        event_processor.clone(),
+        config.clone(),
+        Some(id),
+    )
+    .await
+    .map_err(|e| anyhow!("button pressed handler rejected the request"))?;
+
+    // todo: this is pretty silly, since every button press will trigger a full ui resyn, really
+    // this should be smart and only resync if there are changes
+    info!("Sending profile");
+    Ok(profile_sync_tx.send(())?)
+}
 
 async fn client_disconnected(clients: Clients, id: uuid::Uuid) {
-    error!("websocket disconnected: {}", id);
+    info!("websocket disconnected: {}", id);
 
     // Stream closed up, so remove from the user list
     clients.write().await.remove(&id);
 }
 
-async fn set_button_for_profile(
+async fn profile_sync_task(
     config: Arc<Config>,
     id: uuid::Uuid,
     clients: Clients,
@@ -147,47 +179,73 @@ async fn set_button_for_profile(
     image_cache: ImageCache,
 ) {
     while let Some(_) = profile_sync_rx.recv().await {
-        let start_time = std::time::SystemTime::now();
-        let mut button_config = Vec::new();
-        let profile = profiles::get_profile_by_name(
-            &config.as_ref().profiles,
-            clients.read().await.get(&id).unwrap().profile.to_string(),
-        )
-        .unwrap();
-
-        for button in &profile.buttons {
-            let button_state: &SetButtonUI = &button.states.as_ref().unwrap()[0];
-
-            let image = match &button_state.image {
-                Some(image) => get_image(image, button_state, &image_cache).await.ok(),
-                None => None,
-            };
-
-            button_config.push(SetButtonUI {
-                image: image,
-                color: button_state.color.clone(),
-            });
+        match handle_profile_sync_request(&config, &clients, id, &image_cache).await {
+            Ok(_) => (),
+            Err(err) => {
+                error!(error=?err, uuid=?id, "failed to sync profile")
+            }
         }
+    }
+}
 
-        let msg = WsActions::SetButtons {
-            buttons: button_config,
+async fn handle_profile_sync_request(
+    config: &Arc<Config>,
+    clients: &Arc<RwLock<HashMap<uuid::Uuid, Client>>>,
+    id: uuid::Uuid,
+    image_cache: &Arc<RwLock<HashMap<String, String>>>,
+) -> Result<()> {
+    let mut button_config = Vec::new();
+    let profile = profiles::get_profile_by_name(
+        &config.as_ref().profiles,
+        clients
+            .read()
+            .await
+            .get(&id)
+            .ok_or_else(|| anyhow!("failed to get client for id"))?
+            .profile
+            .to_string(),
+    )
+    .ok_or_else(|| anyhow!("failed to find profile for client"))?;
+
+    for button in &profile.buttons {
+        let button_state: &SetButtonUI = &button.states.as_ref().unwrap()[0];
+
+        let image = match &button_state.image {
+            Some(image) => {
+                get_image(image, button_state, image_cache)
+                    .await
+                    // log error, because its getting eaten
+                    .map_err(|err| {
+                        error!(error=?err, image, "failed to get image, skipping");
+                        err
+                    })
+                    .ok()
+            }
+            None => None,
         };
 
-        info!(
-            "time taken: {}",
-            std::time::SystemTime::now()
-                .duration_since(start_time)
-                .unwrap()
-                .as_micros()
-        );
-        send_ws_message(
-            &id,
-            clients.clone(),
-            Message::text(serde_json::to_string(&msg).unwrap()),
-        )
-        .await
-        .unwrap();
+        button_config.push(SetButtonUI {
+            image: image,
+            color: button_state.color.clone(),
+        });
     }
+    let msg = WsActions::SetButtons {
+        buttons: button_config,
+    };
+    let msg = match serde_json::to_string(&msg) {
+        Ok(msg) => msg,
+        Err(err) => {
+            error!(error=?err, "failed to convert set button event to string, aborting");
+            return Err(anyhow::Error::msg(err));
+        }
+    };
+    let msg = Message::text(msg);
+    error!(client=?id, profile=?profile, "sending set button event");
+    match send_ws_message(&id, clients.clone(), msg).await {
+        Ok(_) => (),
+        Err(err) => error!(error =?err, client=?id, "failed to send button pressed message"),
+    };
+    Ok(())
 }
 
 async fn send_ws_message(
@@ -213,22 +271,27 @@ pub async fn get_image(
         button_state.color.as_ref().unwrap_or(&"".to_string())
     );
 
-    let cached_locked = image_cache.read().await;
-    let cached_image = cached_locked.get(&cache_key);
-    if cached_image.is_some() {
-        let response = cached_image.unwrap().to_string();
-        // need to force drop this so it doesn't block
-        return Ok(response);
+    {
+        let cached_locked = image_cache.read().await;
+        let cached_image = cached_locked.get(&cache_key);
+        match cached_image {
+            Some(cached_image) => {
+                return Ok(cached_image.to_string());
+            }
+            None => (),
+        }
     }
-
-    drop(cached_locked);
     let mut loaded_image = fetch_image(image).await?;
 
     // apply background if color is also set
     // steal this from the streamdeck library, to avoid it as a dependency for the api
+    info!(image=?image, color=?button_state.color, "loading image");
     if let Some(color) = &button_state.color {
-        let (r, g, b) = hex_color_components_from_str(&color).unwrap();
-        let rgba = loaded_image.as_mut_rgba8().unwrap();
+        let (r, g, b) = hex_color_components_from_str(&color)
+            .map_err(|err| anyhow!("unable to decoed hex color: {}", err))?;
+        let rgba = loaded_image.as_mut_rgba8().ok_or_else(|| {
+            anyhow!("unable to convert image to have transparent layer, is it a png?")
+        })?;
 
         let mut r = image::Rgba([r, g, b, 0]);
         for p in rgba.pixels_mut() {
@@ -242,9 +305,13 @@ pub async fn get_image(
     loaded_image
         .resize(100, 100, image::imageops::FilterType::Nearest)
         .write_to(&mut buffered_image, image::ImageOutputFormat::Png)
-        .unwrap();
+        .map_err(|err| anyhow!("unable to write image to buffer: {}", err))?;
 
-    let base64_encoded = base64::encode(&buffered_image.into_inner().unwrap());
+    let base64_encoded = base64::encode(
+        &buffered_image
+            .into_inner()
+            .map_err(|err| anyhow!("unable convert buffered image: {}", err))?,
+    );
     image_cache
         .write()
         .await
