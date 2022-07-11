@@ -3,6 +3,7 @@ use futures_util::stream::StreamExt;
 use futures_util::FutureExt;
 use sdc_core::types::{ProfileButtonPressed, SetButtonUI, WsActions};
 use std::env;
+use std::process::exit;
 use std::str::FromStr;
 use std::sync::Arc;
 use stream_deck_device::{StreamDeckDevice, StreamDeckDeviceTypes};
@@ -77,20 +78,27 @@ async fn main() {
     ws_read
         .for_each(|message| async {
             // tokio_tungstenite responds to ping with pong already, no need to worry about it
-            let message = message.unwrap();
+            let message = match message {
+                Ok(message) => message,
+                Err(err) => {
+                    error!(error=?err, "failed to read message from websocket, can not recover");
+                    exit(1);
+                }
+            };
             handle_socket_message(message, image_update_tx.clone(), &device).await;
-            // match message {
-            // Ok(msg) => handle_socket_message(msg, image_update_tx.clone(), &device).await,
-            //     Err(err) => {
-            //         info!("Error opening message: {}", err);
-            //         return Err(anyhow!("connection likely closed"));
-            //     }
-            // }
         })
         .await;
 
-    handle_button_requests_join.await.unwrap();
-    stream_deck_listener_join.await.unwrap();
+    let (handle_button_requests_join, stream_deck_listener_join) =
+        tokio::join!(handle_button_requests_join, stream_deck_listener_join);
+    match handle_button_requests_join {
+        Ok(_) => (),
+        Err(err) => error!(error = ?err, "failure in handle button request"),
+    }
+    match stream_deck_listener_join {
+        Ok(_) => (),
+        Err(err) => error!(error = ?err, "failure in streamdeck listener"),
+    }
 }
 
 async fn connect_to_stream_deck(device: StreamDeckDevice) -> Result<Arc<Mutex<StreamDeck>>> {
@@ -146,16 +154,19 @@ async fn set_button_state(
     deck_ref: &Arc<Mutex<StreamDeck>>,
     device: &StreamDeckDevice,
 ) -> Result<()> {
+    let (image_width, image_height) = device.image_size();
+    let image_width = image_width.try_into()?;
+    let image_height = image_height.try_into()?;
+
     if let Some(image) = &set_button_request.state.image {
         let img_str = base64::decode(image.to_string().into_bytes())
             .map_err(|e| anyhow!("failed to decode image from base64: {}", e))?;
         let image = image::load_from_memory(&img_str)
             .map_err(|e| anyhow!("failed to load image from into memory: {}", e))?;
 
-        let (w, h) = device.image_size();
         let resized_image = image.resize(
-            w.try_into().unwrap(),
-            h.try_into().unwrap(),
+            image_width,
+            image_height,
             image::imageops::FilterType::Nearest,
         );
 
@@ -193,13 +204,23 @@ async fn handle_socket_message(
         return;
     }
 
-    if !msg.is_text() {
-        info!("unknown message type, ignoring");
-        return;
-    }
+    let msg = match msg.to_text() {
+        Ok(msg) => msg,
+        Err(_) => {
+            info!("message is not a string, ignoring");
+            return;
+        }
+    };
 
-    let p: WsActions = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-    let r = match p {
+    let msg = match serde_json::from_str(msg) {
+        Ok(msg) => msg,
+        Err(err) => {
+            info!(?msg, "unknown message type ({:?}), ignoring", err);
+            return;
+        }
+    };
+
+    let r = match msg {
         WsActions::SetButton { index, button } => image_update_tx
             .send(SetButtonRequest {
                 state: button,
@@ -232,7 +253,12 @@ async fn send_button_update_requests(
     }
 
     // set remaining buttons black
-    for i in buttons.len()..device.keys().try_into().unwrap() {
+    for i in buttons.len()..device.keys().try_into().map_err(|err| {
+        anyhow!(
+            "unable to determine number of keys on the streamdeck with error {:?}",
+            err
+        )
+    })? {
         image_update_tx
             .send(SetButtonRequest {
                 state: SetButtonUI {
@@ -284,9 +310,19 @@ async fn start_stream_deck_listener(
                     button: i,
                 };
 
-                let msg = Message::text(serde_json::to_string(&map).unwrap());
+                let msg = match serde_json::to_string(&map) {
+                    Ok(msg) => msg,
+                    Err(err) => {
+                        error!(error=?err, "failed to convert button pressed event to string, aborting");
+                        continue;
+                    }
+                };
+                let msg = Message::text(msg);
                 info!("Sending button press: {:?}", msg);
-                write.send(msg).unwrap();
+                match write.send(msg) {
+                    Ok(_) => (),
+                    Err(err) => error!(error =?err, "failed to send button pressed message"),
+                };
             }
         }
 
