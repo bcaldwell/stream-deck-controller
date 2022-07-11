@@ -206,8 +206,13 @@ impl integration::Integration for Integration {
         _action: String,
         json_options: serde_json::value::Value,
     ) -> Result<()> {
-        let options: Actions = serde_json::from_value(json_options).unwrap();
-
+        let options: Actions = serde_json::from_value(json_options).map_err(|err| {
+            anyhow!(
+                "unable to convert action to {} action: {:?}",
+                self.name(),
+                err
+            )
+        })?;
         match options {
             Actions::Toggle(action) => {
                 let mut device = self

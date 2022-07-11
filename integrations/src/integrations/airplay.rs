@@ -130,7 +130,7 @@ impl Integration {
         options: &Actions,
         atv_api_endpoint: String,
     ) -> Result<()> {
-        let (device, endpoint) = self.get_url_for_action(&options);
+        let (device, endpoint) = self.get_url_for_action(&options)?;
         let client = reqwest::Client::new();
         let mut r = client.get(format!("{}/{}", atv_api_endpoint, endpoint));
 
@@ -161,32 +161,39 @@ impl Integration {
         Ok(())
     }
 
-    fn get_url_for_action(&self, action: &Actions) -> (&Device, String) {
+    fn get_url_for_action(&self, action: &Actions) -> Result<(&Device, String)> {
         match action {
             Actions::Command(command_action) => {
-                let device = self.devices.get(&command_action.device).unwrap();
-                (
+                let device = self.devices.get(&command_action.device).ok_or_else(|| {
+                    anyhow!("unable to find device named {}", &command_action.device)
+                })?;
+                Ok((
                     device,
                     format!("command/{}/{}", device.identifier, command_action.command).to_string(),
-                )
+                ))
             }
             Actions::OpenApp(open_action) => {
-                let device = self.devices.get(&open_action.device).unwrap();
-                (
+                let device = self.devices.get(&open_action.device).ok_or_else(|| {
+                    anyhow!("unable to find device named {}", &open_action.device)
+                })?;
+                Ok((
                     device,
                     format!(
                         "apps/{}/open/{}",
                         device.identifier, &open_action.identifier
                     )
                     .to_string(),
-                )
+                ))
             }
         }
     }
 
     async fn run_atvremote_command_binary(&self, options: &Actions, binary: String) -> Result<()> {
         let (device_name, command) = self.get_command_for_action(&options);
-        let device = self.devices.get(&device_name).unwrap();
+        let device = self
+            .devices
+            .get(&device_name)
+            .ok_or_else(|| anyhow!("unable to find device named {}", &device_name))?;
         let mut cmd = self.atvremote_command_for_device(&device, binary).await;
         cmd.arg(command);
 
@@ -199,8 +206,8 @@ impl Integration {
             return Err(anyhow!(
                 "airplay command returned non-zero exit ({}): {} {}",
                 output.status,
-                String::from_utf8(output.stdout).unwrap(),
-                String::from_utf8(output.stderr).unwrap(),
+                String::from_utf8(output.stdout)?,
+                String::from_utf8(output.stderr)?,
             ));
         }
 
@@ -254,8 +261,13 @@ impl integration::Integration for Integration {
         _action: String,
         json_options: serde_json::value::Value,
     ) -> Result<()> {
-        let options: Actions = serde_json::from_value(json_options).unwrap();
-
+        let options: Actions = serde_json::from_value(json_options).map_err(|err| {
+            anyhow!(
+                "unable to convert action to {} action: {:?}",
+                self.name(),
+                err
+            )
+        })?;
         self.run_atvremote_command(options).await
     }
 }
