@@ -8,10 +8,9 @@ pub struct IntegrationConfig {}
 
 #[async_trait]
 impl integration::IntegrationConfig for IntegrationConfig {
-    async fn to_integration(&self, name: Option<String>) -> integration::IntegrationResult {
-        return Ok(Box::new(Integration::new(
-            name.unwrap_or("http".to_string()),
-        )));
+    async fn into_integration(&self, name: Option<String>) -> integration::IntegrationResult {
+        let integration = Integration::new(name.unwrap_or("http".to_string()));
+        return Ok(integration.into());
     }
 }
 

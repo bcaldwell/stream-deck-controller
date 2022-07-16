@@ -6,7 +6,6 @@ use futures_util::StreamExt;
 use image::{self, Pixel};
 use sdc_core::types::{ExecuteActionReq, ProfileButtonPressed, SetButtonUI, WsActions};
 use std::collections::HashMap;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
@@ -156,7 +155,7 @@ async fn handle_msg(
         Some(id),
     )
     .await
-    .map_err(|e| anyhow!("button pressed handler rejected the request"))?;
+    .map_err(|err| anyhow!("button pressed handler rejected the request: {:?}", err))?;
 
     // todo: this is pretty silly, since every button press will trigger a full ui resyn, really
     // this should be smart and only resync if there are changes

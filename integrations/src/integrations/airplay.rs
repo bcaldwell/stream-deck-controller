@@ -43,13 +43,13 @@ pub struct IntegrationConfig {
 
 #[async_trait]
 impl integration::IntegrationConfig for IntegrationConfig {
-    async fn to_integration(&self, name: Option<String>) -> integration::IntegrationResult {
+    async fn into_integration(&self, name: Option<String>) -> integration::IntegrationResult {
         let i = Integration::new(
             name.unwrap_or("airplay".to_string()),
             &self.api_endpoint,
             &self.devices,
         )?;
-        return Ok(Box::new(i));
+        return Ok(i.into());
     }
 }
 

@@ -14,6 +14,7 @@
             pkgs.rustc
             # pkgs.rustup
             pkgs.rustfmt
+            pkgs.rust-analyzer
             pkgs.cargo-edit
             pkgs.go-task
             # needed for linker to work with tokio
