@@ -15,10 +15,10 @@ pub struct IntegrationConfig {
 
 #[async_trait]
 impl integration::IntegrationConfig for IntegrationConfig {
-    async fn to_integration(&self, name: Option<String>) -> integration::IntegrationResult {
+    async fn into_integration(&self, name: Option<String>) -> integration::IntegrationResult {
         let auth = shellexpand::env(&self.auth)?.to_string();
         let i = Integration::new(name.unwrap_or("hue".to_string()).as_ref(), &auth).await?;
-        return Ok(Box::new(i));
+        return Ok(i.into());
     }
 }
 

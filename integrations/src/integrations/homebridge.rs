@@ -17,7 +17,7 @@ pub struct IntegrationConfig {
 
 #[async_trait]
 impl integration::IntegrationConfig for IntegrationConfig {
-    async fn to_integration(&self, name: Option<String>) -> integration::IntegrationResult {
+    async fn into_integration(&self, name: Option<String>) -> integration::IntegrationResult {
         let username = shellexpand::env(&self.username)?.to_string();
         let password = shellexpand::env(&self.password)?.to_string();
 
@@ -28,7 +28,7 @@ impl integration::IntegrationConfig for IntegrationConfig {
             &password,
         )
         .await?;
-        return Ok(Box::new(i));
+        return Ok(i.into());
     }
 }
 

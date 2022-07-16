@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use integrations::Integration;
+use integrations::{Integration, IntegrationEnum, IntegrationsConfigurationEnum, IntoIntegration};
 use sdc_core::types::{Actions, ExecuteActionReq, Profiles};
 use std::collections::HashMap;
 use std::env;
@@ -16,54 +16,9 @@ mod ws_api;
 const ACTION_SPLIT_CHARS: [char; 2] = [':', ':'];
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct IntegrationConfiguration<T: integrations::IntegrationConfig> {
-    name: Option<String>,
-    #[serde(flatten)]
-    options: T,
-}
-
-impl<T: integrations::IntegrationConfig> IntegrationConfiguration<T> {
-    async fn as_integration(&self) -> integrations::IntegrationResult {
-        return self.options.to_integration(self.name.clone()).await;
-    }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-enum IntegrationsConfiguration {
-    Hue(IntegrationConfiguration<integrations::hue::IntegrationConfig>),
-    Homebridge(IntegrationConfiguration<integrations::integrations::homebridge::IntegrationConfig>),
-    Airplay(IntegrationConfiguration<integrations::airplay::IntegrationConfig>),
-    Http(IntegrationConfiguration<integrations::http::IntegrationConfig>),
-}
-
-impl IntegrationsConfiguration {
-    async fn as_integration(&self) -> integrations::IntegrationResult {
-        match self {
-            IntegrationsConfiguration::Hue(c) => c.as_integration().await,
-            IntegrationsConfiguration::Homebridge(c) => c.as_integration().await,
-            IntegrationsConfiguration::Airplay(c) => c.as_integration().await,
-            IntegrationsConfiguration::Http(c) => c.as_integration().await,
-        }
-    }
-}
-
-impl std::fmt::Display for IntegrationsConfiguration {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            IntegrationsConfiguration::Hue(_) => write!(f, "hue"),
-            IntegrationsConfiguration::Homebridge(_) => write!(f, "homebridge"),
-            IntegrationsConfiguration::Airplay(_) => write!(f, "airplay"),
-            IntegrationsConfiguration::Http(_) => write!(f, "http"),
-        }
-    }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Config {
-    integrations: Vec<IntegrationsConfiguration>,
+    integrations: Vec<IntegrationsConfigurationEnum>,
     profiles: Profiles,
 }
 
@@ -132,7 +87,7 @@ async fn populat_image_cache(config_ref: Arc<Config>, image_cache: ws_api::Image
 }
 
 struct IntegrationManager {
-    integrations: HashMap<String, Box<dyn Integration + Send + Sync>>,
+    integrations: HashMap<String, IntegrationEnum>,
     rx: Receiver<ExecuteActionReq>,
     ws_clients: ws_api::Clients,
 }
@@ -155,7 +110,7 @@ impl IntegrationManager {
                 integration = integration.to_string(),
                 "setting up integration"
             );
-            let i = integration.as_integration().await.map_err(|err| {
+            let i = integration.into_integration().await.map_err(|err| {
                 error!(?integration, error = ?err, "failed to create integration");
                 anyhow!(
                     "failed to create integration {:?} with {:?}",
@@ -175,7 +130,7 @@ impl IntegrationManager {
         return Ok((manager, tx));
     }
 
-    fn add_integration(&mut self, integration: Box<dyn Integration + Send + Sync>) {
+    fn add_integration(&mut self, integration: IntegrationEnum) {
         self.integrations
             .insert(integration.name().to_string(), integration);
     }
@@ -238,7 +193,6 @@ impl IntegrationManager {
             match integration_option {
                 Some(integration) => {
                     integration
-                        .as_ref()
                         .execute_action(action_name.to_string(), options)
                         .await?;
                 }
