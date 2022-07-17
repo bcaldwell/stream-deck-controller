@@ -239,7 +239,7 @@ async fn handle_profile_sync_request(
         }
     };
     let msg = Message::text(msg);
-    error!(client=?id, profile=?profile, "sending set button event");
+    info!(client=?id, profile=?profile.name, "sending set button event");
     match send_ws_message(&id, clients.clone(), msg).await {
         Ok(_) => (),
         Err(err) => error!(error =?err, client=?id, "failed to send button pressed message"),

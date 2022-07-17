@@ -61,11 +61,19 @@ async fn main() {
     let (client_sender, client_rcv) = mpsc::unbounded_channel();
 
     let client_rcv = UnboundedReceiverStream::new(client_rcv);
-    tokio::task::spawn(client_rcv.map(|x| Ok(x)).forward(ws_write).map(|result| {
-        if let Err(e) = result {
-            error!("error sending websocket msg: {}", e);
-        }
-    }));
+    tokio::task::spawn(
+        client_rcv
+            .map(|x| {
+                info!(message=?x, "sending message on websocket");
+                Ok(x)
+            })
+            .forward(ws_write)
+            .map(|result| {
+                if let Err(e) = result {
+                    error!("error sending websocket msg: {}", e);
+                }
+            }),
+    );
 
     let handle_button_requests_join = tokio::spawn(handle_set_button_requests(
         image_update_rx,
@@ -85,6 +93,7 @@ async fn main() {
                     exit(1);
                 }
             };
+            info!("received message on socket, starting to process");
             handle_socket_message(message, image_update_tx.clone(), &device).await;
         })
         .await;
@@ -137,6 +146,7 @@ async fn handle_set_button_requests(
     device: StreamDeckDevice,
 ) {
     while let Some(set_button_request) = rx.recv().await {
+        info!(button = set_button_request.button, "setting button image");
         match set_button_state(&set_button_request, &deck_ref, &device).await {
             Ok(_) => (),
             Err(e) => {
@@ -176,6 +186,10 @@ async fn set_button_state(
             .set_button_image(set_button_request.button, resized_image)
             .map_err(|e| anyhow!("failed to set button image: {}", e))?;
 
+        info!(
+            button = set_button_request.button,
+            "finished setting button image"
+        );
         return Ok(());
     }
 
@@ -189,6 +203,10 @@ async fn set_button_state(
             .set_button_rgb(set_button_request.button, &color)
             .map_err(|e| anyhow!("failed to set button color: {}", e))?;
 
+        info!(
+            button = set_button_request.button,
+            "finished setting button image"
+        );
         return Ok(());
     }
 
@@ -212,13 +230,18 @@ async fn handle_socket_message(
         }
     };
 
-    let msg = match serde_json::from_str(msg) {
+    let msg: WsActions = match serde_json::from_str(msg) {
         Ok(msg) => msg,
         Err(err) => {
             info!(?msg, "unknown message type ({:?}), ignoring", err);
             return;
         }
     };
+
+    info!(
+        message_type = msg.type_string(),
+        "processing message from websocket"
+    );
 
     let r = match msg {
         WsActions::SetButton { index, button } => image_update_tx
@@ -381,7 +404,7 @@ fn is_time_to_toggle_sleep(
         match std::time::SystemTime::now().duration_since(last_button_press_time) {
             Ok(t) => t,
             Err(e) => {
-                print!(
+                error!(
                     "failed to determine the time since last sleep, assuming no change: {}",
                     e
                 );
