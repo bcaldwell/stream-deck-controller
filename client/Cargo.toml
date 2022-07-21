@@ -19,5 +19,5 @@ tokio-tungstenite = { version = "0.17.2", features = ["rustls-tls-webpki-roots"]
 base64 = "0.13.0"
 rand = "0.8.5"
 anyhow = "1.0"
-tracing-subscriber = "0.3.14"
+tracing-subscriber = "0.3.15"
 tracing = "0.1.35"
