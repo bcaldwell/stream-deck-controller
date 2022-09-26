@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 sdc_core = {path = "../sdc_core"}
 streamdeck = "0.7.0"
-image = "0.23.3"
+image = "0.24.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # reqwest = { version = "0.11.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
