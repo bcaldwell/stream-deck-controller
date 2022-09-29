@@ -37,7 +37,7 @@ async fn ping_all_ws_clients(clients: Clients) {
     let lock = clients.read().await;
     for (_, client) in lock.iter() {
         // ignore the response, since its just a ping, doesn't really matter
-        _ = client.sender.send(Ok(Message::ping("ping")));
+        let result = client.sender.send(Ok(Message::ping("ping")));
     }
 }
 
@@ -300,17 +300,13 @@ pub async fn get_image(
         }
     }
 
-    let mut buffered_image = std::io::BufWriter::new(Vec::new());
+    let mut buffered_image = Vec::new();
     loaded_image
         .resize(100, 100, image::imageops::FilterType::Nearest)
-        .write_to(&mut buffered_image, image::ImageOutputFormat::Png)
+        .write_to(&mut std::io::Cursor::new(&mut buffered_image), image::ImageOutputFormat::Png)
         .map_err(|err| anyhow!("unable to write image to buffer: {}", err))?;
 
-    let base64_encoded = base64::encode(
-        &buffered_image
-            .into_inner()
-            .map_err(|err| anyhow!("unable convert buffered image: {}", err))?,
-    );
+    let base64_encoded = base64::encode(&buffered_image);
     image_cache
         .write()
         .await
