@@ -223,7 +223,7 @@ fn start_integration_manager(mut integration_manager: IntegrationManager) -> Joi
                 }
             };
             // okay to eat this error, since that means the reciever is closed
-            _ = execute_actions_req.tx.send(response.to_string());
+            let result = execute_actions_req.tx.send(response.to_string());
         }
 
         return ();
