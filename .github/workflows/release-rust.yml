@@ -16,7 +16,7 @@ jobs:
           toolchain: stable
           target: arm-unknown-linux-gnueabihf
           override: true
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
         with:
           key: arm-unknown-linux-gnueabihf
       - name: Login to DockerHub
@@ -80,7 +80,7 @@ jobs:
           toolchain: stable
           target: ${{ matrix.target }}
           override: true
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
