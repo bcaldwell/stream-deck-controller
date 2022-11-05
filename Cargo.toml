@@ -1,12 +1,8 @@
 [workspace]
-members = [
-    "sdc_core",
-    "integrations",
-    "server",
-    "client",
-]
+members = ["sdc_core", "integrations", "server", "client"]
 
-default-members = [
-  "server",
-  "client",
-]
+default-members = ["server", "client"]
+
+[workspace.package]
+edition = '2021'
+

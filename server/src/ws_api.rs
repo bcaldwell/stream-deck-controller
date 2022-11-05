@@ -303,7 +303,10 @@ pub async fn get_image(
     let mut buffered_image = Vec::new();
     loaded_image
         .resize(100, 100, image::imageops::FilterType::Nearest)
-        .write_to(&mut std::io::Cursor::new(&mut buffered_image), image::ImageOutputFormat::Png)
+        .write_to(
+            &mut std::io::Cursor::new(&mut buffered_image),
+            image::ImageOutputFormat::Png,
+        )
         .map_err(|err| anyhow!("unable to write image to buffer: {}", err))?;
 
     let base64_encoded = base64::encode(&buffered_image);
