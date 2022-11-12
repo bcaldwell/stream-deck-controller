@@ -69,8 +69,8 @@ export CARGO_TARGET_arm_unknown_linux_gnueabihf_LINKER="gcc-sysroot"
 export CFLAGS="-std=c99"
 
 # Overwrite libc and libpthread with the new ones since the sysroot ones are outdated
-cp $SYSROOT/lib/arm-linux-gnueabihf/libc-2.28.so $SYSROOT/lib/libc.so.6
-cp $SYSROOT/lib/arm-linux-gnueabihf/libpthread-2.28.so $SYSROOT/lib/libpthread.so.0
+cp $SYSROOT/lib/arm-linux-gnueabihf/libc-2.31.so $SYSROOT/lib/libc.so.6
+cp $SYSROOT/lib/arm-linux-gnueabihf/libpthread-2.31.so $SYSROOT/lib/libpthread.so.0
 
 CMD=$1
 shift
