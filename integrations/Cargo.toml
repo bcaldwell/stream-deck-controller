@@ -9,7 +9,7 @@ edition = "2021"
 # replace huehue dependency with local copy, patch only support at package level so dont use
 # patch.crates-io as normal.
 huehue = { path = "./lib/huehue" }
-async-trait = "0.1.62"
+async-trait = "0.1.63"
 anyhow = "1.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
