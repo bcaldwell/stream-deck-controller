@@ -8,7 +8,7 @@ jobs:
     name: Build client for Raspberry Pi
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3.3.0
+      - uses: actions/checkout@v3.4.0
       - name: Setup toolchain
         uses: actions-rs/toolchain@v1
         with:
