@@ -1,4 +1,4 @@
-FROM rust:1.68.0-buster
+FROM rust:1.68.1-buster
 RUN rustup target add arm-unknown-linux-gnueabihf
 RUN cargo install cargo-deb
 ADD build-pi-armv6hf.sh /build-pi-armv6hf.sh
