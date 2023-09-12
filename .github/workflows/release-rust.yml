@@ -148,7 +148,7 @@ jobs:
           mv release/stream-deck-controller-server-aarch64-linux/stream-deck-controller-server-aarch64-linux build/linux/arm64/server
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
