@@ -8,7 +8,7 @@ jobs:
     name: Build client for Raspberry Pi
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3.5.0
+      - uses: actions/checkout@v4.1.1
       - name: Setup toolchain
         uses: actions-rs/toolchain@v1
         with:
@@ -67,7 +67,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       # - name: Install c dependencies
       #   if: matrix.os == 'ubuntu-latest'
@@ -132,7 +132,7 @@ jobs:
     needs: [build_artifacts]
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Create release directory
         run: mkdir release
       - name: Get artifacts
