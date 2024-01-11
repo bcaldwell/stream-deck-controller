@@ -580,13 +580,14 @@ dependencies = [
 
 [[package]]
 name = "hidapi"
-version = "1.4.2"
+version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d26e1151deaab68f34fbfd16d491a2a0170cf98d69d3efa23873b567a4199e1"
+checksum = "723777263b0dcc5730aec947496bd8c3940ba63c15f5633b288cc615f4f6af79"
 dependencies = [
  "cc",
  "libc",
  "pkg-config",
+ "winapi",
 ]
 
 [[package]]
@@ -1756,9 +1757,9 @@ dependencies = [
 
 [[package]]
 name = "streamdeck"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fabb5f888577fa68feaaef00a6f1e88326b32b0d5e9df34be1c4ebb521e9bac"
+checksum = "daaecee06efec1775a4e0c7b3543e1b57199326a4af59dadd13aa36b866ce7e8"
 dependencies = [
  "hidapi",
  "humantime",
