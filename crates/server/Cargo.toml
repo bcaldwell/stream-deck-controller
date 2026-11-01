@@ -23,11 +23,11 @@ futures-util.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-mlua = { version = "0.10", features = ["lua54", "vendored", "async", "serialize"] }
+mlua = { version = "0.12", features = ["lua54", "vendored", "async", "serialize"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 ab_glyph = "0.2"
-notify = "6"
+notify = "8"
 clap = { version = "4", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rusty-s3 = { version = "0.8", default-features = false }
-ureq = { version = "2", default-features = false, features = ["tls"] }
+rusty-s3 = { version = "0.11", default-features = false, features = ["rustcrypto"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }

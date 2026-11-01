@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use mlua::{Function, Lua, LuaSerdeExt, SerializeOptions, Table, Value};
+use mlua::{serde::SerializeOptions, Function, Lua, LuaSerdeExt, Table, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::ha::{EntityState, HaCommand};

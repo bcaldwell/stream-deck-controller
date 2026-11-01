@@ -109,7 +109,7 @@ async fn connect_as(url: &str, target: Option<&str>, sha256: Option<&str>) -> Cl
         client_target: target.map(Into::into),
         client_sha256: sha256.map(Into::into),
     };
-    c.send(Message::Text(serde_json::to_string(&hello).unwrap()))
+    c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
         .unwrap();
     match next_msg(&mut c).await {
@@ -160,7 +160,9 @@ fn on(id: &str) -> EntityState {
 
 async fn keydown(c: &mut Client, key: u8) {
     c.send(Message::Text(
-        serde_json::to_string(&ClientMessage::KeyDown { key }).unwrap(),
+        serde_json::to_string(&ClientMessage::KeyDown { key })
+            .unwrap()
+            .into(),
     ))
     .await
     .unwrap();
@@ -231,7 +233,7 @@ async fn rejects_wrong_protocol_version() {
         client_target: None,
         client_sha256: None,
     };
-    c.send(Message::Text(serde_json::to_string(&hello).unwrap()))
+    c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
         .unwrap();
     match next_msg(&mut c).await {
@@ -334,7 +336,7 @@ async fn client_token_guards_ws_and_client_downloads() {
         client_target: None,
         client_sha256: None,
     };
-    c.send(Message::Text(serde_json::to_string(&hello).unwrap()))
+    c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
         .unwrap();
     assert!(matches!(next_msg(&mut c).await, Message::Text(_)));
@@ -436,7 +438,9 @@ async fn mock_ha(initial: Vec<Value>) -> MockHa {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             ws.send(Message::Text(
-                json!({"type": "auth_required", "ha_version": "mock"}).to_string(),
+                json!({"type": "auth_required", "ha_version": "mock"})
+                    .to_string()
+                    .into(),
             ))
             .await
             .unwrap();
@@ -445,12 +449,14 @@ async fn mock_ha(initial: Vec<Value>) -> MockHa {
                 _ => continue,
             };
             if auth["access_token"] != "secret" {
-                ws.send(Message::Text(json!({"type": "auth_invalid"}).to_string()))
-                    .await
-                    .unwrap();
+                ws.send(Message::Text(
+                    json!({"type": "auth_invalid"}).to_string().into(),
+                ))
+                .await
+                .unwrap();
                 continue;
             }
-            ws.send(Message::Text(json!({"type": "auth_ok"}).to_string()))
+            ws.send(Message::Text(json!({"type": "auth_ok"}).to_string().into()))
                 .await
                 .unwrap();
             let mut sub_id = 0;
@@ -467,20 +473,20 @@ async fn mock_ha(initial: Vec<Value>) -> MockHa {
                         match m["type"].as_str().unwrap() {
                             "subscribe_events" => {
                                 sub_id = id.as_u64().unwrap();
-                                ws.send(Message::Text(json!({"id": id, "type": "result", "success": true, "result": null}).to_string())).await.unwrap();
+                                ws.send(Message::Text(json!({"id": id, "type": "result", "success": true, "result": null}).to_string().into())).await.unwrap();
                             }
                             "get_states" => {
-                                ws.send(Message::Text(json!({"id": id, "type": "result", "success": true, "result": initial}).to_string())).await.unwrap();
+                                ws.send(Message::Text(json!({"id": id, "type": "result", "success": true, "result": initial}).to_string().into())).await.unwrap();
                             }
                             "call_service" => {
                                 let _ = calls_tx.send(m);
-                                ws.send(Message::Text(json!({"id": id, "type": "result", "success": true, "result": {}}).to_string())).await.unwrap();
+                                ws.send(Message::Text(json!({"id": id, "type": "result", "success": true, "result": {}}).to_string().into())).await.unwrap();
                             }
                             _ => {}
                         }
                     }
                     Some(ev) = push_rx.recv() => {
-                        ws.send(Message::Text(json!({"id": sub_id, "type": "event", "event": ev}).to_string())).await.unwrap();
+                        ws.send(Message::Text(json!({"id": sub_id, "type": "event", "event": ev}).to_string().into())).await.unwrap();
                     }
                 }
             }
