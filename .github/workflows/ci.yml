@@ -46,7 +46,7 @@ jobs:
           key: ${{ matrix.target }}
       - uses: mlugg/setup-zig@v1
         with:
-          version: 0.13.0
+          version: 0.17.0
       - name: Install cargo-zigbuild
         run: pip install --user cargo-zigbuild==0.19.8 && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Build static binaries
