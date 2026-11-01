@@ -18,7 +18,7 @@ jobs:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -38,7 +38,7 @@ jobs:
           - arch: x86_64-linux
             target: x86_64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -57,7 +57,7 @@ jobs:
           cp target/${{ matrix.target }}/release/sdc-server out/sdc-server-${{ matrix.arch }}
           cp target/${{ matrix.target }}/release/sdc-client out/sdc-client-${{ matrix.arch }}
           file out/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.arch }}
           path: out/*
@@ -71,8 +71,8 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: binaries-*
           path: bin
@@ -87,11 +87,11 @@ jobs:
           install -m 0755 bin/sdc-client-x86_64-linux dist/clients/sdc-client-x86_64-linux
           install -m 0755 bin/sdc-client-aarch64-linux dist/clients/sdc-client-aarch64-linux
       # No QEMU needed: the binaries are prebuilt, the Dockerfile only copies them.
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       # Tagged by commit SHA (what a deployment should pin), plus the branch name
       # and semver on release tags as conveniences for humans.
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           tags: |
@@ -102,13 +102,13 @@ jobs:
           # the cleanup job can't delete children shared between tags.
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -171,7 +171,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: binaries-*
           path: release
