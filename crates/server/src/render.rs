@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
@@ -21,6 +22,11 @@ const LINE: f32 = 1.15;
 /// How long a failed download is remembered before it is tried again.
 const FAIL_TTL: Duration = Duration::from_secs(60);
 const ERR_BG: Color = Color([0xb0, 0x00, 0x20]);
+/// Decoded pictures are shrunk until their shorter side is at most this (keys are <= 120px, so
+/// this keeps 2x headroom while a 1024px icon costs 16x less memory and resize time).
+const MAX_SRC_SHORT: u32 = 256;
+/// Safety valve for the scaled-picture cache (it is also cleared on config reload).
+const MAX_PREPARED: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color(pub [u8; 3]);
@@ -83,12 +89,93 @@ impl RenderSpec {
     }
 }
 
-pub struct Renderer {
+/// A decoded picture with premultiplied alpha, shared by every render that uses it.
+pub struct Loaded {
+    /// Identifies the source in the scaled-picture cache (file path or remote cache key).
+    id: String,
+    img: RgbaImage,
+}
+
+impl Loaded {
+    /// Premultiplies `img` (once, so scaling never bleeds the colour of transparent pixels) and
+    /// shrinks it to at most [`MAX_SRC_SHORT`] on the shorter side.
+    fn new(id: String, mut img: RgbaImage) -> Arc<Self> {
+        premultiply(&mut img);
+        let short = img.width().min(img.height());
+        if short > MAX_SRC_SHORT {
+            let k = MAX_SRC_SHORT as f32 / short as f32;
+            let w = ((img.width() as f32 * k).round() as u32).max(1);
+            let h = ((img.height() as f32 * k).round() as u32).max(1);
+            img = imageops::resize(&img, w, h, FilterType::Lanczos3);
+        }
+        Arc::new(Self { id, img })
+    }
+}
+
+/// How a picture is scaled for a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Fit {
+    /// Cover a square of this size, center-cropped.
+    Cover(u32),
+    /// Exactly this size (the aspect ratio is already right).
+    Exact(u32, u32),
+}
+
+/// Pictures scaled for a key size, computed once per (source, fit) and shared between the
+/// worker threads that rasterize a page. A `OnceLock` per entry makes concurrent requests for
+/// the same scaling wait for one computation instead of repeating it.
+type ScaledSlot = OnceLock<Arc<RgbaImage>>;
+
+#[derive(Default)]
+struct Scaled {
+    map: Mutex<HashMap<(String, Fit), Arc<ScaledSlot>>>,
+    /// Scalings actually computed (cache misses).
+    computed: AtomicUsize,
+}
+
+impl Scaled {
+    fn get(&self, src: &Loaded, fit: Fit) -> Arc<RgbaImage> {
+        let slot = {
+            let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            if map.len() >= MAX_PREPARED {
+                map.clear();
+            }
+            map.entry((src.id.clone(), fit)).or_default().clone()
+        };
+        slot.get_or_init(|| {
+            self.computed.fetch_add(1, Ordering::Relaxed);
+            Arc::new(match fit {
+                Fit::Cover(size) => cover(&src.img, size),
+                Fit::Exact(w, h) => resize_premul(&src.img, w, h, true),
+            })
+        })
+        .clone()
+    }
+
+    fn clear(&self) {
+        self.map.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    fn forget(&self, id: &str) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(i, _), _| i != id);
+    }
+}
+
+/// Everything needed to rasterize a key, shareable between threads (no caches or Lua).
+struct Painter {
     font: FontRef<'static>,
+    scaled: Scaled,
+}
+
+pub struct Renderer {
+    painter: Arc<Painter>,
     assets: Assets,
     /// `icon`/`image` string -> where it lives (None: unresolvable, already logged).
     resolved: HashMap<String, Option<Source>>,
-    local: HashMap<PathBuf, Option<Rc<RgbaImage>>>,
+    local: HashMap<PathBuf, Option<Arc<Loaded>>>,
     /// Downloaded images by remote cache key.
     remote: HashMap<String, Slot>,
     /// Without one, remote images are reported as failed (they are never fetched inline).
@@ -97,15 +184,25 @@ pub struct Renderer {
 
 enum Slot {
     Loading,
-    Ready(Rc<RgbaImage>),
+    Ready(Arc<Loaded>),
     Failed(Instant),
 }
 
 /// Result of looking an image up for one render; never waits on the network.
+#[derive(Clone)]
 enum Img {
-    Ready(Rc<RgbaImage>),
+    Ready(Arc<Loaded>),
     Loading,
     Failed,
+}
+
+/// A key ready to rasterize: the spec plus its pictures looked up (cheap, needs the renderer's
+/// caches). Turning it into pixels needs no renderer state, so jobs can run in parallel.
+pub struct Job {
+    spec: RenderSpec,
+    size: u32,
+    image: Option<Img>,
+    icon: Option<Img>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +221,10 @@ impl Renderer {
 
     pub fn with_assets(assets: Assets) -> Self {
         Self {
-            font: FontRef::try_from_slice(FONT_BYTES).expect("embedded font is valid"),
+            painter: Arc::new(Painter {
+                font: FontRef::try_from_slice(FONT_BYTES).expect("embedded font is valid"),
+                scaled: Scaled::default(),
+            }),
             assets,
             resolved: HashMap::new(),
             local: HashMap::new(),
@@ -142,6 +242,7 @@ impl Renderer {
     pub fn clear_icon_cache(&mut self) {
         self.resolved.clear();
         self.local.clear();
+        self.painter.scaled.clear();
         self.remote.retain(|_, s| !matches!(s, Slot::Failed(_)));
     }
 
@@ -174,13 +275,19 @@ impl Renderer {
     /// Records the outcome of a background download started by [`Fetcher::spawn`].
     pub fn finish_fetch(&mut self, key: &str, result: Result<RgbaImage, String>) {
         let slot = match result {
-            Ok(img) => Slot::Ready(Rc::new(img)),
+            Ok(img) => Slot::Ready(Loaded::new(key.to_string(), img)),
             Err(e) => {
                 tracing::warn!("cannot fetch image {}: {e}", redact(key));
                 Slot::Failed(Instant::now())
             }
         };
+        self.painter.scaled.forget(key);
         self.remote.insert(key.to_string(), slot);
+    }
+
+    /// Scalings computed so far (cache misses); tests use it to check pictures are reused.
+    pub fn scalings(&self) -> usize {
+        self.painter.scaled.computed.load(Ordering::Relaxed)
     }
 
     pub fn blank(&self, size: u32) -> Vec<u8> {
@@ -196,114 +303,59 @@ impl Renderer {
     }
 
     pub fn render_image(&mut self, spec: &RenderSpec, size: u32) -> RgbImage {
-        let mut img = RgbImage::from_pixel(size, size, Rgb(spec.bg.0));
-        let s = size as f32;
-        let pad = PAD * s / 72.0;
-        let inner = Area {
-            x: pad,
-            y: pad,
-            w: s - 2.0 * pad,
-            h: s - 2.0 * pad,
-        };
-        let full = Area {
-            x: 0.0,
-            y: 0.0,
-            w: s,
-            h: s,
-        };
-        let image = spec.image.as_deref().map(|n| self.lookup(n));
-        let icon = spec.icon.as_deref().map(|n| self.lookup(n));
-        let text = spec.text.as_deref().filter(|t| !t.is_empty());
-
-        let (icon_area, text_area, text_max) = match (icon.is_some(), text) {
-            (true, Some(_)) => {
-                let ih = (inner.h * 0.5).round();
-                (
-                    Some(Area { h: ih, ..inner }),
-                    Some(Area {
-                        y: inner.y + ih,
-                        h: inner.h - ih,
-                        ..inner
-                    }),
-                    s * 0.22,
-                )
-            }
-            (true, None) => (Some(inner), None, 0.0),
-            // label along the bottom of a full-bleed picture
-            (false, Some(_)) if image.is_some() => (
-                None,
-                Some(Area {
-                    y: inner.y + inner.h * 0.55,
-                    h: inner.h * 0.45,
-                    ..inner
-                }),
-                s * 0.22,
-            ),
-            (false, Some(_)) => (None, Some(inner), s * 0.32),
-            (false, None) => (None, None, 0.0),
-        };
-
-        match &image {
-            Some(Img::Ready(im)) => {
-                composite(&mut img, &cover(im, size), 0, 0);
-                if text.is_some() {
-                    darken_bottom(&mut img);
-                }
-            }
-            Some(Img::Failed) => {
-                let top = Area { h: s / 2.0, ..full };
-                self.draw_err(&mut img, full, top);
-            }
-            Some(Img::Loading) | None => {}
-        }
-        match (&icon, icon_area) {
-            (Some(Img::Ready(im)), Some(area)) => draw_icon(&mut img, im, area),
-            (Some(Img::Failed), Some(area)) => self.draw_err(&mut img, area, area),
-            _ => {}
-        }
-        if let (Some(text), Some(area)) = (text, text_area) {
-            if image.is_some() {
-                // drop shadow so the label stays legible on busy pictures
-                let o = s / 72.0;
-                let shadow = Area {
-                    x: area.x + o,
-                    y: area.y + o,
-                    ..area
-                };
-                self.draw_text(
-                    &mut img,
-                    text,
-                    shadow,
-                    Color::BLACK,
-                    spec.font_size,
-                    text_max,
-                );
-            }
-            self.draw_text(&mut img, text, area, spec.fg, spec.font_size, text_max);
-        }
-        img
+        let job = self.prepare(spec, size);
+        self.painter.paint(&job)
     }
 
-    /// Fills `fill` with the error colour and writes "ERR" in `label`.
-    fn draw_err(&self, img: &mut RgbImage, fill: Area, label: Area) {
-        let (x0, y0) = (fill.x as u32, fill.y as u32);
-        let (x1, y1) = (
-            ((fill.x + fill.w) as u32).min(img.width()),
-            ((fill.y + fill.h) as u32).min(img.height()),
-        );
-        for y in y0..y1 {
-            for x in x0..x1 {
-                img.put_pixel(x, y, Rgb(ERR_BG.0));
-            }
+    /// Looks up the pictures `spec` needs (decoding local files, starting downloads).
+    pub fn prepare(&mut self, spec: &RenderSpec, size: u32) -> Job {
+        Job {
+            spec: spec.clone(),
+            size,
+            image: spec.image.as_deref().map(|n| self.lookup(n)),
+            icon: spec.icon.as_deref().map(|n| self.lookup(n)),
         }
-        self.draw_text(
-            img,
-            "ERR",
-            label,
-            Color::WHITE,
-            None,
-            (label.h * 0.6).min(img.width() as f32 * 0.32),
-        );
+    }
+
+    /// Rasterizes and JPEG-encodes `jobs`, spread over the available cores.
+    pub fn encode_all(&self, jobs: Vec<Job>) -> Vec<Vec<u8>> {
+        let painter = &*self.painter;
+        let run = |job: &Job| encode_jpeg(&painter.paint(job));
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(jobs.len());
+        if workers <= 1 {
+            return jobs.iter().map(run).collect();
+        }
+        let next = AtomicUsize::new(0);
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; jobs.len()];
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut done = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(job) = jobs.get(i) else { break };
+                            done.push((i, run(job)));
+                        }
+                        done
+                    })
+                })
+                .collect();
+            for h in handles {
+                for (i, jpeg) in h.join().expect("render worker panicked") {
+                    out[i] = Some(jpeg);
+                }
+            }
+        });
+        out.into_iter().map(|j| j.expect("every job ran")).collect()
+    }
+
+    /// Renders several keys at once (see [`Renderer::encode_all`]).
+    pub fn render_many(&mut self, specs: &[RenderSpec], size: u32) -> Vec<Vec<u8>> {
+        let jobs = specs.iter().map(|s| self.prepare(s, size)).collect();
+        self.encode_all(jobs)
     }
 
     fn resolve(&mut self, name: &str) -> Option<Source> {
@@ -335,7 +387,7 @@ impl Renderer {
                 self.local
                     .entry(full.clone())
                     .or_insert_with(|| match image::open(&full) {
-                        Ok(i) => Some(Rc::new(i.to_rgba8())),
+                        Ok(i) => Some(Loaded::new(full.display().to_string(), i.to_rgba8())),
                         Err(e) => {
                             tracing::warn!("cannot load icon {}: {e}", full.display());
                             None
@@ -370,6 +422,132 @@ impl Renderer {
             self.remote.insert(key, Slot::Failed(Instant::now()));
             Img::Failed
         }
+    }
+}
+
+impl Painter {
+    fn paint(&self, job: &Job) -> RgbImage {
+        let (spec, size) = (&job.spec, job.size);
+        let mut img = RgbImage::from_pixel(size, size, Rgb(spec.bg.0));
+        let s = size as f32;
+        let pad = PAD * s / 72.0;
+        let inner = Area {
+            x: pad,
+            y: pad,
+            w: s - 2.0 * pad,
+            h: s - 2.0 * pad,
+        };
+        let full = Area {
+            x: 0.0,
+            y: 0.0,
+            w: s,
+            h: s,
+        };
+        let (image, icon) = (&job.image, &job.icon);
+        let text = spec.text.as_deref().filter(|t| !t.is_empty());
+
+        let (icon_area, text_area, text_max) = match (icon.is_some(), text) {
+            (true, Some(_)) => {
+                let ih = (inner.h * 0.5).round();
+                (
+                    Some(Area { h: ih, ..inner }),
+                    Some(Area {
+                        y: inner.y + ih,
+                        h: inner.h - ih,
+                        ..inner
+                    }),
+                    s * 0.22,
+                )
+            }
+            (true, None) => (Some(inner), None, 0.0),
+            // label along the bottom of a full-bleed picture
+            (false, Some(_)) if image.is_some() => (
+                None,
+                Some(Area {
+                    y: inner.y + inner.h * 0.55,
+                    h: inner.h * 0.45,
+                    ..inner
+                }),
+                s * 0.22,
+            ),
+            (false, Some(_)) => (None, Some(inner), s * 0.32),
+            (false, None) => (None, None, 0.0),
+        };
+
+        match image {
+            Some(Img::Ready(im)) => {
+                composite(&mut img, &self.scaled.get(im, Fit::Cover(size)), 0, 0);
+                if text.is_some() {
+                    darken_bottom(&mut img);
+                }
+            }
+            Some(Img::Failed) => {
+                let top = Area { h: s / 2.0, ..full };
+                self.draw_err(&mut img, full, top);
+            }
+            Some(Img::Loading) | None => {}
+        }
+        match (icon, icon_area) {
+            (Some(Img::Ready(im)), Some(area)) => self.draw_icon(&mut img, im, area),
+            (Some(Img::Failed), Some(area)) => self.draw_err(&mut img, area, area),
+            _ => {}
+        }
+        if let (Some(text), Some(area)) = (text, text_area) {
+            if image.is_some() {
+                // drop shadow so the label stays legible on busy pictures
+                let o = s / 72.0;
+                let shadow = Area {
+                    x: area.x + o,
+                    y: area.y + o,
+                    ..area
+                };
+                self.draw_text(
+                    &mut img,
+                    text,
+                    shadow,
+                    Color::BLACK,
+                    spec.font_size,
+                    text_max,
+                );
+            }
+            self.draw_text(&mut img, text, area, spec.fg, spec.font_size, text_max);
+        }
+        img
+    }
+
+    fn draw_icon(&self, img: &mut RgbImage, icon: &Loaded, area: Area) {
+        let (iw, ih) = (icon.img.width() as f32, icon.img.height() as f32);
+        let k = (area.w / iw).min(area.h / ih);
+        let (tw, th) = (
+            ((iw * k).round() as u32).max(1),
+            ((ih * k).round() as u32).max(1),
+        );
+        let scaled = self.scaled.get(icon, Fit::Exact(tw, th));
+        let ox = (area.x + (area.w - tw as f32) / 2.0).round() as i64;
+        let oy = (area.y + (area.h - th as f32) / 2.0).round() as i64;
+        composite(img, &scaled, ox, oy);
+    }
+
+    /// Fills `fill` with the error colour and writes "ERR" in `label`.
+    fn draw_err(&self, img: &mut RgbImage, fill: Area, label: Area) {
+        let (x0, y0) = (fill.x as u32, fill.y as u32);
+        let (x1, y1) = (
+            ((fill.x + fill.w) as u32).min(img.width()),
+            ((fill.y + fill.h) as u32).min(img.height()),
+        );
+        for y in y0..y1 {
+            for x in x0..x1 {
+                img.put_pixel(x, y, Rgb(ERR_BG.0));
+            }
+        }
+        self.draw_text(
+            img,
+            "ERR",
+            label,
+            Color::WHITE,
+            None,
+            (label.h * 0.6).min(img.width() as f32 * 0.32),
+        );
     }
 
     fn draw_text(
@@ -511,46 +689,44 @@ fn blend(dst: &mut Rgb<u8>, src: [u8; 3], a: f32) {
     }
 }
 
-fn draw_icon(img: &mut RgbImage, icon: &RgbaImage, area: Area) {
-    let (iw, ih) = (icon.width() as f32, icon.height() as f32);
-    let k = (area.w / iw).min(area.h / ih);
-    let (tw, th) = (
-        ((iw * k).round() as u32).max(1),
-        ((ih * k).round() as u32).max(1),
-    );
-    let scaled = resize_rgba(icon, tw, th);
-    let ox = (area.x + (area.w - tw as f32) / 2.0).round() as i64;
-    let oy = (area.y + (area.h - th as f32) / 2.0).round() as i64;
-    composite(img, &scaled, ox, oy);
-}
-
-/// Scales `src` to cover a `size` x `size` square and center-crops the overflow.
+/// Scales `src` (premultiplied) to cover a `size` x `size` square and center-crops the overflow.
 pub fn cover(src: &RgbaImage, size: u32) -> RgbaImage {
     let k = (size as f32 / src.width() as f32).max(size as f32 / src.height() as f32);
     let w = ((src.width() as f32 * k).round() as u32).max(size);
     let h = ((src.height() as f32 * k).round() as u32).max(size);
-    let scaled = resize_rgba(src, w, h);
-    imageops::crop_imm(&scaled, (w - size) / 2, (h - size) / 2, size, size).to_image()
+    let scaled = resize_premul(src, w, h, false);
+    let mut out =
+        imageops::crop_imm(&scaled, (w - size) / 2, (h - size) / 2, size, size).to_image();
+    unpremultiply(&mut out);
+    out
 }
 
-/// Lanczos resize that does not bleed the colour of transparent pixels into the edges
-/// (resizing is done on premultiplied alpha).
-fn resize_rgba(src: &RgbaImage, w: u32, h: u32) -> RgbaImage {
-    let mut pre = src.clone();
-    for p in pre.pixels_mut() {
+fn premultiply(img: &mut RgbaImage) {
+    for p in img.pixels_mut() {
         let a = p.0[3] as u32;
         for c in &mut p.0[..3] {
             *c = ((*c as u32 * a + 127) / 255) as u8;
         }
     }
-    let mut out = imageops::resize(&pre, w, h, FilterType::Lanczos3);
-    for p in out.pixels_mut() {
+}
+
+fn unpremultiply(img: &mut RgbaImage) {
+    for p in img.pixels_mut() {
         let a = p.0[3] as u32;
         if a > 0 {
             for c in &mut p.0[..3] {
                 *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
             }
         }
+    }
+}
+
+/// Lanczos resize of a premultiplied picture (so transparent pixels do not bleed their colour
+/// into the edges); optionally converts the result back to straight alpha.
+fn resize_premul(src: &RgbaImage, w: u32, h: u32, straight: bool) -> RgbaImage {
+    let mut out = imageops::resize(src, w, h, FilterType::Lanczos3);
+    if straight {
+        unpremultiply(&mut out);
     }
     out
 }
@@ -822,5 +998,76 @@ mod tests {
         );
         let _ = r.render(&spec, 72);
         assert_eq!(r.pending(), 0);
+    }
+
+    /// A dir with `n` distinct large noisy-alpha icons (like real artwork: big, transparent).
+    fn big_icons(tag: &str, n: usize, side: u32) -> (PathBuf, Vec<RenderSpec>) {
+        let files: Vec<_> = (0..n)
+            .map(|i| {
+                let img = RgbaImage::from_fn(side, side, |x, y| {
+                    let a = if (x / 64 + y / 64) % 2 == 0 { 255 } else { 90 };
+                    image::Rgba([(x + i as u32 * 7) as u8, (y * 3) as u8, (x ^ y) as u8, a])
+                });
+                (format!("i{i}.png"), img)
+            })
+            .collect();
+        let refs: Vec<_> = files.iter().map(|(n, i)| (n.as_str(), i.clone())).collect();
+        let dir = png_dir(tag, &refs);
+        let specs = files
+            .iter()
+            .map(|(name, _)| RenderSpec {
+                icon: Some(name.clone()),
+                text: Some("Lamp".into()),
+                ..Default::default()
+            })
+            .collect();
+        (dir, specs)
+    }
+
+    #[test]
+    fn scaled_pictures_are_computed_once_per_size() {
+        // one source used by 15 keys, then a second page render, then another key size
+        let (dir, mut specs) = big_icons("cache", 1, 1024);
+        let spec = specs.pop().unwrap();
+        let page = vec![spec; 15];
+        let mut r = Renderer::new(dir.clone());
+        let first = r.render_many(&page, 72);
+        assert_eq!(r.scalings(), 1, "15 keys share one scaling");
+        let second = r.render_many(&page, 72);
+        assert_eq!(r.scalings(), 1, "a re-render reuses it");
+        assert_eq!(first, second);
+        r.render_many(&page[..1], 96);
+        assert_eq!(r.scalings(), 2, "a new key size scales again");
+        r.clear_icon_cache();
+        r.render_many(&page[..1], 72);
+        assert_eq!(r.scalings(), 3, "a reload drops the cache");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn parallel_render_matches_serial() {
+        let (dir, specs) = big_icons("par", 6, 300);
+        let mut r = Renderer::new(dir.clone());
+        let serial: Vec<_> = specs.iter().map(|s| r.render(s, 72)).collect();
+        assert_eq!(r.render_many(&specs, 72), serial);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `cargo test -p sdc-server --release -- --ignored --nocapture page_render_timing`
+    #[test]
+    #[ignore]
+    fn page_render_timing() {
+        let (dir, specs) = big_icons("bench", 15, 1024);
+        let mut r = Renderer::new(dir.clone());
+        for pass in ["cold", "warm"] {
+            let t = Instant::now();
+            let serial: Vec<_> = specs.iter().map(|s| r.render(s, 72)).collect();
+            eprintln!("{pass} serial   page of 15 icons: {:?}", t.elapsed());
+            let t = Instant::now();
+            let many = r.render_many(&specs, 72);
+            eprintln!("{pass} parallel page of 15 icons: {:?}", t.elapsed());
+            assert_eq!(serial, many);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, SerializeOptions, Table, Value};
@@ -41,10 +42,53 @@ pub struct ButtonDef {
     release: Option<Function>,
 }
 
+/// `sdc.idle{...}`: dim, then switch the display off, after this long without a key press.
+/// With neither set a client never idles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdleConfig {
+    pub dim_after: Option<Duration>,
+    /// Brightness while dimmed (percent).
+    pub dim_brightness: u8,
+    pub off_after: Option<Duration>,
+}
+
+/// Brightness restored on wake when the config has no `sdc.brightness`.
+pub const DEFAULT_BRIGHTNESS: u8 = 60;
+const DEFAULT_DIM_BRIGHTNESS: u8 = 10;
+
+/// Device-wide settings from the config (`sdc.idle`, `sdc.brightness`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settings {
+    pub idle: IdleConfig,
+    /// `sdc.brightness`, if set; clients are told about it on connect and on wake.
+    pub brightness: Option<u8>,
+}
+
+impl Settings {
+    /// Brightness of an awake display.
+    pub fn active_brightness(&self) -> u8 {
+        self.brightness.unwrap_or(DEFAULT_BRIGHTNESS)
+    }
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            idle: IdleConfig {
+                dim_after: None,
+                dim_brightness: DEFAULT_DIM_BRIGHTNESS,
+                off_after: None,
+            },
+            brightness: None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Registry {
     pages: Vec<(String, Vec<Option<ButtonDef>>)>,
     default: Option<String>,
+    settings: Settings,
 }
 
 /// Per-call context handed to Lua as `ctx`.
@@ -107,6 +151,10 @@ impl LuaRuntime {
         r.default
             .clone()
             .or_else(|| r.pages.first().map(|(n, _)| n.clone()))
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.registry.borrow().settings
     }
 
     pub fn has_page(&self, name: &str) -> bool {
@@ -271,6 +319,50 @@ fn install(
         })?,
     )?;
 
+    let reg = registry.clone();
+    sdc.set(
+        "brightness",
+        lua.create_function(move |_, percent: i64| {
+            reg.borrow_mut().settings.brightness = Some(percent_arg("sdc.brightness", percent)?);
+            Ok(())
+        })?,
+    )?;
+
+    let reg = registry.clone();
+    sdc.set(
+        "idle",
+        lua.create_function(move |_, t: Table| {
+            let mut idle = IdleConfig {
+                dim_brightness: DEFAULT_DIM_BRIGHTNESS,
+                ..Default::default()
+            };
+            for pair in t.pairs::<String, Value>() {
+                let (k, v) = pair?;
+                match k.as_str() {
+                    "dim_after" => idle.dim_after = Some(seconds_arg(&k, &v)?),
+                    "off_after" => idle.off_after = Some(seconds_arg(&k, &v)?),
+                    "dim_brightness" => match v {
+                        Value::Integer(i) => {
+                            idle.dim_brightness = percent_arg("sdc.idle: 'dim_brightness'", i)?
+                        }
+                        _ => {
+                            return Err(mlua::Error::runtime(
+                                "sdc.idle: 'dim_brightness' must be an integer 0-100",
+                            ))
+                        }
+                    },
+                    _ => {
+                        return Err(mlua::Error::runtime(format!(
+                        "sdc.idle: unknown field '{k}' (use dim_after, dim_brightness, off_after)"
+                    )))
+                    }
+                }
+            }
+            reg.borrow_mut().settings.idle = idle;
+            Ok(())
+        })?,
+    )?;
+
     // ha
     let ha = lua.create_table()?;
     let h = host.clone();
@@ -333,6 +425,28 @@ fn install(
         package.set("path", format!("{d}/?.lua;{d}/?/init.lua;{old}"))?;
     }
     Ok(())
+}
+
+fn percent_arg(what: &str, v: i64) -> mlua::Result<u8> {
+    u8::try_from(v)
+        .ok()
+        .filter(|p| *p <= 100)
+        .ok_or_else(|| mlua::Error::runtime(format!("{what}: {v} is not a percentage (0-100)")))
+}
+
+fn seconds_arg(field: &str, v: &Value) -> mlua::Result<Duration> {
+    let secs = match v {
+        Value::Integer(i) => *i as f64,
+        Value::Number(n) => *n,
+        _ => 0.0,
+    };
+    if secs.is_finite() && secs > 0.0 {
+        Ok(Duration::from_secs_f64(secs))
+    } else {
+        Err(mlua::Error::runtime(format!(
+            "sdc.idle: '{field}' must be a number of seconds > 0"
+        )))
+    }
 }
 
 fn check_button_table(t: &Table) -> mlua::Result<()> {
@@ -556,5 +670,30 @@ mod tests {
     fn bad_page_item_fails_load() {
         assert!(LuaRuntime::load_str(r#"sdc.page("p", { 42 })"#, Host::new(None)).is_err());
         assert!(LuaRuntime::load_str(r#"sdc.button{ press = 1 }"#, Host::new(None)).is_err());
+    }
+
+    #[test]
+    fn idle_and_brightness_settings() {
+        let rt = LuaRuntime::load_str("", Host::new(None)).unwrap();
+        assert_eq!(rt.settings(), Settings::default());
+        assert_eq!(rt.settings().active_brightness(), DEFAULT_BRIGHTNESS);
+        let rt = LuaRuntime::load_str(
+            "sdc.idle { dim_after = 120, off_after = 600.5 } sdc.brightness(40)",
+            Host::new(None),
+        )
+        .unwrap();
+        let s = rt.settings();
+        assert_eq!(s.idle.dim_after, Some(Duration::from_secs(120)));
+        assert_eq!(s.idle.off_after, Some(Duration::from_millis(600_500)));
+        assert_eq!(s.idle.dim_brightness, 10);
+        assert_eq!(s.active_brightness(), 40);
+        for bad in [
+            "sdc.brightness(101)",
+            "sdc.idle { dim_after = 0 }",
+            "sdc.idle { dim_brightness = 200 }",
+            "sdc.idle { dim_aftr = 5 }",
+        ] {
+            assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
+        }
     }
 }

@@ -9,7 +9,7 @@ use sdc_protocol::DeviceInfo;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-use crate::engine::{Engine, EngineEvent};
+use crate::engine::{Engine, EngineEvent, Out};
 use crate::ha::{self, HaConfig, HaEvent};
 
 const ROWS: u8 = 3;
@@ -88,7 +88,8 @@ pub async fn run(
     }
 
     let mut tiles: Vec<Option<RgbImage>> = vec![None; (ROWS * COLS) as usize];
-    while let Ok(f) = rx.try_recv() {
+    while let Ok(out) = rx.try_recv() {
+        let Out::Frame(f) = out else { continue };
         tiles[f.key as usize] = Some(image::load_from_memory(&f.jpeg)?.to_rgb8());
     }
     if tiles.iter().all(Option::is_none) {

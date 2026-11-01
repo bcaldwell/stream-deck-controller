@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use image::RgbaImage;
@@ -14,8 +15,8 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::assets::{Assets, Fetcher, S3Config};
 use crate::ha::{HaCommand, HaEvent};
-use crate::lua_api::{CtxInfo, Host, LuaRuntime};
-use crate::render::{RenderSpec, Renderer};
+use crate::lua_api::{CtxInfo, Host, IdleConfig, LuaRuntime, Settings};
+use crate::render::{Color, RenderSpec, Renderer};
 
 pub type ClientId = u64;
 
@@ -26,12 +27,31 @@ pub struct Frame {
     pub jpeg: Vec<u8>,
 }
 
+/// What the engine sends to a client's connection.
+#[derive(Debug, Clone)]
+pub enum Out {
+    Frame(Frame),
+    /// Percent 0-100 (0 = display off).
+    Brightness(u8),
+}
+
+/// How often the engine checks clients for idleness.
+const TICK: Duration = Duration::from_secs(1);
+
+/// Display state of a client; only ever left by a tick (dim/off) or a key press (wake).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Power {
+    Active,
+    Dim,
+    Off,
+}
+
 pub enum EngineEvent {
     ClientConnected {
         id: ClientId,
         client_id: String,
         device: DeviceInfo,
-        tx: UnboundedSender<Frame>,
+        tx: UnboundedSender<Out>,
     },
     ClientDisconnected(ClientId),
     KeyDown {
@@ -49,13 +69,19 @@ pub enum EngineEvent {
         result: Result<RgbaImage, String>,
     },
     Reload,
+    /// Time passed: dim or switch off idle clients.
+    Tick,
 }
 
 struct Client {
     client_id: String,
     device: DeviceInfo,
-    tx: UnboundedSender<Frame>,
+    tx: UnboundedSender<Out>,
     page: String,
+    last_activity: Instant,
+    power: Power,
+    /// Keys whose press woke the display: their release is swallowed too.
+    swallow_up: HashSet<u8>,
     /// Last image bytes sent per key, to suppress identical frames.
     sent: Vec<Option<Vec<u8>>>,
 }
@@ -109,6 +135,7 @@ impl Engine {
 
     /// (Re)loads the config. On failure the previous config stays active.
     pub fn reload(&mut self) -> Result<()> {
+        let old = self.settings();
         let rt = LuaRuntime::load(&self.config_path, self.host.clone())?;
         tracing::info!(
             "loaded {} (pages: {})",
@@ -130,10 +157,27 @@ impl Engine {
             }
         }
         self.render_all_clients();
+        // Tell clients about brightness the new config changed; a client is not woken or put
+        // to sleep here (the next tick does that if the idle settings now say so).
+        let new = self.settings();
+        let changed: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| level(&old, c.power) != level(&new, c.power))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in changed {
+            self.send_brightness(id);
+        }
         Ok(())
     }
 
     pub fn handle(&mut self, ev: EngineEvent) {
+        self.handle_at(ev, Instant::now());
+    }
+
+    /// Like [`Engine::handle`] with an explicit clock (tests).
+    pub fn handle_at(&mut self, ev: EngineEvent, now: Instant) {
         match ev {
             EngineEvent::ClientConnected {
                 id,
@@ -156,9 +200,15 @@ impl Engine {
                         device,
                         tx,
                         page,
+                        last_activity: now,
+                        power: Power::Active,
+                        swallow_up: HashSet::new(),
                         sent,
                     },
                 );
+                if self.settings().brightness.is_some() {
+                    self.send_brightness(id);
+                }
                 self.render_client(id);
             }
             EngineEvent::ClientDisconnected(id) => {
@@ -167,8 +217,9 @@ impl Engine {
                 }
                 self.drop_deps(|(cid, _)| *cid == id);
             }
-            EngineEvent::KeyDown { id, key } => self.key_event(id, key, true),
-            EngineEvent::KeyUp { id, key } => self.key_event(id, key, false),
+            EngineEvent::KeyDown { id, key } => self.key_event(id, key, true, now),
+            EngineEvent::KeyUp { id, key } => self.key_event(id, key, false, now),
+            EngineEvent::Tick => self.tick(now),
             EngineEvent::Ha(e) => self.ha_event(e),
             EngineEvent::ImageFetched { key, result } => {
                 self.renderer.finish_fetch(&key, result);
@@ -242,12 +293,61 @@ impl Engine {
             .copied()
             .collect();
         keys.sort_unstable();
-        for (id, key) in keys {
-            self.render_key(id, key);
+        for chunk in keys.chunk_by(|a, b| a.0 == b.0) {
+            let ids: Vec<u8> = chunk.iter().map(|(_, k)| *k).collect();
+            self.render_keys(chunk[0].0, &ids);
         }
     }
 
-    fn key_event(&mut self, id: ClientId, key: u8, down: bool) {
+    fn settings(&self) -> Settings {
+        self.runtime
+            .as_ref()
+            .map(LuaRuntime::settings)
+            .unwrap_or_default()
+    }
+
+    /// Sends the brightness that matches the client's current power state.
+    fn send_brightness(&mut self, id: ClientId) {
+        let settings = self.settings();
+        if let Some(c) = self.clients.get_mut(&id) {
+            let _ = c.tx.send(Out::Brightness(level(&settings, c.power)));
+        }
+    }
+
+    /// Dims, then switches off, clients that have been idle for the configured time.
+    pub fn tick(&mut self, now: Instant) {
+        let idle = self.settings().idle;
+        let mut changed = Vec::new();
+        for (id, c) in self.clients.iter_mut() {
+            let want = power_after(&idle, now.saturating_duration_since(c.last_activity));
+            if want != c.power {
+                tracing::info!(client = %c.client_id, from = ?c.power, to = ?want, "power");
+                c.power = want;
+                changed.push(*id);
+            }
+        }
+        for id in changed {
+            self.send_brightness(id);
+        }
+    }
+
+    fn key_event(&mut self, id: ClientId, key: u8, down: bool, now: Instant) {
+        let Some(c) = self.clients.get_mut(&id) else {
+            return;
+        };
+        if down {
+            c.last_activity = now;
+            if c.power != Power::Active {
+                // The press only wakes the display; it is not a button press.
+                tracing::info!(client = %c.client_id, key, "woken by key press");
+                c.power = Power::Active;
+                c.swallow_up.insert(key);
+                self.send_brightness(id);
+                return;
+            }
+        } else if c.swallow_up.remove(&key) {
+            return;
+        }
         let Some(c) = self.clients.get(&id) else {
             return;
         };
@@ -285,41 +385,65 @@ impl Engine {
         let Some(c) = self.clients.get(&id) else {
             return;
         };
-        for key in 0..c.device.key_count() {
-            self.render_key(id, key);
-        }
+        let keys: Vec<u8> = (0..c.device.key_count()).collect();
+        self.render_keys(id, &keys);
     }
 
-    fn render_key(&mut self, id: ClientId, key: u8) {
+    /// Renders `keys` of a client: Lua render functions run one after the other on this thread,
+    /// then the resulting descriptors are rasterized and encoded in parallel.
+    fn render_keys(&mut self, id: ClientId, keys: &[u8]) {
         let Some(c) = self.clients.get(&id) else {
             return;
         };
+        let started = Instant::now();
         let size = c.device.key_size_px;
-        let found = self
-            .runtime
-            .as_ref()
-            .and_then(|rt| rt.button(&c.page, key).map(|b| (rt, b)));
-        let (jpeg, deps) = match found {
-            Some((rt, btn)) => {
-                let info = ctx_info(c, key);
-                let out = rt.render(&btn, &info);
-                if let Some(e) = &out.error {
-                    tracing::error!("render {} key {key} for {}: {e}", info.page, c.client_id);
+        let mut jobs = Vec::with_capacity(keys.len());
+        let mut all_deps = Vec::with_capacity(keys.len());
+        for &key in keys {
+            let found = self
+                .runtime
+                .as_ref()
+                .and_then(|rt| rt.button(&c.page, key).map(|b| (rt, b)));
+            let (spec, deps) = match found {
+                Some((rt, btn)) => {
+                    let info = ctx_info(c, key);
+                    let out = rt.render(&btn, &info);
+                    if let Some(e) = &out.error {
+                        tracing::error!("render {} key {key} for {}: {e}", info.page, c.client_id);
+                    }
+                    let mut deps = out.deps;
+                    deps.extend(
+                        self.renderer
+                            .remote_keys(&out.spec)
+                            .into_iter()
+                            .map(|k| format!("img:{k}")),
+                    );
+                    (out.spec, deps)
                 }
-                let jpeg = self.renderer.render(&out.spec, size);
-                let mut deps = out.deps;
-                deps.extend(
-                    self.renderer
-                        .remote_keys(&out.spec)
-                        .into_iter()
-                        .map(|k| format!("img:{k}")),
-                );
-                (jpeg, deps)
-            }
-            None => (self.renderer.blank(size), HashSet::new()),
-        };
-        self.set_deps(id, key, deps);
-        self.send_if_changed(id, key, jpeg);
+                None => (
+                    RenderSpec {
+                        bg: Color::BLACK,
+                        ..RenderSpec::default()
+                    },
+                    HashSet::new(),
+                ),
+            };
+            jobs.push(self.renderer.prepare(&spec, size));
+            all_deps.push(deps);
+        }
+        let page = c.page.clone();
+        let jpegs = self.renderer.encode_all(jobs);
+        tracing::debug!(
+            client = id,
+            page,
+            keys = keys.len(),
+            ms = started.elapsed().as_secs_f64() * 1000.0,
+            "rendered keys"
+        );
+        for ((&key, deps), jpeg) in keys.iter().zip(all_deps).zip(jpegs) {
+            self.set_deps(id, key, deps);
+            self.send_if_changed(id, key, jpeg);
+        }
     }
 
     fn send_if_changed(&mut self, id: ClientId, key: u8, jpeg: Vec<u8>) {
@@ -334,7 +458,7 @@ impl Engine {
         }
         *slot = Some(jpeg.clone());
         // A closed receiver just means the client is on its way out.
-        let _ = c.tx.send(Frame { key, jpeg });
+        let _ = c.tx.send(Out::Frame(Frame { key, jpeg }));
     }
 
     fn set_deps(&mut self, id: ClientId, key: u8, deps: HashSet<String>) {
@@ -370,6 +494,26 @@ impl Engine {
     }
 }
 
+/// The power state a client is in after being idle for `idle`.
+fn power_after(cfg: &IdleConfig, idle: Duration) -> Power {
+    if cfg.off_after.is_some_and(|t| idle >= t) {
+        Power::Off
+    } else if cfg.dim_after.is_some_and(|t| idle >= t) {
+        Power::Dim
+    } else {
+        Power::Active
+    }
+}
+
+/// Brightness percent to show in a power state.
+fn level(settings: &Settings, power: Power) -> u8 {
+    match power {
+        Power::Active => settings.active_brightness(),
+        Power::Dim => settings.idle.dim_brightness,
+        Power::Off => 0,
+    }
+}
+
 fn ctx_info(c: &Client, key: u8) -> CtxInfo {
     CtxInfo {
         client_id: c.client_id.clone(),
@@ -390,6 +534,19 @@ pub fn spawn(
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = Handle::try_current().ok();
     let events = tx.clone();
+    if let Some(h) = &handle {
+        let ticks = tx.downgrade();
+        h.spawn(async move {
+            let mut every = tokio::time::interval(TICK);
+            loop {
+                every.tick().await;
+                match ticks.upgrade() {
+                    Some(tx) if tx.send(EngineEvent::Tick).is_ok() => {}
+                    _ => break,
+                }
+            }
+        });
+    }
     std::thread::Builder::new()
         .name("sdc-engine".into())
         .spawn(move || {
@@ -460,15 +617,35 @@ mod tests {
         }
     }
 
-    fn drain(rx: &mut UnboundedReceiver<Frame>) -> Vec<Frame> {
+    fn drain_out(rx: &mut UnboundedReceiver<Out>) -> Vec<Out> {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Frames only.
+    fn drain(rx: &mut UnboundedReceiver<Out>) -> Vec<Frame> {
+        drain_out(rx)
+            .into_iter()
+            .filter_map(|o| match o {
+                Out::Frame(f) => Some(f),
+                Out::Brightness(_) => None,
+            })
+            .collect()
+    }
+
+    fn brightness(outs: &[Out]) -> Vec<u8> {
+        outs.iter()
+            .filter_map(|o| match o {
+                Out::Brightness(p) => Some(*p),
+                Out::Frame(_) => None,
+            })
+            .collect()
     }
 
     fn setup(
         src: &str,
     ) -> (
         Engine,
-        UnboundedReceiver<Frame>,
+        UnboundedReceiver<Out>,
         UnboundedReceiver<HaCommand>,
         tempdir::Dir,
     ) {
@@ -604,6 +781,133 @@ mod tests {
         write_config(d.path(), r##"sdc.page("home", {})"##);
         e.handle(EngineEvent::Reload);
         assert_eq!(e.clients[&1].page, "home");
+    }
+
+    const IDLE_CONFIG: &str = r##"
+        sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600 }
+        sdc.brightness(80)
+        sdc.page("home", {
+          sdc.button{ render = { text = "A" },
+            press = function() ha.call("light", "toggle", { entity_id = "light.a" }) end,
+            release = function() ha.call("light", "turn_off", { entity_id = "light.a" }) end },
+        })
+    "##;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn idle_dims_then_turns_off() {
+        let (mut e, rx, _ha, _d) = setup(IDLE_CONFIG);
+        drop(rx);
+        // reconnect so the idle clock starts at a known instant
+        let t0 = Instant::now();
+        let (tx, mut rx2) = mpsc::unbounded_channel();
+        e.handle_at(
+            EngineEvent::ClientConnected {
+                id: 2,
+                client_id: "c2".into(),
+                device: device(),
+                tx,
+            },
+            t0,
+        );
+        // the configured brightness is sent on connect
+        assert_eq!(brightness(&drain_out(&mut rx2)), [80]);
+        e.tick(t0 + secs(119));
+        assert!(drain_out(&mut rx2).is_empty());
+        e.tick(t0 + secs(120));
+        assert_eq!(brightness(&drain_out(&mut rx2)), [10]);
+        e.tick(t0 + secs(500)); // still dim: nothing more to say
+        assert!(drain_out(&mut rx2).is_empty());
+        e.tick(t0 + secs(600));
+        assert_eq!(brightness(&drain_out(&mut rx2)), [0]);
+        e.tick(t0 + secs(9000));
+        assert!(drain_out(&mut rx2).is_empty());
+    }
+
+    #[test]
+    fn key_press_wakes_and_is_consumed() {
+        let (mut e, mut rx, mut ha, _d) = setup(IDLE_CONFIG);
+        drain_out(&mut rx);
+        let t0 = Instant::now();
+        let down = |e: &mut Engine, t| e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t);
+        let up = |e: &mut Engine, t| e.handle_at(EngineEvent::KeyUp { id: 1, key: 0 }, t);
+        let calls = |ha: &mut UnboundedReceiver<HaCommand>| {
+            std::iter::from_fn(|| ha.try_recv().ok()).count()
+        };
+
+        // dimmed: the press restores brightness, runs nothing; its release is swallowed too
+        e.tick(t0 + secs(130));
+        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
+        down(&mut e, t0 + secs(131));
+        assert_eq!(brightness(&drain_out(&mut rx)), [80]);
+        up(&mut e, t0 + secs(131));
+        assert_eq!(calls(&mut ha), 0);
+
+        // awake: presses run, and each one restarts the idle clock
+        down(&mut e, t0 + secs(200));
+        up(&mut e, t0 + secs(200));
+        assert_eq!(calls(&mut ha), 2);
+        e.tick(t0 + secs(200 + 119));
+        assert!(drain_out(&mut rx).is_empty());
+        e.tick(t0 + secs(200 + 120));
+        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
+
+        // off: same
+        e.tick(t0 + secs(200 + 600));
+        assert_eq!(brightness(&drain_out(&mut rx)), [0]);
+        down(&mut e, t0 + secs(1000));
+        assert_eq!(brightness(&drain_out(&mut rx)), [80]);
+        up(&mut e, t0 + secs(1000));
+        assert_eq!(calls(&mut ha), 0);
+        down(&mut e, t0 + secs(1001));
+        assert_eq!(calls(&mut ha), 1);
+    }
+
+    #[test]
+    fn without_idle_config_no_brightness_messages() {
+        let (mut e, mut rx, mut ha, _d) = setup(CONFIG);
+        let t0 = Instant::now();
+        e.tick(t0 + secs(100_000));
+        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0 + secs(100_001));
+        assert!(brightness(&drain_out(&mut rx)).is_empty());
+        assert!(ha.try_recv().is_ok(), "the press runs normally");
+    }
+
+    #[test]
+    fn default_wake_brightness_and_reload_keep_idle_state() {
+        let cfg = r##"sdc.idle { dim_after = 10 } sdc.page("home", {})"##;
+        let (mut e, mut rx, _ha, d) = setup(cfg);
+        assert!(
+            drain_out(&mut rx).is_empty(),
+            "no sdc.brightness: nothing on connect"
+        );
+        let t0 = Instant::now();
+        e.tick(t0 + secs(11));
+        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
+        // reloading the same config leaves a dimmed client alone
+        e.handle_at(EngineEvent::Reload, t0 + secs(12));
+        assert!(brightness(&drain_out(&mut rx)).is_empty());
+        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0 + secs(13));
+        assert_eq!(
+            brightness(&drain_out(&mut rx)),
+            [60],
+            "default active brightness"
+        );
+        // dropping sdc.idle while dimmed wakes the client on the next tick
+        e.tick(t0 + secs(30));
+        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
+        write_config(d.path(), r##"sdc.page("home", {})"##);
+        e.handle_at(EngineEvent::Reload, t0 + secs(31));
+        assert!(brightness(&drain_out(&mut rx)).is_empty());
+        e.tick(t0 + secs(32));
+        assert_eq!(brightness(&drain_out(&mut rx)), [60]);
+        // a changed sdc.brightness reaches an awake client right away
+        write_config(d.path(), r##"sdc.brightness(30) sdc.page("home", {})"##);
+        e.handle_at(EngineEvent::Reload, t0 + secs(33));
+        assert_eq!(brightness(&drain_out(&mut rx)), [30]);
     }
 
     /// Serves a solid red PNG at /ok.png and 404 elsewhere; returns its base URL.
