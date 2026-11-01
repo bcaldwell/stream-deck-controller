@@ -3,6 +3,10 @@
 -- may also be an http(s) URL or an object key in the S3 assets bucket (see crates/server/README.md).
 local sdc = require("sdc")
 
+-- Dim after 2 minutes without a key press, off after 10; the next press only wakes the deck.
+sdc.brightness(60)
+sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600 }
+
 local ON, OFF = "#f5b400", "#2a2a2e"
 
 -- A toggle button for any light: shows on/off colour and brightness %.

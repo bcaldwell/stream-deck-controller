@@ -14,7 +14,7 @@ use sdc_protocol::{ClientMessage, ImageFrame, ServerMessage, PROTOCOL_VERSION};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::clients::ClientBinaries;
-use crate::engine::{EngineEvent, Frame};
+use crate::engine::{EngineEvent, Out};
 use crate::http;
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
@@ -116,7 +116,7 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
     }
 
     let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
     let _ = engine.send(EngineEvent::ClientConnected {
         id,
         client_id,
@@ -127,8 +127,12 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
     let result: Result<()> = async {
         loop {
             tokio::select! {
-                frame = rx.recv() => match frame {
-                    Some(f) => sink.send(Message::Binary(ImageFrame::encode(f.key, &f.jpeg))).await?,
+                out = rx.recv() => match out {
+                    Some(Out::Frame(f)) => sink.send(Message::Binary(ImageFrame::encode(f.key, &f.jpeg))).await?,
+                    Some(Out::Brightness(percent)) => {
+                        let msg = ServerMessage::Brightness { percent };
+                        sink.send(Message::Text(serde_json::to_string(&msg)?)).await?
+                    }
                     None => return Ok(()),
                 },
                 msg = stream.next() => match msg {

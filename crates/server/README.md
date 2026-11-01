@@ -63,6 +63,8 @@ sdc.page("home", {                -- list index = key index, row-major, key 1 (L
   sdc.button { render = { text = "Media" }, press = function(ctx) ctx.goto_page("media") end },
 })
 sdc.default_page("home")          -- optional; default is the first page defined
+sdc.brightness(60)                -- optional; active brightness 0-100 (sent on connect and on wake)
+sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600 }   -- optional, seconds
 ```
 
 - Render descriptor: `text` (`\n` allowed; wraps and auto-shrinks), `bg`/`fg` (`#rgb`, `#rrggbb`),
@@ -74,6 +76,16 @@ sdc.default_page("home")          -- optional; default is the first page defined
   the encoded image actually changed.
 - A Lua error in `render`/`press` is logged and shows a red `ERR` tile; the server keeps running.
 - Other `.lua` files next to the config can be loaded with `require`.
+- Idle: without `sdc.idle` a deck never idles. Otherwise, after `dim_after` seconds without a key press the
+  server sends brightness `dim_brightness` (default 10), and after `off_after` seconds brightness 0
+  (backlight off; key images are left alone). Both are optional. The next key press restores the active
+  brightness (`sdc.brightness`, default 60) and is consumed: it only wakes the deck, its press and release
+  handlers do not run. Any press while awake restarts the timer. Clients are checked once a second; a config
+  reload re-reads the settings without waking or dimming anyone (a changed setting takes effect on the next check).
+- Rendering: Lua `render` functions run one after the other, then the keys of a page (connect, page switch,
+  reload) are rasterized and JPEG-encoded in parallel. Pictures are premultiplied and shrunk (shorter side
+  <= 256 px) when decoded, and scaled once per key size and cached until the next config reload.
+  `RUST_LOG=sdc_server=debug` logs how long each render took.
 
 ## Icons and images
 
