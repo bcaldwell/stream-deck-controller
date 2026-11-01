@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main, v2]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/bcaldwell/stream-deck-controller
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64-linux
+            target: aarch64-unknown-linux-musl
+          - arch: x86_64-linux
+            target: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+      - name: Install cargo-zigbuild
+        run: pip install --user cargo-zigbuild==0.19.8 && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build static binaries
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }} -p sdc-server -p sdc-client
+      - name: Stage binaries
+        run: |
+          mkdir -p out
+          cp target/${{ matrix.target }}/release/sdc-server out/sdc-server-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/sdc-client out/sdc-client-${{ matrix.arch }}
+          file out/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+  docker:
+    name: docker image
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: bin
+          merge-multiple: true
+      - name: Stage binaries for the Dockerfile
+        run: |
+          mkdir -p dist/linux/amd64 dist/linux/arm64
+          install -m 0755 bin/sdc-server-x86_64-linux dist/linux/amd64/sdc-server
+          install -m 0755 bin/sdc-server-aarch64-linux dist/linux/arm64/sdc-server
+      # No QEMU needed: the binaries are prebuilt, the Dockerfile only copies them.
+      - uses: docker/setup-buildx-action@v3
+      # Tagged by commit SHA (what a deployment should pin), plus the branch name
+      # and semver on release tags as conveniences for humans.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ github.sha }}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+          # A per-commit revision label keeps every build's manifests unique, so
+          # the cleanup job can't delete children shared between tags.
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Provenance shows in GHCR as an extra "unknown/unknown" child per image
+          # and nothing here verifies it.
+          provenance: false
+
+  # Each push adds ~8 MB (one static binary layer per arch over distroless).
+  # Keep enough SHAs for a rollback; anything older can be rebuilt from its commit.
+  cleanup:
+    name: prune old images
+    if: github.event_name != 'pull_request'
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      # Multi-arch aware: per-platform manifests are untagged children, and a
+      # naive "delete untagged" breaks every image.
+      - uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          package: stream-deck-controller
+          keep-n-tagged: 10
+          exclude-tags: main,v*
+          delete-untagged: true
+          delete-partial-images: true
+          validate: true
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: release
+          merge-multiple: true
+      - name: Checksums
+        working-directory: release
+        run: sha256sum sdc-* > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*

@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sdc-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: sdc-server}
+  template:
+    metadata:
+      labels: {app: sdc-server}
+    spec:
+      containers:
+        - name: sdc-server
+          image: ghcr.io/bcaldwell/stream-deck-controller:latest
+          ports:
+            - containerPort: 7700
+          env:
+            - name: HA_URL
+              value: http://homeassistant.local:8123   # change me
+            - name: HA_TOKEN
+              valueFrom:
+                secretKeyRef: {name: sdc-secrets, key: HA_TOKEN}
+            - name: SDC_CONFIG
+              value: /config/config.lua
+            - name: RUST_LOG
+              value: info
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+          readinessProbe:
+            tcpSocket: {port: 7700}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 128Mi}
+      volumes:
+        - name: config
+          configMap: {name: sdc-config}

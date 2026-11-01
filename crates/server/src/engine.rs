@@ -1,0 +1,559 @@
+//! The engine: owns the Lua state (which is `!Send`), per-client state and the
+//! entity -> key dependency map. It runs on a dedicated thread and is driven by
+//! [`EngineEvent`]s; rendered frames go out through per-client channels.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use anyhow::Result;
+use sdc_protocol::DeviceInfo;
+use tokio::sync::mpsc::{self, UnboundedSender};
+
+use crate::ha::{HaCommand, HaEvent};
+use crate::lua_api::{CtxInfo, Host, LuaRuntime};
+use crate::render::{RenderSpec, Renderer};
+
+pub type ClientId = u64;
+
+/// A rendered key image for one client.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub key: u8,
+    pub jpeg: Vec<u8>,
+}
+
+pub enum EngineEvent {
+    ClientConnected {
+        id: ClientId,
+        client_id: String,
+        device: DeviceInfo,
+        tx: UnboundedSender<Frame>,
+    },
+    ClientDisconnected(ClientId),
+    KeyDown {
+        id: ClientId,
+        key: u8,
+    },
+    KeyUp {
+        id: ClientId,
+        key: u8,
+    },
+    Ha(HaEvent),
+    Reload,
+}
+
+struct Client {
+    client_id: String,
+    device: DeviceInfo,
+    tx: UnboundedSender<Frame>,
+    page: String,
+    /// Last image bytes sent per key, to suppress identical frames.
+    sent: Vec<Option<Vec<u8>>>,
+}
+
+pub struct Engine {
+    config_path: PathBuf,
+    host: Rc<Host>,
+    runtime: Option<LuaRuntime>,
+    renderer: Renderer,
+    clients: BTreeMap<ClientId, Client>,
+    key_deps: HashMap<(ClientId, u8), HashSet<String>>,
+    /// entity id -> keys whose last render read it
+    rev_deps: HashMap<String, HashSet<(ClientId, u8)>>,
+}
+
+impl Engine {
+    pub fn new(config_path: PathBuf, ha_tx: Option<UnboundedSender<HaCommand>>) -> Self {
+        let base = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            config_path,
+            host: Host::new(ha_tx),
+            runtime: None,
+            renderer: Renderer::new(base),
+            clients: BTreeMap::new(),
+            key_deps: HashMap::new(),
+            rev_deps: HashMap::new(),
+        }
+    }
+
+    /// (Re)loads the config. On failure the previous config stays active.
+    pub fn reload(&mut self) -> Result<()> {
+        let rt = LuaRuntime::load(&self.config_path, self.host.clone())?;
+        tracing::info!(
+            "loaded {} (pages: {})",
+            self.config_path.display(),
+            rt.page_names().join(", ")
+        );
+        self.runtime = Some(rt);
+        self.renderer.clear_icon_cache();
+        self.key_deps.clear();
+        self.rev_deps.clear();
+        let default = self.default_page();
+        let rt = self.runtime.as_ref().expect("just set");
+        for c in self.clients.values_mut() {
+            if !rt.has_page(&c.page) {
+                c.page = default.clone();
+            }
+        }
+        self.render_all_clients();
+        Ok(())
+    }
+
+    pub fn handle(&mut self, ev: EngineEvent) {
+        match ev {
+            EngineEvent::ClientConnected {
+                id,
+                client_id,
+                device,
+                tx,
+            } => {
+                tracing::info!(
+                    "client {client_id} connected ({}x{} @ {}px)",
+                    device.rows,
+                    device.cols,
+                    device.key_size_px
+                );
+                let sent = vec![None; device.key_count() as usize];
+                let page = self.default_page();
+                self.clients.insert(
+                    id,
+                    Client {
+                        client_id,
+                        device,
+                        tx,
+                        page,
+                        sent,
+                    },
+                );
+                self.render_client(id);
+            }
+            EngineEvent::ClientDisconnected(id) => {
+                if let Some(c) = self.clients.remove(&id) {
+                    tracing::info!("client {} disconnected", c.client_id);
+                }
+                self.drop_deps(|(cid, _)| *cid == id);
+            }
+            EngineEvent::KeyDown { id, key } => self.key_event(id, key, true),
+            EngineEvent::KeyUp { id, key } => self.key_event(id, key, false),
+            EngineEvent::Ha(e) => self.ha_event(e),
+            EngineEvent::Reload => {
+                if let Err(e) = self.reload() {
+                    tracing::error!("config reload failed, keeping previous config: {e:#}");
+                }
+            }
+        }
+    }
+
+    /// Blocking event loop; returns when all senders are dropped.
+    pub fn run(mut self, mut rx: mpsc::UnboundedReceiver<EngineEvent>) {
+        while let Some(ev) = rx.blocking_recv() {
+            self.handle(ev);
+        }
+    }
+
+    /// Switches a client to `page` (no-op with a warning if it doesn't exist).
+    pub fn goto_page(&mut self, id: ClientId, page: &str) {
+        if !self.runtime.as_ref().is_some_and(|rt| rt.has_page(page)) {
+            tracing::warn!("goto_page: no such page '{page}'");
+            return;
+        }
+        if let Some(c) = self.clients.get_mut(&id) {
+            c.page = page.to_string();
+            self.render_client(id);
+        }
+    }
+
+    fn default_page(&self) -> String {
+        self.runtime
+            .as_ref()
+            .and_then(|rt| rt.default_page())
+            .unwrap_or_default()
+    }
+
+    fn ha_event(&mut self, e: HaEvent) {
+        match e {
+            HaEvent::Seed(states) => {
+                *self.host.states.borrow_mut() = states
+                    .into_iter()
+                    .map(|s| (s.entity_id.clone(), s))
+                    .collect();
+                // Everything may have changed while we were away.
+                self.render_all_clients();
+            }
+            HaEvent::Changed(s) => {
+                let id = s.entity_id.clone();
+                let prev = self.host.states.borrow_mut().insert(id.clone(), s.clone());
+                if prev.as_ref() != Some(&s) {
+                    self.entity_changed(&id);
+                }
+            }
+            HaEvent::Removed(id) => {
+                if self.host.states.borrow_mut().remove(&id).is_some() {
+                    self.entity_changed(&id);
+                }
+            }
+        }
+    }
+
+    fn entity_changed(&mut self, entity: &str) {
+        let mut keys: Vec<_> = self
+            .rev_deps
+            .get(entity)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        keys.sort_unstable();
+        for (id, key) in keys {
+            self.render_key(id, key);
+        }
+    }
+
+    fn key_event(&mut self, id: ClientId, key: u8, down: bool) {
+        let Some(c) = self.clients.get(&id) else {
+            return;
+        };
+        let Some(rt) = &self.runtime else { return };
+        let Some(btn) = rt.button(&c.page, key) else {
+            return;
+        };
+        let info = ctx_info(c, key);
+        tracing::debug!(client = %c.client_id, page = %c.page, key, down, "key event");
+        match rt.press(&btn, &info, down) {
+            Ok(Some(page)) => self.goto_page(id, &page),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(
+                    "{} key {key} {}: {e:#}",
+                    info.page,
+                    if down { "press" } else { "release" }
+                );
+                let jpeg = self
+                    .renderer
+                    .render(&RenderSpec::error(), c.device.key_size_px);
+                self.send_if_changed(id, key, jpeg);
+            }
+        }
+    }
+
+    fn render_all_clients(&mut self) {
+        let ids: Vec<_> = self.clients.keys().copied().collect();
+        for id in ids {
+            self.render_client(id);
+        }
+    }
+
+    fn render_client(&mut self, id: ClientId) {
+        let Some(c) = self.clients.get(&id) else {
+            return;
+        };
+        for key in 0..c.device.key_count() {
+            self.render_key(id, key);
+        }
+    }
+
+    fn render_key(&mut self, id: ClientId, key: u8) {
+        let Some(c) = self.clients.get(&id) else {
+            return;
+        };
+        let size = c.device.key_size_px;
+        let found = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.button(&c.page, key).map(|b| (rt, b)));
+        let (jpeg, deps) = match found {
+            Some((rt, btn)) => {
+                let info = ctx_info(c, key);
+                let out = rt.render(&btn, &info);
+                if let Some(e) = &out.error {
+                    tracing::error!("render {} key {key} for {}: {e}", info.page, c.client_id);
+                }
+                (self.renderer.render(&out.spec, size), out.deps)
+            }
+            None => (self.renderer.blank(size), HashSet::new()),
+        };
+        self.set_deps(id, key, deps);
+        self.send_if_changed(id, key, jpeg);
+    }
+
+    fn send_if_changed(&mut self, id: ClientId, key: u8, jpeg: Vec<u8>) {
+        let Some(c) = self.clients.get_mut(&id) else {
+            return;
+        };
+        let Some(slot) = c.sent.get_mut(key as usize) else {
+            return;
+        };
+        if slot.as_ref() == Some(&jpeg) {
+            return;
+        }
+        *slot = Some(jpeg.clone());
+        // A closed receiver just means the client is on its way out.
+        let _ = c.tx.send(Frame { key, jpeg });
+    }
+
+    fn set_deps(&mut self, id: ClientId, key: u8, deps: HashSet<String>) {
+        if let Some(old) = self.key_deps.remove(&(id, key)) {
+            for e in old {
+                if let Some(set) = self.rev_deps.get_mut(&e) {
+                    set.remove(&(id, key));
+                }
+            }
+        }
+        for e in &deps {
+            self.rev_deps
+                .entry(e.clone())
+                .or_default()
+                .insert((id, key));
+        }
+        if !deps.is_empty() {
+            self.key_deps.insert((id, key), deps);
+        }
+    }
+
+    fn drop_deps(&mut self, pred: impl Fn(&(ClientId, u8)) -> bool) {
+        self.key_deps.retain(|k, _| !pred(k));
+        for set in self.rev_deps.values_mut() {
+            set.retain(|k| !pred(k));
+        }
+        self.rev_deps.retain(|_, s| !s.is_empty());
+    }
+
+    #[cfg(test)]
+    fn dep_count(&self, entity: &str) -> usize {
+        self.rev_deps.get(entity).map_or(0, HashSet::len)
+    }
+}
+
+fn ctx_info(c: &Client, key: u8) -> CtxInfo {
+    CtxInfo {
+        client_id: c.client_id.clone(),
+        key,
+        page: c.page.clone(),
+        rows: c.device.rows,
+        cols: c.device.cols,
+    }
+}
+
+/// Spawns the engine thread (Lua is `!Send`, so it is constructed on that thread).
+/// A failing initial config load is logged; the engine keeps running so a
+/// subsequent hot reload can fix it.
+pub fn spawn(
+    config_path: PathBuf,
+    ha_tx: Option<UnboundedSender<HaCommand>>,
+) -> UnboundedSender<EngineEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("sdc-engine".into())
+        .spawn(move || {
+            let mut engine = Engine::new(config_path, ha_tx);
+            if let Err(e) = engine.reload() {
+                tracing::error!("failed to load config: {e:#}");
+            }
+            engine.run(rx);
+        })
+        .expect("spawn engine thread");
+    tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ha::EntityState;
+    use serde_json::json;
+    use std::io::Write;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    const CONFIG: &str = r##"
+        sdc.page("home", {
+          sdc.button{ render = function()
+              local l = ha.state("light.a")
+              return { text = "A", bg = (l and l.state == "on") and "#f5b400" or "#222222" }
+            end,
+            press = function() ha.call("light", "toggle", { entity_id = "light.a" }) end },
+          sdc.button{ render = function()
+              local l = ha.state("light.b")
+              return { text = "B", bg = (l and l.state == "on") and "#f5b400" or "#222222" }
+            end },
+          sdc.button{ render = { text = "Next" }, press = function(ctx) ctx.goto_page("two") end },
+          sdc.button{ render = function() error("nope") end },
+        })
+        sdc.page("two", { sdc.button{ render = { text = "Back" }, press = function(ctx) ctx.goto_page("home") end } })
+    "##;
+
+    fn write_config(dir: &Path, src: &str) -> PathBuf {
+        let p = dir.join("config.lua");
+        std::fs::File::create(&p)
+            .unwrap()
+            .write_all(src.as_bytes())
+            .unwrap();
+        p
+    }
+
+    fn device() -> DeviceInfo {
+        DeviceInfo {
+            model: "t".into(),
+            serial: None,
+            rows: 3,
+            cols: 5,
+            key_size_px: 72,
+        }
+    }
+
+    fn st(id: &str, s: &str) -> EntityState {
+        EntityState {
+            entity_id: id.into(),
+            state: s.into(),
+            attributes: json!({}),
+        }
+    }
+
+    fn drain(rx: &mut UnboundedReceiver<Frame>) -> Vec<Frame> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn setup(
+        src: &str,
+    ) -> (
+        Engine,
+        UnboundedReceiver<Frame>,
+        UnboundedReceiver<HaCommand>,
+        tempdir::Dir,
+    ) {
+        let dir = tempdir::Dir::new();
+        let path = write_config(dir.path(), src);
+        let (ha_tx, ha_rx) = mpsc::unbounded_channel();
+        let mut e = Engine::new(path, Some(ha_tx));
+        e.reload().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        e.handle(EngineEvent::ClientConnected {
+            id: 1,
+            client_id: "c1".into(),
+            device: device(),
+            tx,
+        });
+        assert_eq!(drain(&mut rx).len(), 15);
+        (e, rx, ha_rx, dir)
+    }
+
+    /// Minimal self-cleaning temp dir (avoids a dev-dependency).
+    mod tempdir {
+        use std::path::{Path, PathBuf};
+        pub struct Dir(PathBuf);
+        impl Dir {
+            pub fn new() -> Self {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let p = std::env::temp_dir().join(format!(
+                    "sdc-test-{}-{}",
+                    std::process::id(),
+                    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                std::fs::create_dir_all(&p).unwrap();
+                Dir(p)
+            }
+            pub fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn state_change_rerenders_only_dependents() {
+        let (mut e, mut rx, _ha, _d) = setup(CONFIG);
+        assert_eq!(e.dep_count("light.a"), 1);
+        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
+        let frames = drain(&mut rx);
+        assert_eq!(frames.iter().map(|f| f.key).collect::<Vec<_>>(), [0]);
+        // identical change: no frame
+        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
+        assert!(drain(&mut rx).is_empty());
+        // unrelated entity: no frame
+        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.zzz", "on"))));
+        assert!(drain(&mut rx).is_empty());
+        // light.b -> key 1 only
+        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.b", "on"))));
+        assert_eq!(
+            drain(&mut rx).iter().map(|f| f.key).collect::<Vec<_>>(),
+            [1]
+        );
+    }
+
+    #[test]
+    fn seed_only_sends_visibly_changed_keys() {
+        let (mut e, mut rx, _ha, _d) = setup(CONFIG);
+        e.handle(EngineEvent::Ha(HaEvent::Seed(vec![st("light.b", "on")])));
+        assert_eq!(
+            drain(&mut rx).iter().map(|f| f.key).collect::<Vec<_>>(),
+            [1]
+        );
+    }
+
+    #[test]
+    fn error_tile_on_render_error() {
+        let (mut e, mut rx, _ha, d) = setup(CONFIG);
+        // key 3 errored at connect; its frame equals the error tile
+        let mut r = Renderer::new(d.path().to_path_buf());
+        let err = r.render(&RenderSpec::error(), 72);
+        e.handle(EngineEvent::Reload);
+        assert!(drain(&mut rx).is_empty()); // unchanged => nothing re-sent
+        let c = e.clients.get(&1).unwrap();
+        assert_eq!(c.sent[3].as_ref().unwrap(), &err);
+    }
+
+    #[test]
+    fn press_calls_ha_and_goto_switches_page() {
+        let (mut e, mut rx, mut ha, _d) = setup(CONFIG);
+        e.handle(EngineEvent::KeyDown { id: 1, key: 0 });
+        assert!(
+            matches!(ha.try_recv().unwrap(), HaCommand::CallService { service, .. } if service == "toggle")
+        );
+        e.handle(EngineEvent::KeyDown { id: 1, key: 2 });
+        assert_eq!(e.clients[&1].page, "two");
+        let frames = drain(&mut rx);
+        assert!(!frames.is_empty());
+        // light.a dependency gone with the page change
+        assert_eq!(e.dep_count("light.a"), 0);
+        e.handle(EngineEvent::KeyDown { id: 1, key: 0 });
+        assert_eq!(e.clients[&1].page, "home");
+    }
+
+    #[test]
+    fn disconnect_drops_deps() {
+        let (mut e, _rx, _ha, _d) = setup(CONFIG);
+        e.handle(EngineEvent::ClientDisconnected(1));
+        assert_eq!(e.dep_count("light.a"), 0);
+        assert!(e.key_deps.is_empty());
+    }
+
+    #[test]
+    fn reload_keeps_page_and_survives_bad_config() {
+        let (mut e, mut rx, _ha, d) = setup(CONFIG);
+        e.goto_page(1, "two");
+        drain(&mut rx);
+        // bad config: previous kept
+        write_config(d.path(), "this is not lua (");
+        e.handle(EngineEvent::Reload);
+        assert!(e.runtime.as_ref().unwrap().has_page("two"));
+        assert!(drain(&mut rx).is_empty());
+        // good config that still has "two"
+        write_config(
+            d.path(),
+            r##"sdc.page("home", {}) sdc.page("two", { sdc.button{ render = { text = "New" } } })"##,
+        );
+        e.handle(EngineEvent::Reload);
+        assert_eq!(e.clients[&1].page, "two");
+        assert!(!drain(&mut rx).is_empty());
+        // config without "two": back to default
+        write_config(d.path(), r##"sdc.page("home", {})"##);
+        e.handle(EngineEvent::Reload);
+        assert_eq!(e.clients[&1].page, "home");
+    }
+}
