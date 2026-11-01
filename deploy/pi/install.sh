@@ -87,6 +87,12 @@ chown root:root "$new"
 chmod 0600 "$new"
 mv "$new" "$ENV_FILE"
 
+# The Pi has no RTC and sits on a network without internet access; the firewall allows it
+# NTP to this one host only. A drifting clock eventually fails TLS against a renewed cert.
+mkdir -p /etc/systemd/timesyncd.conf.d
+printf '[Time]\nNTP=time.cloudflare.com\n' > /etc/systemd/timesyncd.conf.d/sdc.conf
+systemctl restart systemd-timesyncd 2>/dev/null || true
+
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=hidraw --subsystem-match=usb || true
 systemctl daemon-reload
