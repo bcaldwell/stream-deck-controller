@@ -1,5 +1,6 @@
 //! Server connection: reconnect loop and the per-connection session.
 
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -12,7 +13,7 @@ use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{debug, error, info, warn};
 
-use crate::device::{Deck, KeyEvent};
+use crate::device::{Deck, DeviceEvent, KeyEvent};
 
 /// If nothing (including pongs to our pings) arrives for this long, the link is dead.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -21,15 +22,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Brightness cap (percent) of the offline state.
 const OFFLINE_BRIGHTNESS: u8 = 20;
 
+/// How long a key shows the offline marker after a press while disconnected.
+const FEEDBACK_FOR: Duration = Duration::from_secs(2);
+
+/// Last JPEG received per key, so keys can be redrawn while disconnected.
+type Cache = HashMap<u8, Vec<u8>>;
+
 /// Tracks how long the server has been unreachable, to decide when the deck should show its
-/// offline state. Short outages (deploys, client restarts) leave the last images untouched.
-/// Time is passed in, so this is testable without a device.
+/// offline screen, and which keys are flashing press feedback. Outages leave the last images
+/// untouched until the grace passes. Time is passed in, so this is testable without a device.
 #[derive(Debug)]
 pub struct Link {
     grace: Duration,
     /// When the connection was lost (or the client started); `None` while connected.
     down_since: Option<Instant>,
     offline_shown: bool,
+    /// Keys showing press feedback, with when to restore them.
+    feedback: BTreeMap<u8, Instant>,
 }
 
 impl Link {
@@ -39,12 +48,15 @@ impl Link {
             grace,
             down_since: Some(now),
             offline_shown: false,
+            feedback: BTreeMap::new(),
         }
     }
 
     /// The server connection is up. Returns whether the offline state was showing.
     pub fn up(&mut self) -> bool {
         self.down_since = None;
+        // the server re-sends every image, which also replaces any feedback
+        self.feedback.clear();
         std::mem::take(&mut self.offline_shown)
     }
 
@@ -65,9 +77,39 @@ impl Link {
     pub fn take_due(&mut self, now: Instant) -> bool {
         if self.deadline().is_some_and(|d| now >= d) {
             self.offline_shown = true;
+            self.feedback.clear(); // the offline screen replaces everything
             return true;
         }
         false
+    }
+
+    /// A key went down. True if feedback should be drawn on it now: only while disconnected
+    /// and before the offline screen (which is its own feedback). Repeats extend the flash.
+    pub fn press(&mut self, key: u8, now: Instant) -> bool {
+        if self.down_since.is_none() || self.offline_shown {
+            return false;
+        }
+        self.feedback.insert(key, now + FEEDBACK_FOR);
+        true
+    }
+
+    /// Keys whose feedback has run out; the caller restores them.
+    pub fn take_restores(&mut self, now: Instant) -> Vec<u8> {
+        let keys: Vec<u8> = self
+            .feedback
+            .iter()
+            .filter(|(_, t)| now >= **t)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in &keys {
+            self.feedback.remove(k);
+        }
+        keys
+    }
+
+    /// The next time something is due: the offline screen or a feedback restore.
+    pub fn wake_at(&self) -> Option<Instant> {
+        self.feedback.values().copied().chain(self.deadline()).min()
     }
 }
 
@@ -79,13 +121,50 @@ async fn show_offline(cfg: &Config, deck: &Deck) -> Result<()> {
     deck.show_disconnected().await
 }
 
+/// Handles whatever is due while disconnected: the offline screen and feedback restores.
+async fn offline_due(
+    cfg: &Config,
+    deck: &Deck,
+    link: &mut Link,
+    cache: &Cache,
+    now: Instant,
+) -> Result<()> {
+    if link.take_due(now) {
+        show_offline(cfg, deck).await?;
+    }
+    for key in link.take_restores(now) {
+        deck.restore_key(key, cache.get(&key).map(Vec::as_slice))
+            .await?;
+    }
+    Ok(())
+}
+
+/// A device event while disconnected: a press flashes the offline marker; nothing is sent.
+async fn offline_event(
+    deck: &Deck,
+    link: &mut Link,
+    cache: &Cache,
+    ev: Option<DeviceEvent>,
+) -> Result<()> {
+    match ev {
+        Some(Ok(KeyEvent::Down(key))) if link.press(key, Instant::now()) => {
+            debug!(key, "key pressed while offline");
+            deck.show_offline_key(key, cache.get(&key).map(Vec::as_slice))
+                .await
+        }
+        Some(Ok(_)) => Ok(()),
+        Some(Err(e)) => Err(anyhow!(e)),
+        None => Err(anyhow!("device event channel closed")),
+    }
+}
+
 pub struct Config {
     pub server: String,
     /// Bearer token for the handshake and update downloads (None: send no credentials).
     pub token: Option<String>,
     pub client_id: String,
     pub brightness: u8,
-    /// How long the server may be unreachable before the deck shows its offline state.
+    /// How long the server may be unreachable before the deck shows its offline screen.
     pub offline_after: Duration,
     /// Hash of the running executable, reported in Hello (None: could not read it).
     pub client_sha256: Option<String>,
@@ -148,10 +227,11 @@ pub fn handle_message(msg: &Message) -> Result<Action> {
 pub async fn run(cfg: &Config, deck: &mut Deck) -> String {
     let mut backoff = Duration::from_millis(500);
     let mut link = Link::new(cfg.offline_after, Instant::now());
+    let mut cache = Cache::new();
     loop {
         info!(server = %cfg.server, "connecting");
         let started = Instant::now();
-        let res = session(cfg, deck, &mut link).await;
+        let res = session(cfg, deck, &mut link, &mut cache).await;
         link.down(Instant::now());
         match res {
             Ok(End::Device(why)) => return why,
@@ -165,12 +245,17 @@ pub async fn run(cfg: &Config, deck: &mut Deck) -> String {
         info!(?backoff, "retrying");
         let wake = Instant::now() + backoff;
         loop {
-            let until = link.deadline().map_or(wake, |d| d.min(wake));
-            tokio::time::sleep_until(until).await;
-            if link.take_due(Instant::now()) {
-                if let Err(e) = show_offline(cfg, deck).await {
-                    return format!("device error: {e:#}");
+            let until = link.wake_at().map_or(wake, |d| d.min(wake));
+            tokio::select! {
+                _ = tokio::time::sleep_until(until) => {}
+                ev = deck.events.recv() => {
+                    if let Err(e) = offline_event(deck, &mut link, &cache, ev).await {
+                        return format!("device error: {e:#}");
+                    }
                 }
+            }
+            if let Err(e) = offline_due(cfg, deck, &mut link, &cache, Instant::now()).await {
+                return format!("device error: {e:#}");
             }
             if Instant::now() >= wake {
                 break;
@@ -180,7 +265,7 @@ pub async fn run(cfg: &Config, deck: &mut Deck) -> String {
     }
 }
 
-async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link) -> Result<End> {
+async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link, cache: &mut Cache) -> Result<End> {
     let mut request = cfg.server.as_str().into_client_request()?;
     if let Some(token) = &cfg.token {
         request.headers_mut().insert(
@@ -189,18 +274,21 @@ async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link) -> Result<End> 
                 .map_err(|_| anyhow!("token contains characters not allowed in a header"))?,
         );
     }
-    // The offline state can fall due while the connect attempt is still pending.
+    // Offline timers and key presses are served while the connect attempt is pending.
     let connect = timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request));
     tokio::pin!(connect);
     let connected = loop {
-        let due = link.deadline();
+        let due = link.wake_at();
         tokio::select! {
             r = &mut connect => break r,
             _ = async { tokio::time::sleep_until(due.unwrap()).await }, if due.is_some() => {
-                if link.take_due(Instant::now()) {
-                    if let Err(e) = show_offline(cfg, deck).await {
-                        return Ok(End::Device(format!("device error: {e:#}")));
-                    }
+                if let Err(e) = offline_due(cfg, deck, link, cache, Instant::now()).await {
+                    return Ok(End::Device(format!("device error: {e:#}")));
+                }
+            }
+            ev = deck.events.recv() => {
+                if let Err(e) = offline_event(deck, link, cache, ev).await {
+                    return Ok(End::Device(format!("device error: {e:#}")));
                 }
             }
         }
@@ -287,6 +375,7 @@ async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link) -> Result<End> 
                         }
                     }
                     Ok(Action::Image { key, jpeg }) => {
+                        cache.insert(key, jpeg.clone());
                         if let Err(e) = deck.set_image_jpeg(key, &jpeg).await {
                             if deck.is_fake() || e.downcast_ref::<elgato_streamdeck::StreamDeckError>().is_none() {
                                 warn!(key, "image rejected: {e:#}");
@@ -352,30 +441,70 @@ mod tests {
         let t0 = Instant::now();
         let secs = Duration::from_secs;
         // startup: counts as down from the start, nothing drawn before the grace
-        let mut l = Link::new(secs(20), t0);
-        assert_eq!(l.deadline(), Some(t0 + secs(20)));
-        assert!(!l.take_due(t0 + secs(19)));
-        assert!(l.take_due(t0 + secs(20)));
-        assert!(!l.take_due(t0 + secs(21)), "drawn only once");
+        let mut l = Link::new(secs(1800), t0);
+        assert_eq!(l.deadline(), Some(t0 + secs(1800)));
+        assert!(!l.take_due(t0 + secs(1799)));
+        assert!(l.take_due(t0 + secs(1800)));
+        assert!(!l.take_due(t0 + secs(1801)), "drawn only once");
         assert_eq!(l.deadline(), None);
         // reconnect reports that the offline state has to be undone
         assert!(l.up());
         assert!(!l.up());
         assert_eq!(l.deadline(), None, "connected: nothing due");
-        assert!(!l.take_due(t0 + secs(1000)));
+        assert!(!l.take_due(t0 + secs(5000)));
 
         // a short outage never draws anything
-        l.down(t0 + secs(100));
-        l.down(t0 + secs(105)); // repeated failures keep the original loss time
-        assert_eq!(l.deadline(), Some(t0 + secs(120)));
-        assert!(!l.take_due(t0 + secs(119)));
+        l.down(t0 + secs(6000));
+        l.down(t0 + secs(6005)); // repeated failures keep the original loss time
+        assert_eq!(l.deadline(), Some(t0 + secs(7800)));
+        assert_eq!(l.wake_at(), l.deadline());
+        assert!(!l.take_due(t0 + secs(7799)));
+        assert!(l.take_restores(t0 + secs(7000)).is_empty());
         assert!(!l.up());
-        assert!(!l.take_due(t0 + secs(130)));
+        assert!(!l.take_due(t0 + secs(9000)));
 
         // a second long outage draws again
-        l.down(t0 + secs(200));
-        assert!(l.take_due(t0 + secs(220)));
+        l.down(t0 + secs(10000));
+        assert!(l.take_due(t0 + secs(11800)));
         assert!(l.up());
+    }
+
+    #[test]
+    fn link_press_feedback_while_offline() {
+        let t0 = Instant::now();
+        let secs = Duration::from_secs;
+        let mut l = Link::new(secs(1800), t0);
+        // press while disconnected: feedback on that key, restored after 2s
+        assert!(l.press(3, t0 + secs(10)));
+        assert_eq!(l.wake_at(), Some(t0 + secs(12)));
+        assert!(l.take_restores(t0 + secs(11)).is_empty());
+        // a repeat press extends it; other keys are tracked independently
+        assert!(l.press(3, t0 + secs(11)));
+        assert!(l.press(7, t0 + secs(11)));
+        assert!(l.take_restores(t0 + secs(12)).is_empty());
+        assert_eq!(l.take_restores(t0 + secs(13)), vec![3, 7]);
+        assert!(l.take_restores(t0 + secs(14)).is_empty(), "restored once");
+        assert_eq!(l.wake_at(), l.deadline());
+
+        // the long fallback shows the offline screen and cancels pending feedback
+        assert!(l.press(1, t0 + secs(1799)));
+        assert!(l.take_due(t0 + secs(1800)));
+        assert!(l.take_restores(t0 + secs(2000)).is_empty());
+        assert!(
+            !l.press(1, t0 + secs(1801)),
+            "offline screen is its own feedback"
+        );
+
+        // reconnect restores; connected presses are sent, not flashed
+        assert!(l.up());
+        assert!(!l.press(1, t0 + secs(1900)));
+        assert_eq!(l.wake_at(), None);
+
+        // reconnect drops pending feedback (the server re-sends images)
+        l.down(t0 + secs(2000));
+        assert!(l.press(2, t0 + secs(2001)));
+        assert!(!l.up());
+        assert!(l.take_restores(t0 + secs(2100)).is_empty());
     }
 
     #[test]

@@ -32,12 +32,13 @@ struct Args {
           value_parser = clap::value_parser!(u8).range(0..=100))]
     brightness: u8,
 
-    /// Seconds without a server connection before the deck shows its offline state; until
-    /// then (also at startup) it keeps showing the last images
+    /// Seconds without a server connection before the deck switches to its dimmed offline
+    /// screen; until then (also at startup) it keeps showing the last images, and a key
+    /// press flashes an offline marker on that key
     #[arg(
         long,
         env = "SDC_OFFLINE_AFTER",
-        default_value_t = 20,
+        default_value_t = 1800,
         value_name = "SECONDS"
     )]
     offline_after: u64,

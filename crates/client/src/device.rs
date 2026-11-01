@@ -229,6 +229,49 @@ impl Deck {
     }
 }
 
+impl Deck {
+    /// Press feedback while offline: the cached image dimmed with a red bar along the bottom
+    /// (just the bar on black when nothing is cached).
+    pub async fn show_offline_key(&self, key: u8, cached: Option<&[u8]>) -> Result<()> {
+        let size = self.info.key_size_px;
+        let base = cached.and_then(|j| decode_key_image(j, size).ok());
+        let mut jpeg = Vec::new();
+        offline_key_tile(base.as_ref(), size)
+            .write_to(&mut std::io::Cursor::new(&mut jpeg), ImageFormat::Jpeg)?;
+        self.set_image_jpeg(key, &jpeg).await
+    }
+
+    /// Undo [`Deck::show_offline_key`]: redraw the cached image (black when nothing is cached).
+    pub async fn restore_key(&self, key: u8, cached: Option<&[u8]>) -> Result<()> {
+        match cached {
+            Some(jpeg) => self.set_image_jpeg(key, jpeg).await,
+            None => {
+                let mut jpeg = Vec::new();
+                RgbImage::from_pixel(1, 1, Rgb([0, 0, 0]))
+                    .write_to(&mut std::io::Cursor::new(&mut jpeg), ImageFormat::Jpeg)?;
+                self.set_image_jpeg(key, &jpeg).await
+            }
+        }
+    }
+}
+
+/// `base` dimmed to a third of its brightness, with a red bar along the bottom edge.
+pub fn offline_key_tile(base: Option<&DynamicImage>, size: u32) -> DynamicImage {
+    let mut img = match base {
+        Some(b) => b.to_rgb8(),
+        None => RgbImage::from_pixel(size, size, Rgb([0, 0, 0])),
+    };
+    let bar_top = (size as f32 * 0.78) as u32;
+    for (_, y, px) in img.enumerate_pixels_mut() {
+        *px = if y >= bar_top {
+            Rgb([200, 0, 0])
+        } else {
+            Rgb(px.0.map(|c| c / 3))
+        };
+    }
+    DynamicImage::ImageRgb8(img)
+}
+
 /// A black key with a small red dot near the top-left corner.
 pub fn disconnected_tile(size: u32) -> DynamicImage {
     let mut img = RgbImage::from_pixel(size, size, Rgb([0, 0, 0]));
@@ -363,6 +406,15 @@ mod tests {
         assert_eq!(tile.get_pixel(50, 50).0, [0, 0, 0]);
         assert!(!dir.join("key-3.jpg").exists());
         assert!(dir.join("key-0.jpg").exists());
+
+        // press feedback and restore
+        deck.show_offline_key(3, Some(&jpeg(72))).await.unwrap();
+        let shown = std::fs::read(dir.join("key-3.jpg")).unwrap();
+        let px = decode_key_image(&shown, 72).unwrap().to_rgb8();
+        assert!(px.get_pixel(36, 10).0[1] < 100, "dimmed (was 200 green)");
+        assert!(px.get_pixel(36, 68).0[0] > 150, "red bar at the bottom");
+        deck.restore_key(3, Some(&jpeg(72))).await.unwrap();
+        assert_eq!(std::fs::read(dir.join("key-3.jpg")).unwrap(), jpeg(72));
         std::fs::remove_dir_all(dir).ok();
     }
 }
