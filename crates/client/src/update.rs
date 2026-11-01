@@ -46,8 +46,8 @@ pub fn http_base(server: &str) -> Result<String> {
 }
 
 /// Download `path` from the server, verify it hashes to `sha256` and replace the running
-/// executable with it. Blocking: call from `spawn_blocking`.
-pub fn apply(server: &str, path: &str, sha256: &str) -> Result<()> {
+/// executable with it. `token` is sent as a bearer token. Blocking: call from `spawn_blocking`.
+pub fn apply(server: &str, token: Option<&str>, path: &str, sha256: &str) -> Result<()> {
     let url = format!("{}{path}", http_base(server)?);
     let exe = std::env::current_exe().context("locating current executable")?;
     let dir = exe
@@ -55,12 +55,14 @@ pub fn apply(server: &str, path: &str, sha256: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("executable has no directory"))?;
     check_writable(dir)?;
 
-    let resp = ureq::AgentBuilder::new()
+    let mut req = ureq::AgentBuilder::new()
         .timeout(HTTP_TIMEOUT)
         .build()
-        .get(&url)
-        .call()
-        .with_context(|| format!("downloading {url}"))?;
+        .get(&url);
+    if let Some(token) = token {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    let resp = req.call().with_context(|| format!("downloading {url}"))?;
     let mut bytes = Vec::new();
     resp.into_reader()
         .take(MAX_BINARY_BYTES)

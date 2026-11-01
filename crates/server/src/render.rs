@@ -3,11 +3,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::{self, FilterType};
 use image::{ExtendedColorType, ImageEncoder, Rgb, RgbImage, RgbaImage};
+
+use crate::assets::{redact, Assets, Fetcher, Source};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/OpenSans.ttf");
 
@@ -15,6 +18,9 @@ const JPEG_QUALITY: u8 = 90;
 const PAD: f32 = 4.0;
 const MIN_FONT_PX: f32 = 9.0;
 const LINE: f32 = 1.15;
+/// How long a failed download is remembered before it is tried again.
+const FAIL_TTL: Duration = Duration::from_secs(60);
+const ERR_BG: Color = Color([0xb0, 0x00, 0x20]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color(pub [u8; 3]);
@@ -47,7 +53,10 @@ pub struct RenderSpec {
     pub text: Option<String>,
     pub bg: Color,
     pub fg: Color,
+    /// Fit-with-padding picture over `bg` (local path, URL or bucket key).
     pub icon: Option<String>,
+    /// Full-bleed picture (scaled to cover the key); text is drawn on top of it.
+    pub image: Option<String>,
     pub font_size: Option<f32>,
 }
 
@@ -58,6 +67,7 @@ impl Default for RenderSpec {
             bg: Color([0x1c, 0x1c, 0x1e]),
             fg: Color::WHITE,
             icon: None,
+            image: None,
             font_size: None,
         }
     }
@@ -67,7 +77,7 @@ impl RenderSpec {
     pub fn error() -> Self {
         Self {
             text: Some("ERR".into()),
-            bg: Color([0xb0, 0x00, 0x20]),
+            bg: ERR_BG,
             ..Self::default()
         }
     }
@@ -75,8 +85,27 @@ impl RenderSpec {
 
 pub struct Renderer {
     font: FontRef<'static>,
-    base_dir: PathBuf,
-    icons: HashMap<PathBuf, Option<Rc<RgbaImage>>>,
+    assets: Assets,
+    /// `icon`/`image` string -> where it lives (None: unresolvable, already logged).
+    resolved: HashMap<String, Option<Source>>,
+    local: HashMap<PathBuf, Option<Rc<RgbaImage>>>,
+    /// Downloaded images by remote cache key.
+    remote: HashMap<String, Slot>,
+    /// Without one, remote images are reported as failed (they are never fetched inline).
+    fetcher: Option<Fetcher>,
+}
+
+enum Slot {
+    Loading,
+    Ready(Rc<RgbaImage>),
+    Failed(Instant),
+}
+
+/// Result of looking an image up for one render; never waits on the network.
+enum Img {
+    Ready(Rc<RgbaImage>),
+    Loading,
+    Failed,
 }
 
 #[derive(Clone, Copy)]
@@ -90,19 +119,76 @@ struct Area {
 impl Renderer {
     /// `base_dir` is the directory icon paths are relative to (the config's directory).
     pub fn new(base_dir: PathBuf) -> Self {
+        Self::with_assets(Assets::new(base_dir, None))
+    }
+
+    pub fn with_assets(assets: Assets) -> Self {
         Self {
             font: FontRef::try_from_slice(FONT_BYTES).expect("embedded font is valid"),
-            base_dir,
-            icons: HashMap::new(),
+            assets,
+            resolved: HashMap::new(),
+            local: HashMap::new(),
+            remote: HashMap::new(),
+            fetcher: None,
         }
     }
 
+    pub fn set_fetcher(&mut self, fetcher: Option<Fetcher>) {
+        self.fetcher = fetcher;
+    }
+
+    /// Forgets local files, resolutions and failed downloads (config reload). Downloaded
+    /// images stay: they do not depend on the config and refetching would blank the keys.
     pub fn clear_icon_cache(&mut self) {
-        self.icons.clear();
+        self.resolved.clear();
+        self.local.clear();
+        self.remote.retain(|_, s| !matches!(s, Slot::Failed(_)));
+    }
+
+    /// Number of downloads in flight.
+    pub fn pending(&self) -> usize {
+        self.remote
+            .values()
+            .filter(|s| matches!(s, Slot::Loading))
+            .count()
+    }
+
+    /// Starts fetching `name` if it is a remote image that is not cached yet.
+    pub fn prefetch(&mut self, name: &str) {
+        self.lookup(name);
+    }
+
+    /// Cache keys of the remote images `spec` uses: when one of them arrives, the key must be
+    /// re-rendered.
+    pub fn remote_keys(&mut self, spec: &RenderSpec) -> Vec<String> {
+        [spec.icon.as_deref(), spec.image.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|n| {
+                let src = self.resolve(n)?;
+                self.assets.remote_key(&src)
+            })
+            .collect()
+    }
+
+    /// Records the outcome of a background download started by [`Fetcher::spawn`].
+    pub fn finish_fetch(&mut self, key: &str, result: Result<RgbaImage, String>) {
+        let slot = match result {
+            Ok(img) => Slot::Ready(Rc::new(img)),
+            Err(e) => {
+                tracing::warn!("cannot fetch image {}: {e}", redact(key));
+                Slot::Failed(Instant::now())
+            }
+        };
+        self.remote.insert(key.to_string(), slot);
     }
 
     pub fn blank(&self, size: u32) -> Vec<u8> {
-        encode_jpeg(&RgbImage::from_pixel(size, size, Rgb(Color::BLACK.0)))
+        self.blank_with(Color::BLACK, size)
+    }
+
+    fn blank_with(&self, color: Color, size: u32) -> Vec<u8> {
+        encode_jpeg(&RgbImage::from_pixel(size, size, Rgb(color.0)))
     }
 
     pub fn render(&mut self, spec: &RenderSpec, size: u32) -> Vec<u8> {
@@ -119,11 +205,18 @@ impl Renderer {
             w: s - 2.0 * pad,
             h: s - 2.0 * pad,
         };
-        let icon = spec.icon.as_deref().and_then(|p| self.load_icon(p));
+        let full = Area {
+            x: 0.0,
+            y: 0.0,
+            w: s,
+            h: s,
+        };
+        let image = spec.image.as_deref().map(|n| self.lookup(n));
+        let icon = spec.icon.as_deref().map(|n| self.lookup(n));
         let text = spec.text.as_deref().filter(|t| !t.is_empty());
 
-        let (icon_area, text_area, text_max) = match (&icon, text) {
-            (Some(_), Some(_)) => {
+        let (icon_area, text_area, text_max) = match (icon.is_some(), text) {
+            (true, Some(_)) => {
                 let ih = (inner.h * 0.5).round();
                 (
                     Some(Area { h: ih, ..inner }),
@@ -135,32 +228,148 @@ impl Renderer {
                     s * 0.22,
                 )
             }
-            (Some(_), None) => (Some(inner), None, 0.0),
-            (None, Some(_)) => (None, Some(inner), s * 0.32),
-            (None, None) => (None, None, 0.0),
+            (true, None) => (Some(inner), None, 0.0),
+            // label along the bottom of a full-bleed picture
+            (false, Some(_)) if image.is_some() => (
+                None,
+                Some(Area {
+                    y: inner.y + inner.h * 0.55,
+                    h: inner.h * 0.45,
+                    ..inner
+                }),
+                s * 0.22,
+            ),
+            (false, Some(_)) => (None, Some(inner), s * 0.32),
+            (false, None) => (None, None, 0.0),
         };
 
-        if let (Some(icon), Some(area)) = (&icon, icon_area) {
-            draw_icon(&mut img, icon, area, spec.bg);
+        match &image {
+            Some(Img::Ready(im)) => {
+                composite(&mut img, &cover(im, size), 0, 0);
+                if text.is_some() {
+                    darken_bottom(&mut img);
+                }
+            }
+            Some(Img::Failed) => {
+                let top = Area { h: s / 2.0, ..full };
+                self.draw_err(&mut img, full, top);
+            }
+            Some(Img::Loading) | None => {}
+        }
+        match (&icon, icon_area) {
+            (Some(Img::Ready(im)), Some(area)) => draw_icon(&mut img, im, area),
+            (Some(Img::Failed), Some(area)) => self.draw_err(&mut img, area, area),
+            _ => {}
         }
         if let (Some(text), Some(area)) = (text, text_area) {
+            if image.is_some() {
+                // drop shadow so the label stays legible on busy pictures
+                let o = s / 72.0;
+                let shadow = Area {
+                    x: area.x + o,
+                    y: area.y + o,
+                    ..area
+                };
+                self.draw_text(
+                    &mut img,
+                    text,
+                    shadow,
+                    Color::BLACK,
+                    spec.font_size,
+                    text_max,
+                );
+            }
             self.draw_text(&mut img, text, area, spec.fg, spec.font_size, text_max);
         }
         img
     }
 
-    fn load_icon(&mut self, path: &str) -> Option<Rc<RgbaImage>> {
-        let full = self.base_dir.join(path);
-        self.icons
-            .entry(full.clone())
-            .or_insert_with(|| match image::open(&full) {
-                Ok(i) => Some(Rc::new(i.to_rgba8())),
-                Err(e) => {
-                    tracing::warn!("cannot load icon {}: {e}", full.display());
-                    None
-                }
-            })
-            .clone()
+    /// Fills `fill` with the error colour and writes "ERR" in `label`.
+    fn draw_err(&self, img: &mut RgbImage, fill: Area, label: Area) {
+        let (x0, y0) = (fill.x as u32, fill.y as u32);
+        let (x1, y1) = (
+            ((fill.x + fill.w) as u32).min(img.width()),
+            ((fill.y + fill.h) as u32).min(img.height()),
+        );
+        for y in y0..y1 {
+            for x in x0..x1 {
+                img.put_pixel(x, y, Rgb(ERR_BG.0));
+            }
+        }
+        self.draw_text(
+            img,
+            "ERR",
+            label,
+            Color::WHITE,
+            None,
+            (label.h * 0.6).min(img.width() as f32 * 0.32),
+        );
+    }
+
+    fn resolve(&mut self, name: &str) -> Option<Source> {
+        if let Some(r) = self.resolved.get(name) {
+            return r.clone();
+        }
+        let r = match self.assets.resolve(name) {
+            Ok(src) => Some(src),
+            Err(e) => {
+                tracing::warn!("cannot resolve image {name:?}: {e}");
+                None
+            }
+        };
+        self.resolved.insert(name.to_string(), r.clone());
+        r
+    }
+
+    /// Local files are decoded inline (cached); remote ones come from the cache or start a
+    /// background download and report `Loading`.
+    fn lookup(&mut self, name: &str) -> Img {
+        let Some(src) = self.resolve(name) else {
+            return Img::Failed;
+        };
+        let Some(key) = self.assets.remote_key(&src) else {
+            let Source::File(full) = src else {
+                return Img::Failed;
+            };
+            let loaded =
+                self.local
+                    .entry(full.clone())
+                    .or_insert_with(|| match image::open(&full) {
+                        Ok(i) => Some(Rc::new(i.to_rgba8())),
+                        Err(e) => {
+                            tracing::warn!("cannot load icon {}: {e}", full.display());
+                            None
+                        }
+                    });
+            return loaded.clone().map_or(Img::Failed, Img::Ready);
+        };
+        match self.remote.get(&key) {
+            Some(Slot::Ready(i)) => return Img::Ready(i.clone()),
+            Some(Slot::Loading) => return Img::Loading,
+            Some(Slot::Failed(at)) if at.elapsed() < FAIL_TTL => return Img::Failed,
+            _ => {}
+        }
+        let started = match (&self.fetcher, self.assets.download_url(&src)) {
+            (Some(f), Ok(url)) => {
+                f.spawn(key.clone(), url);
+                true
+            }
+            (None, _) => {
+                tracing::warn!("cannot fetch {}: no background fetcher", redact(&key));
+                false
+            }
+            (_, Err(e)) => {
+                tracing::warn!("cannot fetch {}: {e:#}", redact(&key));
+                false
+            }
+        };
+        if started {
+            self.remote.insert(key, Slot::Loading);
+            Img::Loading
+        } else {
+            self.remote.insert(key, Slot::Failed(Instant::now()));
+            Img::Failed
+        }
     }
 
     fn draw_text(
@@ -302,17 +511,53 @@ fn blend(dst: &mut Rgb<u8>, src: [u8; 3], a: f32) {
     }
 }
 
-fn draw_icon(img: &mut RgbImage, icon: &RgbaImage, area: Area, _bg: Color) {
+fn draw_icon(img: &mut RgbImage, icon: &RgbaImage, area: Area) {
     let (iw, ih) = (icon.width() as f32, icon.height() as f32);
     let k = (area.w / iw).min(area.h / ih);
     let (tw, th) = (
         ((iw * k).round() as u32).max(1),
         ((ih * k).round() as u32).max(1),
     );
-    let scaled = imageops::resize(icon, tw, th, FilterType::Lanczos3);
+    let scaled = resize_rgba(icon, tw, th);
     let ox = (area.x + (area.w - tw as f32) / 2.0).round() as i64;
     let oy = (area.y + (area.h - th as f32) / 2.0).round() as i64;
-    for (x, y, p) in scaled.enumerate_pixels() {
+    composite(img, &scaled, ox, oy);
+}
+
+/// Scales `src` to cover a `size` x `size` square and center-crops the overflow.
+pub fn cover(src: &RgbaImage, size: u32) -> RgbaImage {
+    let k = (size as f32 / src.width() as f32).max(size as f32 / src.height() as f32);
+    let w = ((src.width() as f32 * k).round() as u32).max(size);
+    let h = ((src.height() as f32 * k).round() as u32).max(size);
+    let scaled = resize_rgba(src, w, h);
+    imageops::crop_imm(&scaled, (w - size) / 2, (h - size) / 2, size, size).to_image()
+}
+
+/// Lanczos resize that does not bleed the colour of transparent pixels into the edges
+/// (resizing is done on premultiplied alpha).
+fn resize_rgba(src: &RgbaImage, w: u32, h: u32) -> RgbaImage {
+    let mut pre = src.clone();
+    for p in pre.pixels_mut() {
+        let a = p.0[3] as u32;
+        for c in &mut p.0[..3] {
+            *c = ((*c as u32 * a + 127) / 255) as u8;
+        }
+    }
+    let mut out = imageops::resize(&pre, w, h, FilterType::Lanczos3);
+    for p in out.pixels_mut() {
+        let a = p.0[3] as u32;
+        if a > 0 {
+            for c in &mut p.0[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Alpha-composites `over` onto `img` with its top-left corner at (`ox`, `oy`).
+fn composite(img: &mut RgbImage, over: &RgbaImage, ox: i64, oy: i64) {
+    for (x, y, p) in over.enumerate_pixels() {
         let (dx, dy) = (ox + x as i64, oy + y as i64);
         if dx < 0 || dy < 0 || dx >= img.width() as i64 || dy >= img.height() as i64 {
             continue;
@@ -322,6 +567,21 @@ fn draw_icon(img: &mut RgbImage, icon: &RgbaImage, area: Area, _bg: Color) {
             [p.0[0], p.0[1], p.0[2]],
             p.0[3] as f32 / 255.0,
         );
+    }
+}
+
+/// Subtle dark gradient over the lower half so text on top of a picture stays legible.
+fn darken_bottom(img: &mut RgbImage) {
+    let h = img.height() as f32;
+    let start = h * 0.4;
+    for y in 0..img.height() {
+        let t = ((y as f32 - start) / (h - start)).clamp(0.0, 1.0);
+        if t == 0.0 {
+            continue;
+        }
+        for x in 0..img.width() {
+            blend(img.get_pixel_mut(x, y), [0, 0, 0], 0.7 * t);
+        }
     }
 }
 
@@ -414,5 +674,153 @@ mod tests {
             ..Default::default()
         };
         let _ = r.render(&spec, 72);
+    }
+
+    fn png_dir(tag: &str, files: &[(&str, RgbaImage)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sdc-render-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, img) in files {
+            img.save(dir.join(name)).unwrap();
+        }
+        dir
+    }
+
+    fn px(jpeg: &[u8], x: u32, y: u32) -> [u8; 3] {
+        image::load_from_memory(jpeg)
+            .unwrap()
+            .to_rgb8()
+            .get_pixel(x, y)
+            .0
+    }
+
+    fn near(a: [u8; 3], b: [u8; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| x.abs_diff(y) < 24)
+    }
+
+    #[test]
+    fn cover_fills_square_and_crops_the_center() {
+        // 2:1 picture, left half red, right half blue
+        let mut src = RgbaImage::new(200, 100);
+        for (x, _, p) in src.enumerate_pixels_mut() {
+            *p = if x < 100 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            };
+        }
+        for size in [72u32, 96] {
+            let out = cover(&src, size);
+            assert_eq!((out.width(), out.height()), (size, size));
+            assert_eq!(out.get_pixel(2, size / 2).0, [255, 0, 0, 255]);
+            assert_eq!(out.get_pixel(size - 3, size / 2).0, [0, 0, 255, 255]);
+        }
+        // tall pictures too
+        let out = cover(&RgbaImage::new(30, 300), 72);
+        assert_eq!((out.width(), out.height()), (72, 72));
+    }
+
+    #[test]
+    fn image_is_full_bleed_icon_keeps_padding_and_alpha() {
+        let green = RgbaImage::from_pixel(40, 20, image::Rgba([0, 200, 0, 255]));
+        let clear = RgbaImage::from_pixel(32, 32, image::Rgba([255, 0, 0, 0]));
+        let dir = png_dir("bleed", &[("g.png", green), ("clear.png", clear)]);
+        let mut r = Renderer::new(dir.clone());
+        let bg = Color([0x20, 0x20, 0x80]);
+
+        let full = r.render(
+            &RenderSpec {
+                image: Some("g.png".into()),
+                bg,
+                ..Default::default()
+            },
+            72,
+        );
+        for (x, y) in [(0, 0), (71, 0), (0, 71), (71, 71), (36, 36)] {
+            assert!(near(px(&full, x, y), [0, 200, 0]), "({x},{y})");
+        }
+
+        // `icon` is fitted with padding over bg: corners stay bg, the middle is the picture
+        let icon = r.render(
+            &RenderSpec {
+                icon: Some("g.png".into()),
+                bg,
+                ..Default::default()
+            },
+            72,
+        );
+        assert!(near(px(&icon, 1, 1), bg.0));
+        assert!(near(px(&icon, 36, 36), [0, 200, 0]));
+
+        // a fully transparent icon leaves the background untouched
+        let transparent = r.render(
+            &RenderSpec {
+                icon: Some("clear.png".into()),
+                bg,
+                ..Default::default()
+            },
+            72,
+        );
+        assert_eq!(transparent, r.blank_with(bg, 72));
+
+        // text over a picture is drawn on a darkened bottom
+        let labelled = r.render(
+            &RenderSpec {
+                image: Some("g.png".into()),
+                text: Some("Movie".into()),
+                bg,
+                ..Default::default()
+            },
+            72,
+        );
+        assert!(px(&labelled, 2, 70)[1] < 120, "bottom is darkened");
+        assert!(near(px(&labelled, 36, 2), [0, 200, 0]), "top is untouched");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_image_shows_error_only_in_its_area() {
+        let mut r = Renderer::new(PathBuf::from("/nonexistent"));
+        let bg = Color([0x20, 0x20, 0x80]);
+        let icon = r.render(
+            &RenderSpec {
+                icon: Some("nope.png".into()),
+                text: Some("x".into()),
+                bg,
+                ..Default::default()
+            },
+            72,
+        );
+        assert!(
+            near(px(&icon, 6, 6), ERR_BG.0),
+            "icon area is the error tile"
+        );
+        assert!(
+            near(px(&icon, 3, 68), bg.0),
+            "the rest of the key is intact"
+        );
+        let full = r.render(
+            &RenderSpec {
+                image: Some("nope.png".into()),
+                bg,
+                ..Default::default()
+            },
+            72,
+        );
+        assert!(near(px(&full, 2, 70), ERR_BG.0));
+    }
+
+    #[test]
+    fn remote_image_without_fetcher_fails_instead_of_blocking() {
+        let mut r = Renderer::new(PathBuf::from("."));
+        let spec = RenderSpec {
+            image: Some("http://127.0.0.1:9/never.png".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            r.remote_keys(&spec),
+            ["http://127.0.0.1:9/never.png".to_string()]
+        );
+        let _ = r.render(&spec, 72);
+        assert_eq!(r.pending(), 0);
     }
 }

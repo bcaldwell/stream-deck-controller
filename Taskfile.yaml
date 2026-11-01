@@ -71,16 +71,29 @@ tasks:
       - cp target/{{.ARM}}/release/sdc-client dist/clients/sdc-client-aarch64-linux
       - docker build -t {{.IMAGE}} .
 
-  deploy-pi:
-    desc: Copy a locally built aarch64 client to the Pi (PI_HOST, default 192.168.2.81); prints the install command
+  pi:install:
+    desc: Build the Pi client, push it + the installer from this Mac and install it over ssh (HOST, SERVER; token from env SDC_CLIENT_TOKEN)
     deps: [build-pi]
     vars:
-      PI_HOST: '{{.PI_HOST | default "192.168.2.81"}}'
+      HOST: '{{.HOST | default "pi@192.168.2.81"}}'
+      SERVER: '{{.SERVER | default "wss://streamdeck.bcaldwell.co/ws"}}'
     cmds:
-      - scp target/{{.ARM}}/release/sdc-client pi@{{.PI_HOST}}:/tmp/sdc-client
+      # One ssh session runs the install under sudo, so there is a single password prompt.
+      # The token goes over ssh stdin into a 0600 file in a private temp dir (never on a
+      # command line, where `ps` could show it); install.sh deletes it and the dir is removed.
       - |
-        echo "On the Pi, install with the server's own binary and installer:"
-        echo "  curl -fsSL http://<server>:7700/install.sh | sudo sh -s -- --server ws://<server>:7700/ws"
-        echo "or hot-swap this build: sudo install -o sdc -g sdc -m755 /tmp/sdc-client /var/lib/sdc-client/sdc-client && sudo systemctl restart sdc-client"
-        echo "(the server will replace it again if it serves a different build; use --no-update to pin)"
-
+        set -eu
+        host='{{.HOST}}'
+        dir="$(ssh "$host" 'mktemp -d')"
+        scp -q target/{{.ARM}}/release/sdc-client deploy/pi/install.sh deploy/pi/50-streamdeck.rules deploy/pi/sdc-client.service "$host:$dir/"
+        token_arg=""
+        if [ -n "${SDC_CLIENT_TOKEN:-}" ]; then
+          printf '%s' "$SDC_CLIENT_TOKEN" | ssh "$host" "umask 077 && cat > '$dir/token'"
+          token_arg="--token-file '$dir/token'"
+        else
+          echo "SDC_CLIENT_TOKEN not set: keeping the token already on the Pi (if any)" >&2
+        fi
+        rc=0
+        ssh -t "$host" "sudo sh '$dir/install.sh' --server '{{.SERVER}}' $token_arg" || rc=$?
+        ssh "$host" "rm -rf '$dir'" || true
+        exit "$rc"

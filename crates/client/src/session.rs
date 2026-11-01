@@ -2,11 +2,14 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use futures_util::{SinkExt, StreamExt};
 use sdc_protocol::{ClientMessage, ImageFrame, ServerMessage, PROTOCOL_VERSION};
 use tokio::time::{interval, timeout, Instant};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{debug, error, info, warn};
 
 use crate::device::{Deck, KeyEvent};
@@ -18,6 +21,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Config {
     pub server: String,
+    /// Bearer token for the handshake and update downloads (None: send no credentials).
+    pub token: Option<String>,
     pub client_id: String,
     pub brightness: u8,
     /// Hash of the running executable, reported in Hello (None: could not read it).
@@ -102,12 +107,25 @@ pub async fn run(cfg: &Config, deck: &mut Deck) -> String {
 }
 
 async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
-    let (ws, _) = timeout(
-        CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async(cfg.server.as_str()),
-    )
-    .await
-    .map_err(|_| anyhow!("connect timed out"))??;
+    let mut request = cfg.server.as_str().into_client_request()?;
+    if let Some(token) = &cfg.token {
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::try_from(format!("Bearer {token}"))
+                .map_err(|_| anyhow!("token contains characters not allowed in a header"))?,
+        );
+    }
+    let (ws, _) = match timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+        .await
+        .map_err(|_| anyhow!("connect timed out"))?
+    {
+        Ok(ok) => ok,
+        Err(WsError::Http(resp)) if resp.status() == StatusCode::UNAUTHORIZED => {
+            error!("server rejected token (HTTP 401): check SDC_CLIENT_TOKEN / --token");
+            bail!("server rejected token");
+        }
+        Err(e) => return Err(e.into()),
+    };
     let (mut tx, mut rx) = ws.split();
     info!("connected");
 
@@ -165,8 +183,9 @@ async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
                             update_tried = true;
                             info!(%path, "server offers a new client binary, updating");
                             let server = cfg.server.clone();
+                            let token = cfg.token.clone();
                             let res = tokio::task::spawn_blocking(move || {
-                                crate::update::apply(&server, &path, &sha256)
+                                crate::update::apply(&server, token.as_deref(), &path, &sha256)
                             })
                             .await;
                             match res {

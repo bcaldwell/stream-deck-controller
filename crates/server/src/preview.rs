@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use image::{Rgb, RgbImage};
 use sdc_protocol::DeviceInfo;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::engine::{Engine, EngineEvent};
@@ -15,6 +16,7 @@ const ROWS: u8 = 3;
 const COLS: u8 = 5;
 const KEY_PX: u32 = 72;
 const GAP: u32 = 6;
+const FETCH_WAIT: Duration = Duration::from_secs(30);
 
 pub async fn run(
     config: PathBuf,
@@ -25,11 +27,13 @@ pub async fn run(
 ) -> Result<()> {
     let (ha_cmd_tx, ha_cmd_rx) = mpsc::unbounded_channel();
     let mut engine = Engine::new(config, Some(ha_cmd_tx));
+    // Image downloads report back here; unlike the server, we wait for them below.
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    engine.enable_fetch(Handle::current(), &ev_tx);
     engine.reload()?;
 
     if let Some(cfg) = ha_cfg {
-        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
-        tokio::spawn(ha::run(cfg, ha_cmd_rx, ev_tx));
+        tokio::spawn(ha::run(cfg, ha_cmd_rx, ev_tx.clone()));
         // wait for the initial state snapshot
         let seeded = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(ev) = ev_rx.recv().await {
@@ -68,6 +72,19 @@ pub async fn run(
     });
     if let Some(p) = &page {
         engine.goto_page(1, p);
+    }
+
+    let waited = tokio::time::timeout(FETCH_WAIT, async {
+        while engine.pending_fetches() > 0 {
+            match ev_rx.recv().await {
+                Some(ev) => engine.handle(ev),
+                None => break,
+            }
+        }
+    })
+    .await;
+    if waited.is_err() {
+        tracing::warn!("timed out waiting for image downloads; rendering without them");
     }
 
     let mut tiles: Vec<Option<RgbImage>> = vec![None; (ROWS * COLS) as usize];

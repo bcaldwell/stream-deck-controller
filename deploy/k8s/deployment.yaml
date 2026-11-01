@@ -23,6 +23,20 @@ spec:
             - name: HA_TOKEN
               valueFrom:
                 secretKeyRef: {name: sdc-secrets, key: HA_TOKEN}
+            - name: SDC_CLIENT_TOKEN
+              valueFrom:
+                secretKeyRef: {name: sdc-secrets, key: SDC_CLIENT_TOKEN}
+            # Optional: S3 bucket (Garage) for icon/image objects. Remove if unused.
+            - name: SDC_ASSETS_S3_ENDPOINT
+              value: http://garage.garage.svc.cluster.local:3900
+            - name: SDC_ASSETS_S3_BUCKET
+              value: stream-deck-icons
+            - name: SDC_ASSETS_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef: {name: sdc-secrets, key: SDC_ASSETS_S3_ACCESS_KEY_ID, optional: true}
+            - name: SDC_ASSETS_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: {name: sdc-secrets, key: SDC_ASSETS_S3_SECRET_ACCESS_KEY, optional: true}
             - name: SDC_CONFIG
               value: /config/config.lua
             - name: RUST_LOG

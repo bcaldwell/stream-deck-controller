@@ -1,5 +1,6 @@
 //! Stream Deck controller server library (the `sdc-server` binary is a thin CLI over this).
 
+pub mod assets;
 pub mod clients;
 pub mod engine;
 pub mod ha;
