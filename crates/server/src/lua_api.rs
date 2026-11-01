@@ -128,6 +128,23 @@ impl LuaRuntime {
         keys.get(key as usize)?.clone()
     }
 
+    /// `icon`/`image` names used by buttons whose `render` is a static table or string (the
+    /// ones that can be fetched ahead of time).
+    pub fn static_image_names(&self) -> Vec<String> {
+        let r = self.registry.borrow();
+        let mut names = Vec::new();
+        for (_, keys) in &r.pages {
+            for btn in keys.iter().flatten() {
+                if let Ok(spec) = parse_spec(&btn.render) {
+                    names.extend(spec.icon.into_iter().chain(spec.image));
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Runs a button's render, recording the entities it reads. Never fails: errors
     /// are reported in the outcome (and the spec is the error tile).
     pub fn render(&self, btn: &ButtonDef, info: &CtxInfo) -> RenderOutcome {
@@ -375,6 +392,7 @@ fn parse_spec(v: &Value) -> mlua::Result<RenderSpec> {
         }
     }
     spec.icon = t.get("icon")?;
+    spec.image = t.get("image")?;
     spec.font_size = t.get("font_size")?;
     Ok(spec)
 }

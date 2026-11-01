@@ -19,6 +19,10 @@ struct Args {
     #[arg(long, env = "SDC_SERVER", default_value = "ws://127.0.0.1:7700/ws")]
     server: String,
 
+    /// Shared secret the server requires (sent as `Authorization: Bearer <token>`)
+    #[arg(long, env = "SDC_CLIENT_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+
     /// Stable identifier for this client (default: hostname)
     #[arg(long, env = "SDC_CLIENT_ID")]
     client_id: Option<String>,
@@ -124,6 +128,7 @@ async fn main() -> Result<()> {
 
     let cfg = session::Config {
         server: args.server,
+        token: args.token.filter(|t| !t.is_empty()),
         client_id: args.client_id.unwrap_or_else(hostname),
         brightness: args.brightness,
         client_sha256: update::exe_sha256()

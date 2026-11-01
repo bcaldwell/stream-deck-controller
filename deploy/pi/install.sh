@@ -1,70 +1,63 @@
 #!/bin/sh
-# Install sdc-client on a 64-bit Linux box (Raspberry Pi OS Lite) from an sdc-server.
-# The server hands out its own client binary, so the Pi needs no internet access.
+# Install sdc-client on a Raspberry Pi (64-bit Linux). Run ON THE PI as root, with the binary,
+# 50-streamdeck.rules and sdc-client.service next to this script. `task pi:install` copies those
+# files over from your Mac and runs this under sudo; see deploy/pi/README.md.
 #
-#   curl -fsSL http://<server>:7700/install.sh | sudo sh -s -- --server ws://<server>:7700/ws
+#   sudo sh install.sh --server wss://streamdeck.example.com/ws --token-file ./token
 #
 # Options:
-#   --server URL   WebSocket URL of the server (or $SDC_SERVER). Optional when re-running
-#                  on a box that already has /etc/sdc-client.env.
-#   --base URL     HTTP base to download from (default: derived from --server)
-#
-# The udev rule and systemd unit below mirror 50-streamdeck.rules and sdc-client.service
-# (the server tests check they stay identical).
+#   --server URL       WebSocket URL of the server. Optional on re-runs: the value in
+#                      /etc/sdc-client.env is kept.
+#   --token TOKEN      Shared client token (server's SDC_CLIENT_TOKEN). Visible in `ps`; prefer
+#                      --token-file. Optional on re-runs: the existing token is kept.
+#   --token-file FILE  Read the token from FILE and delete FILE afterwards.
+#   --binary FILE      sdc-client binary (default: ./sdc-client next to this script)
 set -eu
 
-SERVER="${SDC_SERVER:-}"
-BASE=""
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SERVER=""
+TOKEN=""
+TOKEN_FILE=""
+BINARY="$HERE/sdc-client"
 DIR=/var/lib/sdc-client
+ENV_FILE=/etc/sdc-client.env
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --server) SERVER="${2:?--server needs a value}"; shift 2 ;;
-    --base) BASE="${2:?--base needs a value}"; shift 2 ;;
+    --token) TOKEN="${2:?--token needs a value}"; shift 2 ;;
+    --token-file) TOKEN_FILE="${2:?--token-file needs a value}"; shift 2 ;;
+    --binary) BINARY="${2:?--binary needs a value}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+for f in "$BINARY" "$HERE/50-streamdeck.rules" "$HERE/sdc-client.service"; do
+  [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }
+done
 
-if [ -z "$SERVER" ] && [ -f /etc/sdc-client.env ]; then
-  SERVER="$(sed -n 's/^SDC_SERVER=//p' /etc/sdc-client.env | head -n 1)"
-  [ -z "$SERVER" ] || echo "==> keeping server $SERVER from /etc/sdc-client.env"
+if [ -n "$TOKEN_FILE" ]; then
+  TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+  rm -f "$TOKEN_FILE"
 fi
-[ -n "$SERVER" ] || { echo "missing --server ws://host:7700/ws" >&2; exit 1; }
-if [ -z "$BASE" ]; then
-  # ws://host:port/ws -> http://host:port, wss:// -> https://
-  BASE="$(printf '%s' "$SERVER" | sed -e 's#^ws://#http://#' -e 's#^wss://#https://#' -e 's#^\(https\{0,1\}://[^/]*\).*#\1#')"
-fi
-BASE="${BASE%/}"
-
-case "$(uname -m)" in
-  aarch64|arm64) TARGET=aarch64-linux ;;
-  x86_64) TARGET=x86_64-linux ;;
-  *) echo "unsupported architecture $(uname -m); need a 64-bit OS" >&2; exit 1 ;;
+# systemd reads the env file itself, so keep the value free of anything it would reinterpret.
+case "$TOKEN" in
+  *[!A-Za-z0-9._~+/=-]*) echo "token may only contain A-Za-z0-9 . _ ~ + / = -" >&2; exit 1 ;;
 esac
 
-if command -v curl >/dev/null 2>&1; then
-  fetch() { curl -fsSL -o "$2" "$1"; }
-elif command -v wget >/dev/null 2>&1; then
-  fetch() { wget -q -O "$2" "$1"; }
-else
-  echo "need curl or wget" >&2; exit 1
+# Re-runs keep what is already configured unless overridden.
+env_get() { [ -f "$ENV_FILE" ] && sed -n "s/^$1=//p" "$ENV_FILE" | head -n 1 || true; }
+if [ -z "$SERVER" ]; then
+  SERVER="$(env_get SDC_SERVER)"
+  [ -z "$SERVER" ] || echo "==> keeping server $SERVER from $ENV_FILE"
 fi
-sha256() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
-  else shasum -a 256 "$1" | cut -d' ' -f1; fi
-}
-
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-
-echo "==> downloading $BASE/client/$TARGET"
-fetch "$BASE/client/$TARGET" "$tmp/sdc-client"
-fetch "$BASE/client/$TARGET.sha256" "$tmp/sha256"
-want="$(tr -d ' \n\r' < "$tmp/sha256")"
-got="$(sha256 "$tmp/sdc-client")"
-[ "$want" = "$got" ] || { echo "checksum mismatch: want $want, got $got" >&2; exit 1; }
+[ -n "$SERVER" ] || { echo "missing --server wss://host/ws" >&2; exit 1; }
+if [ -z "$TOKEN" ]; then
+  TOKEN="$(env_get SDC_CLIENT_TOKEN)"
+  [ -z "$TOKEN" ] || echo "==> keeping token from $ENV_FILE"
+fi
+[ -n "$TOKEN" ] || echo "==> no token set: the server must not require one" >&2
 
 # The service runs as a dedicated user that owns $DIR so the client can replace its own
 # binary when the server pushes an update (DynamicUser would hide the dir under
@@ -72,45 +65,27 @@ got="$(sha256 "$tmp/sdc-client")"
 id sdc >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin sdc
 systemctl stop sdc-client 2>/dev/null || true
 install -d -o sdc -g sdc -m 0755 "$DIR"
-install -o sdc -g sdc -m 0755 "$tmp/sdc-client" "$DIR/sdc-client"
+install -o sdc -g sdc -m 0755 "$BINARY" "$DIR/sdc-client"
 
-cat > /etc/udev/rules.d/50-streamdeck.rules <<'EOF'
-# Allow non-root access to Elgato Stream Decks (vendor 0fd9) via hidraw/usb.
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", MODE="0666"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", MODE="0666"
-EOF
+install -m 0644 "$HERE/50-streamdeck.rules" /etc/udev/rules.d/50-streamdeck.rules
+install -m 0644 "$HERE/sdc-client.service" /etc/systemd/system/sdc-client.service
 
-cat > /etc/systemd/system/sdc-client.service <<'EOF'
-[Unit]
-Description=Stream Deck Controller client
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-EnvironmentFile=/etc/sdc-client.env
-ExecStart=/var/lib/sdc-client/sdc-client
-# The client exits after replacing itself with a newer binary from the server.
-Restart=always
-RestartSec=3
-# Generic, low-privilege hardening (device access is granted by the udev rule).
-# StateDirectory is the only writable path: it holds the self-updating binary.
-User=sdc
-Group=sdc
-StateDirectory=sdc-client
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > /etc/sdc-client.env <<EOF
-SDC_SERVER=$SERVER
-SDC_BRIGHTNESS=60
-RUST_LOG=info
-EOF
-chmod 0644 /etc/sdc-client.env
+# Root-only: systemd (PID 1) reads EnvironmentFile, the unprivileged service never does.
+# Settings other than the two managed here (SDC_BRIGHTNESS, SDC_CLIENT_ID, ...) are kept.
+new="$(umask 077 && mktemp "$ENV_FILE.XXXXXX")"
+{
+  echo "SDC_SERVER=$SERVER"
+  [ -z "$TOKEN" ] || echo "SDC_CLIENT_TOKEN=$TOKEN"
+  if [ -f "$ENV_FILE" ]; then
+    grep -v -e '^SDC_SERVER=' -e '^SDC_CLIENT_TOKEN=' "$ENV_FILE" || true
+  else
+    echo "SDC_BRIGHTNESS=60"
+    echo "RUST_LOG=info"
+  fi
+} > "$new"
+chown root:root "$new"
+chmod 0600 "$new"
+mv "$new" "$ENV_FILE"
 
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=hidraw --subsystem-match=usb || true

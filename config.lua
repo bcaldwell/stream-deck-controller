@@ -1,5 +1,6 @@
 -- Example Stream Deck config (3 rows x 5 cols; key 0 is top-left, row-major).
--- Hot-reloaded on save. Icon paths are relative to this file.
+-- Hot-reloaded on save. Icon paths are relative to this file; an `icon` or full-bleed `image`
+-- may also be an http(s) URL or an object key in the S3 assets bucket (see crates/server/README.md).
 local sdc = require("sdc")
 
 local ON, OFF = "#f5b400", "#2a2a2e"

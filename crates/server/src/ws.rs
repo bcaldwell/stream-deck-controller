@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
+use axum::http::HeaderMap;
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use sdc_protocol::{ClientMessage, ImageFrame, ServerMessage, PROTOCOL_VERSION};
@@ -14,6 +15,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::clients::ClientBinaries;
 use crate::engine::{EngineEvent, Frame};
+use crate::http;
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -22,10 +24,20 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct WsState {
     pub engine: UnboundedSender<EngineEvent>,
     pub binaries: Arc<ClientBinaries>,
+    /// Shared client token; `None` accepts everyone.
+    pub token: Option<Arc<str>>,
 }
 
 /// Upgrade handler for `/ws`.
-pub async fn upgrade(State(state): State<WsState>, ws: WebSocketUpgrade) -> Response {
+pub async fn upgrade(
+    State(state): State<WsState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(denied) = http::authorize(state.token.as_deref(), &headers) {
+        tracing::warn!("rejected websocket connection: missing or invalid client token");
+        return denied;
+    }
     ws.on_upgrade(move |socket| async move {
         if let Err(e) = handle_conn(socket, state).await {
             tracing::warn!("connection ended: {e:#}");
@@ -34,7 +46,9 @@ pub async fn upgrade(State(state): State<WsState>, ws: WebSocketUpgrade) -> Resp
 }
 
 async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
-    let WsState { engine, binaries } = state;
+    let WsState {
+        engine, binaries, ..
+    } = state;
     let (mut sink, mut stream) = ws.split();
 
     // Hello

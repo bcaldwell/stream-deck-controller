@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -71,13 +72,27 @@ async fn start_server_with(
     ha_tx: UnboundedSender<HaCommand>,
     binaries: ClientBinaries,
 ) -> (UnboundedSender<EngineEvent>, String, TempDir) {
+    start_server_full(tag, ha_tx, binaries, None).await
+}
+
+async fn start_server_full(
+    tag: &str,
+    ha_tx: UnboundedSender<HaCommand>,
+    binaries: ClientBinaries,
+    token: Option<&str>,
+) -> (UnboundedSender<EngineEvent>, String, TempDir) {
     let dir = TempDir::new(tag);
     let cfg = dir.0.join("config.lua");
     std::fs::write(&cfg, CONFIG).unwrap();
     let engine_tx = engine::spawn(cfg, Some(ha_tx));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    tokio::spawn(http::serve(listener, engine_tx.clone(), Arc::new(binaries)));
+    tokio::spawn(http::serve(
+        listener,
+        engine_tx.clone(),
+        Arc::new(binaries),
+        token.map(Into::into),
+    ));
     (engine_tx, url, dir)
 }
 
@@ -232,13 +247,18 @@ async fn rejects_wrong_protocol_version() {
 
 /// Minimal HTTP/1.0 GET against `ws://addr/ws`-style server urls: (status, body).
 async fn http_get(ws_url: &str, path: &str) -> (u16, Vec<u8>) {
+    http_get_auth(ws_url, path, None).await
+}
+
+async fn http_get_auth(ws_url: &str, path: &str, auth: Option<&str>) -> (u16, Vec<u8>) {
+    let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
     let addr = ws_url
         .strip_prefix("ws://")
         .unwrap()
         .strip_suffix("/ws")
         .unwrap();
     let mut s = TcpStream::connect(addr).await.unwrap();
-    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
+    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\n{auth}\r\n").as_bytes())
         .await
         .unwrap();
     let mut raw = Vec::new();
@@ -250,7 +270,7 @@ async fn http_get(ws_url: &str, path: &str) -> (u16, Vec<u8>) {
 }
 
 #[tokio::test]
-async fn serves_clients_installer_and_health() {
+async fn serves_clients_and_health() {
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
     let bin = b"\x7fELF fake client";
     let (_e, url, _dir) =
@@ -264,22 +284,92 @@ async fn serves_clients_installer_and_health() {
     assert_eq!(http_get(&url, "/client/x86_64-linux").await.0, 404);
     assert_eq!(http_get(&url, "/client/x86_64-linux.sha256").await.0, 404);
 
-    let (st, body) = http_get(&url, "/install.sh").await;
-    let script = String::from_utf8(body).unwrap();
-    assert!(st == 200 && script.starts_with("#!/bin/sh"));
-    // the embedded udev rule / unit must match the files they are sourced from
-    for f in [
-        include_str!("../../../deploy/pi/50-streamdeck.rules"),
-        include_str!("../../../deploy/pi/sdc-client.service"),
-    ] {
-        assert!(
-            script.contains(f),
-            "install.sh is out of sync with deploy/pi"
-        );
-    }
-
     assert_eq!(http_get(&url, "/healthz").await, (200, b"ok".to_vec()));
     assert_eq!(http_get(&url, "/nope").await.0, 404);
+}
+
+// ---- client token ---------------------------------------------------------
+
+/// Handshake status for a websocket upgrade carrying `auth` as the Authorization header.
+async fn ws_handshake_status(url: &str, auth: Option<&str>) -> u16 {
+    let mut req = url.into_client_request().unwrap();
+    if let Some(a) = auth {
+        req.headers_mut()
+            .insert("Authorization", a.parse().unwrap());
+    }
+    match tokio_tungstenite::connect_async(req).await {
+        Ok((_, resp)) => resp.status().as_u16(),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+        Err(e) => panic!("unexpected handshake error: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn client_token_guards_ws_and_client_downloads() {
+    let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
+    let bin = b"\x7fELF fake client";
+    let (_e, url, _dir) = start_server_full(
+        "token",
+        ha_tx,
+        ClientBinaries::with("aarch64-linux", bin),
+        Some("s3cret"),
+    )
+    .await;
+
+    // websocket: 401 without / with a wrong token, upgrade with the right one
+    assert_eq!(ws_handshake_status(&url, None).await, 401);
+    assert_eq!(ws_handshake_status(&url, Some("Bearer wrong")).await, 401);
+    assert_eq!(ws_handshake_status(&url, Some("s3cret")).await, 401);
+    assert_eq!(ws_handshake_status(&url, Some("Bearer s3cret")).await, 101);
+
+    // a full session works with the token
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", "Bearer s3cret".parse().unwrap());
+    let (mut c, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let hello = ClientMessage::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client_id: "test".into(),
+        device: device(),
+        client_target: None,
+        client_sha256: None,
+    };
+    c.send(Message::Text(serde_json::to_string(&hello).unwrap()))
+        .await
+        .unwrap();
+    assert!(matches!(next_msg(&mut c).await, Message::Text(_)));
+
+    // client downloads
+    for path in ["/client/aarch64-linux", "/client/aarch64-linux.sha256"] {
+        assert_eq!(http_get(&url, path).await.0, 401);
+        assert_eq!(http_get_auth(&url, path, Some("Bearer wrong")).await.0, 401);
+        assert_eq!(
+            http_get_auth(&url, path, Some("Bearer s3cret")).await.0,
+            200
+        );
+    }
+    // unknown targets are still 404 once authorized, 401 before
+    assert_eq!(http_get(&url, "/client/x86_64-linux").await.0, 401);
+    assert_eq!(
+        http_get_auth(&url, "/client/x86_64-linux", Some("Bearer s3cret"))
+            .await
+            .0,
+        404
+    );
+
+    // health stays open
+    assert_eq!(http_get(&url, "/healthz").await, (200, b"ok".to_vec()));
+}
+
+#[tokio::test]
+async fn no_token_configured_allows_everyone() {
+    let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
+    let (_e, url, _dir) = start_server("open", ha_tx).await;
+    assert_eq!(ws_handshake_status(&url, None).await, 101);
+    assert_eq!(
+        ws_handshake_status(&url, Some("Bearer whatever")).await,
+        101
+    );
 }
 
 #[tokio::test]

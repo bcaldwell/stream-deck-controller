@@ -29,3 +29,5 @@ ab_glyph = "0.2"
 notify = "6"
 clap = { version = "4", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rusty-s3 = { version = "0.8", default-features = false }
+ureq = { version = "2", default-features = false, features = ["tls"] }

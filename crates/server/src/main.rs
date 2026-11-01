@@ -100,9 +100,18 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(clients::DEFAULT_DIR));
     let binaries = Arc::new(ClientBinaries::load(&client_dir));
+    let token = std::env::var("SDC_CLIENT_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    if token.is_none() {
+        tracing::warn!(
+            "SDC_CLIENT_TOKEN not set: clients are unauthenticated, anyone who can reach the \
+             server can connect"
+        );
+    }
     tracing::info!("listening on ws://{}/ws", listener.local_addr()?);
     tokio::select! {
-        _ = http::serve(listener, engine_tx, binaries) => {}
+        _ = http::serve(listener, engine_tx, binaries, token) => {}
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
     }
     Ok(())

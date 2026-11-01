@@ -7,9 +7,12 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::Result;
+use image::RgbaImage;
 use sdc_protocol::DeviceInfo;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
+use crate::assets::{Assets, Fetcher, S3Config};
 use crate::ha::{HaCommand, HaEvent};
 use crate::lua_api::{CtxInfo, Host, LuaRuntime};
 use crate::render::{RenderSpec, Renderer};
@@ -40,6 +43,11 @@ pub enum EngineEvent {
         key: u8,
     },
     Ha(HaEvent),
+    /// A background image download finished (key: the renderer's cache key).
+    ImageFetched {
+        key: String,
+        result: Result<RgbaImage, String>,
+    },
     Reload,
 }
 
@@ -59,7 +67,8 @@ pub struct Engine {
     renderer: Renderer,
     clients: BTreeMap<ClientId, Client>,
     key_deps: HashMap<(ClientId, u8), HashSet<String>>,
-    /// entity id -> keys whose last render read it
+    /// dependency -> keys whose last render read it: an entity id, or `img:<cache key>` for a
+    /// remote image (so keys re-render when their download completes)
     rev_deps: HashMap<String, HashSet<(ClientId, u8)>>,
 }
 
@@ -73,11 +82,29 @@ impl Engine {
             config_path,
             host: Host::new(ha_tx),
             runtime: None,
-            renderer: Renderer::new(base),
+            renderer: Renderer::with_assets(Assets::new(base, S3Config::from_env())),
             clients: BTreeMap::new(),
             key_deps: HashMap::new(),
             rev_deps: HashMap::new(),
         }
+    }
+
+    /// Lets the renderer download remote images in the background on `handle`; results come
+    /// back as [`EngineEvent::ImageFetched`] on `events` (held weakly, so it does not keep the
+    /// event loop alive).
+    pub fn enable_fetch(&mut self, handle: Handle, events: &UnboundedSender<EngineEvent>) {
+        let events = events.downgrade();
+        self.renderer
+            .set_fetcher(Some(Fetcher::new(handle, move |(key, result)| {
+                if let Some(tx) = events.upgrade() {
+                    let _ = tx.send(EngineEvent::ImageFetched { key, result });
+                }
+            })));
+    }
+
+    /// Remote images still downloading.
+    pub fn pending_fetches(&self) -> usize {
+        self.renderer.pending()
     }
 
     /// (Re)loads the config. On failure the previous config stays active.
@@ -94,6 +121,9 @@ impl Engine {
         self.rev_deps.clear();
         let default = self.default_page();
         let rt = self.runtime.as_ref().expect("just set");
+        for name in rt.static_image_names() {
+            self.renderer.prefetch(&name);
+        }
         for c in self.clients.values_mut() {
             if !rt.has_page(&c.page) {
                 c.page = default.clone();
@@ -140,6 +170,10 @@ impl Engine {
             EngineEvent::KeyDown { id, key } => self.key_event(id, key, true),
             EngineEvent::KeyUp { id, key } => self.key_event(id, key, false),
             EngineEvent::Ha(e) => self.ha_event(e),
+            EngineEvent::ImageFetched { key, result } => {
+                self.renderer.finish_fetch(&key, result);
+                self.entity_changed(&format!("img:{key}"));
+            }
             EngineEvent::Reload => {
                 if let Err(e) = self.reload() {
                     tracing::error!("config reload failed, keeping previous config: {e:#}");
@@ -272,7 +306,15 @@ impl Engine {
                 if let Some(e) = &out.error {
                     tracing::error!("render {} key {key} for {}: {e}", info.page, c.client_id);
                 }
-                (self.renderer.render(&out.spec, size), out.deps)
+                let jpeg = self.renderer.render(&out.spec, size);
+                let mut deps = out.deps;
+                deps.extend(
+                    self.renderer
+                        .remote_keys(&out.spec)
+                        .into_iter()
+                        .map(|k| format!("img:{k}")),
+                );
+                (jpeg, deps)
             }
             None => (self.renderer.blank(size), HashSet::new()),
         };
@@ -346,10 +388,16 @@ pub fn spawn(
     ha_tx: Option<UnboundedSender<HaCommand>>,
 ) -> UnboundedSender<EngineEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let handle = Handle::try_current().ok();
+    let events = tx.clone();
     std::thread::Builder::new()
         .name("sdc-engine".into())
         .spawn(move || {
             let mut engine = Engine::new(config_path, ha_tx);
+            if let Some(h) = handle {
+                engine.enable_fetch(h, &events);
+            }
+            drop(events);
             if let Err(e) = engine.reload() {
                 tracing::error!("failed to load config: {e:#}");
             }
@@ -363,6 +411,7 @@ pub fn spawn(
 mod tests {
     use super::*;
     use crate::ha::EntityState;
+    use image::RgbaImage;
     use serde_json::json;
     use std::io::Write;
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -555,5 +604,99 @@ mod tests {
         write_config(d.path(), r##"sdc.page("home", {})"##);
         e.handle(EngineEvent::Reload);
         assert_eq!(e.clients[&1].page, "home");
+    }
+
+    /// Serves a solid red PNG at /ok.png and 404 elsewhere; returns its base URL.
+    async fn image_server() -> String {
+        let mut png = Vec::new();
+        RgbaImage::from_pixel(40, 20, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let app = axum::Router::new().route(
+            "/ok.png",
+            axum::routing::get(move || {
+                let png = png.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, "image/png")], png) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        base
+    }
+
+    fn center(jpeg: &[u8]) -> [u8; 3] {
+        image::load_from_memory(jpeg)
+            .unwrap()
+            .to_rgb8()
+            .get_pixel(36, 36)
+            .0
+    }
+
+    async fn next_event(rx: &mut UnboundedReceiver<EngineEvent>) -> EngineEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timed out waiting for the download")
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_image_renders_placeholder_then_rerenders_when_fetched() {
+        let base = image_server().await;
+        let dir = tempdir::Dir::new();
+        let cfg = write_config(
+            dir.path(),
+            &format!(
+                r##"sdc.page("home", {{
+                  sdc.button{{ render = {{ image = "{base}/ok.png", bg = "#000080" }} }},
+                  sdc.button{{ render = {{ image = "{base}/missing.png", bg = "#000080" }} }},
+                  sdc.button{{ render = {{ text = "plain" }} }},
+                }})"##
+            ),
+        );
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let mut e = Engine::new(cfg, None);
+        e.enable_fetch(Handle::current(), &ev_tx);
+        e.reload().unwrap(); // prefetches both static images
+        assert_eq!(e.pending_fetches(), 2);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        e.handle(EngineEvent::ClientConnected {
+            id: 1,
+            client_id: "c1".into(),
+            device: device(),
+            tx,
+        });
+        // cache miss: the key renders right away, without the picture
+        let first = drain(&mut rx);
+        assert_eq!(first.len(), 15);
+        let c = center(&first[0].jpeg);
+        assert!(c[0] < 10 && c[2] > 100, "background only, got {c:?}");
+        assert_eq!(e.dep_count(&format!("img:{base}/ok.png")), 1);
+
+        // each download completes and re-renders only the keys that use it
+        for _ in 0..2 {
+            let ev = next_event(&mut ev_rx).await;
+            assert!(matches!(ev, EngineEvent::ImageFetched { .. }));
+            e.handle(ev);
+        }
+        assert_eq!(e.pending_fetches(), 0);
+        let after = drain(&mut rx);
+        let mut keys: Vec<_> = after.iter().map(|f| f.key).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, [0, 1]);
+        let ok = after.iter().find(|f| f.key == 0).unwrap();
+        let bad = after.iter().find(|f| f.key == 1).unwrap();
+        assert!(center(&ok.jpeg)[0] > 200, "fetched picture fills the key");
+        assert!(
+            center(&bad.jpeg)[0] > 120,
+            "failed fetch shows the error tile"
+        );
+
+        // a reload keeps downloaded images but retries failed ones
+        e.handle(EngineEvent::Reload);
+        assert_eq!(e.pending_fetches(), 1);
+        let resent = drain(&mut rx);
+        assert_eq!(resent.iter().map(|f| f.key).collect::<Vec<_>>(), [1]);
     }
 }
