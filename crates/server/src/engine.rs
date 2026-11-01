@@ -13,7 +13,7 @@ use sdc_protocol::DeviceInfo;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use crate::assets::{Assets, Fetcher, S3Config};
+use crate::assets::{Assets, Fetcher, HaApi, S3Config};
 use crate::ha::{HaCommand, HaEvent};
 use crate::lua_api::{CtxInfo, Host, IdleConfig, LuaRuntime, Settings};
 use crate::render::{Color, RenderSpec, Renderer};
@@ -108,7 +108,9 @@ impl Engine {
             config_path,
             host: Host::new(ha_tx),
             runtime: None,
-            renderer: Renderer::with_assets(Assets::new(base, S3Config::from_env())),
+            renderer: Renderer::with_assets(
+                Assets::new(base, S3Config::from_env()).with_ha(HaApi::from_env()),
+            ),
             clients: BTreeMap::new(),
             key_deps: HashMap::new(),
             rev_deps: HashMap::new(),

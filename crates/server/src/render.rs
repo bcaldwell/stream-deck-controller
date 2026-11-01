@@ -11,7 +11,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::imageops::{self, FilterType};
 use image::{ExtendedColorType, ImageEncoder, Rgb, RgbImage, RgbaImage};
 
-use crate::assets::{redact, Assets, Fetcher, Source};
+use crate::assets::{is_ha_key, redact, Assets, Fetcher, Source};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/OpenSans.ttf");
 
@@ -25,6 +25,10 @@ const ERR_BG: Color = Color([0xb0, 0x00, 0x20]);
 /// Decoded pictures are shrunk until their shorter side is at most this (keys are <= 120px, so
 /// this keeps 2x headroom while a 1024px icon costs 16x less memory and resize time).
 const MAX_SRC_SHORT: u32 = 256;
+/// Downloaded pictures kept decoded (and failed downloads remembered); the least recently
+/// rendered go first. Sources such as media artwork change with every track, so this must not
+/// grow forever, while icons that are on a page stay hot.
+const MAX_REMOTE: usize = 128;
 /// Safety valve for the scaled-picture cache (it is also cleared on config reload).
 const MAX_PREPARED: usize = 1024;
 
@@ -164,6 +168,63 @@ impl Scaled {
     }
 }
 
+/// A map that drops its least recently used entries beyond `cap`. Lookups are linear in the
+/// number of entries to evict only, so it is meant for small caps.
+struct Lru<V> {
+    cap: usize,
+    tick: u64,
+    map: HashMap<String, (V, u64)>,
+}
+
+impl<V> Lru<V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            tick: 0,
+            map: HashMap::new(),
+        }
+    }
+
+    /// Marks `key` as just used.
+    fn get(&mut self, key: &str) -> Option<&V> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(key).map(|(v, used)| {
+            *used = tick;
+            &*v
+        })
+    }
+
+    /// Inserts `key` and returns the keys evicted to stay within the cap. Entries for which
+    /// `keep` is true (downloads in flight) are never evicted, so the cap can be exceeded
+    /// while that many are pending.
+    fn insert(&mut self, key: String, v: V, keep: impl Fn(&V) -> bool) -> Vec<String> {
+        self.tick += 1;
+        self.map.insert(key.clone(), (v, self.tick));
+        let mut evicted = Vec::new();
+        while self.map.len() > self.cap {
+            let oldest = self
+                .map
+                .iter()
+                .filter(|(k, (v, _))| **k != key && !keep(v))
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone());
+            let Some(k) = oldest else { break };
+            self.map.remove(&k);
+            evicted.push(k);
+        }
+        evicted
+    }
+
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.map.values().map(|(v, _)| v)
+    }
+
+    fn retain(&mut self, f: impl Fn(&V) -> bool) {
+        self.map.retain(|_, (v, _)| f(v));
+    }
+}
+
 /// Everything needed to rasterize a key, shareable between threads (no caches or Lua).
 struct Painter {
     font: FontRef<'static>,
@@ -176,8 +237,8 @@ pub struct Renderer {
     /// `icon`/`image` string -> where it lives (None: unresolvable, already logged).
     resolved: HashMap<String, Option<Source>>,
     local: HashMap<PathBuf, Option<Arc<Loaded>>>,
-    /// Downloaded images by remote cache key.
-    remote: HashMap<String, Slot>,
+    /// Downloaded images by remote cache key (bounded, see [`MAX_REMOTE`]).
+    remote: Lru<Slot>,
     /// Without one, remote images are reported as failed (they are never fetched inline).
     fetcher: Option<Fetcher>,
 }
@@ -194,6 +255,9 @@ enum Img {
     Ready(Arc<Loaded>),
     Loading,
     Failed,
+    /// Home Assistant artwork that could not be fetched: media art legitimately goes away, so
+    /// this renders as if there were no picture, without an error tile.
+    Missing,
 }
 
 /// A key ready to rasterize: the spec plus its pictures looked up (cheap, needs the renderer's
@@ -203,6 +267,16 @@ pub struct Job {
     size: u32,
     image: Option<Img>,
     icon: Option<Img>,
+}
+
+impl Job {
+    /// Drops pictures that are [`Img::Missing`] so layout treats them as not given.
+    fn without_missing(mut self) -> Self {
+        let keep = |i: Option<Img>| i.filter(|i| !matches!(i, Img::Missing));
+        self.image = keep(self.image);
+        self.icon = keep(self.icon);
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -228,7 +302,7 @@ impl Renderer {
             assets,
             resolved: HashMap::new(),
             local: HashMap::new(),
-            remote: HashMap::new(),
+            remote: Lru::new(MAX_REMOTE),
             fetcher: None,
         }
     }
@@ -243,7 +317,7 @@ impl Renderer {
         self.resolved.clear();
         self.local.clear();
         self.painter.scaled.clear();
-        self.remote.retain(|_, s| !matches!(s, Slot::Failed(_)));
+        self.remote.retain(|s| !matches!(s, Slot::Failed(_)));
     }
 
     /// Number of downloads in flight.
@@ -277,12 +351,26 @@ impl Renderer {
         let slot = match result {
             Ok(img) => Slot::Ready(Loaded::new(key.to_string(), img)),
             Err(e) => {
-                tracing::warn!("cannot fetch image {}: {e}", redact(key));
+                if is_ha_key(key) {
+                    tracing::debug!("no image from {}: {e}", redact(key));
+                } else {
+                    tracing::warn!("cannot fetch image {}: {e}", redact(key));
+                }
                 Slot::Failed(Instant::now())
             }
         };
         self.painter.scaled.forget(key);
-        self.remote.insert(key.to_string(), slot);
+        self.store(key.to_string(), slot);
+    }
+
+    /// Caches `slot`, dropping the pictures scaled from whatever the LRU evicts.
+    fn store(&mut self, key: String, slot: Slot) {
+        for old in self
+            .remote
+            .insert(key, slot, |s| matches!(s, Slot::Loading))
+        {
+            self.painter.scaled.forget(&old);
+        }
     }
 
     /// Scalings computed so far (cache misses); tests use it to check pictures are reused.
@@ -315,6 +403,7 @@ impl Renderer {
             image: spec.image.as_deref().map(|n| self.lookup(n)),
             icon: spec.icon.as_deref().map(|n| self.lookup(n)),
         }
+        .without_missing()
     }
 
     /// Rasterizes and JPEG-encodes `jobs`, spread over the available cores.
@@ -395,15 +484,21 @@ impl Renderer {
                     });
             return loaded.clone().map_or(Img::Failed, Img::Ready);
         };
+        // failed Home Assistant artwork is not an error, see [`Img::Missing`]
+        let failed = if is_ha_key(&key) {
+            Img::Missing
+        } else {
+            Img::Failed
+        };
         match self.remote.get(&key) {
             Some(Slot::Ready(i)) => return Img::Ready(i.clone()),
             Some(Slot::Loading) => return Img::Loading,
-            Some(Slot::Failed(at)) if at.elapsed() < FAIL_TTL => return Img::Failed,
+            Some(Slot::Failed(at)) if at.elapsed() < FAIL_TTL => return failed,
             _ => {}
         }
-        let started = match (&self.fetcher, self.assets.download_url(&src)) {
-            (Some(f), Ok(url)) => {
-                f.spawn(key.clone(), url);
+        let started = match (&self.fetcher, self.assets.download(&src)) {
+            (Some(f), Ok(dl)) => {
+                f.spawn(key.clone(), dl);
                 true
             }
             (None, _) => {
@@ -416,11 +511,11 @@ impl Renderer {
             }
         };
         if started {
-            self.remote.insert(key, Slot::Loading);
+            self.store(key, Slot::Loading);
             Img::Loading
         } else {
-            self.remote.insert(key, Slot::Failed(Instant::now()));
-            Img::Failed
+            self.store(key, Slot::Failed(Instant::now()));
+            failed
         }
     }
 }
@@ -485,7 +580,7 @@ impl Painter {
                 let top = Area { h: s / 2.0, ..full };
                 self.draw_err(&mut img, full, top);
             }
-            Some(Img::Loading) | None => {}
+            Some(Img::Loading | Img::Missing) | None => {}
         }
         match (icon, icon_area) {
             (Some(Img::Ready(im)), Some(area)) => self.draw_icon(&mut img, im, area),
@@ -998,6 +1093,99 @@ mod tests {
         );
         let _ = r.render(&spec, 72);
         assert_eq!(r.pending(), 0);
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used_but_not_pending() {
+        let mut l: Lru<u8> = Lru::new(2);
+        assert!(l.insert("a".into(), 0, |_| false).is_empty());
+        assert!(l.insert("b".into(), 0, |_| false).is_empty());
+        l.get("a"); // b is now the oldest
+        assert_eq!(l.insert("c".into(), 0, |_| false), ["b"]);
+        // entries in flight (value 1) stay even over the cap
+        let mut l: Lru<u8> = Lru::new(1);
+        l.insert("p".into(), 1, |v| *v == 1);
+        assert!(l.insert("q".into(), 1, |v| *v == 1).is_empty());
+        assert_eq!(l.map.len(), 2);
+    }
+
+    #[test]
+    fn remote_cache_is_bounded_and_forgets_scalings() {
+        let mut r = Renderer::new(PathBuf::from("."));
+        let spec = |i: usize| RenderSpec {
+            image: Some(format!("http://h/{i}.png")),
+            ..Default::default()
+        };
+        for i in 0..MAX_REMOTE + 20 {
+            let key = format!("http://h/{i}.png");
+            if i % 2 == 0 {
+                r.finish_fetch(
+                    &key,
+                    Ok(RgbaImage::from_pixel(8, 8, image::Rgba([9, 9, 9, 255]))),
+                );
+                r.render(&spec(i), 72); // scales it
+            } else {
+                r.finish_fetch(&key, Err("HTTP 404".into()));
+            }
+        }
+        assert_eq!(r.remote.map.len(), MAX_REMOTE);
+        let scaled = r.painter.scaled.map.lock().unwrap().len();
+        assert!(
+            scaled <= MAX_REMOTE / 2,
+            "scalings of evicted images are dropped: {scaled}"
+        );
+        // the newest entries survive, the oldest are gone
+        assert!(r
+            .remote
+            .get(&format!("http://h/{}.png", MAX_REMOTE + 19))
+            .is_some());
+        assert!(r.remote.get("http://h/0.png").is_none());
+    }
+
+    #[test]
+    fn hot_images_survive_a_flood_of_changing_sources() {
+        let mut r = Renderer::new(PathBuf::from("."));
+        let hot = "http://h/hot.png";
+        let px = || Ok(RgbaImage::from_pixel(8, 8, image::Rgba([9, 9, 9, 255])));
+        r.finish_fetch(hot, px());
+        let spec = RenderSpec {
+            image: Some(hot.into()),
+            ..Default::default()
+        };
+        for i in 0..MAX_REMOTE * 3 {
+            r.finish_fetch(&format!("http://h/track{i}.png"), px());
+            r.render(&spec, 72); // the icon is on screen, so it is used all the time
+        }
+        assert!(matches!(r.remote.get(hot), Some(Slot::Ready(_))));
+    }
+
+    #[test]
+    fn missing_ha_artwork_renders_without_an_error_tile() {
+        let ha = crate::assets::HaApi::new("http://127.0.0.1:9", "t");
+        let assets = Assets::new(PathBuf::from("/nonexistent"), None).with_ha(Some(ha));
+        let mut r = Renderer::with_assets(assets);
+        let bg = Color([0x20, 0x20, 0x80]);
+        let path = "/api/media_player_proxy/media_player.tv?token=x";
+        let spec = RenderSpec {
+            image: Some(path.into()),
+            text: Some("x".into()),
+            bg,
+            ..Default::default()
+        };
+        // no fetcher: fails right away; then a failed download reported by the fetcher
+        let first = r.render(&spec, 72);
+        assert!(near(px(&first, 2, 2), bg.0), "no ERR tile");
+        let key = r.remote_keys(&spec).pop().unwrap();
+        r.finish_fetch(&key, Err("HTTP 404".into()));
+        let again = r.render(&spec, 72);
+        assert!(near(px(&again, 2, 2), bg.0));
+        assert!(
+            near(px(&again, 2, 70), bg.0),
+            "laid out as if there were no picture"
+        );
+        // other failures still show it, and so does HA being unconfigured
+        let mut plain = Renderer::new(PathBuf::from("/nonexistent"));
+        assert!(near(px(&plain.render(&spec, 72), 2, 2), ERR_BG.0));
     }
 
     /// A dir with `n` distinct large noisy-alpha icons (like real artwork: big, transparent).
