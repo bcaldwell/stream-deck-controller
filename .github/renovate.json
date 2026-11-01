@@ -1,21 +1,18 @@
 {
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "description": "Every merge to main deploys to the cluster, so batch updates weekly instead of a deploy per crate.",
+  "schedule": ["before 6am on monday"],
   "packageRules": [
     {
+      "description": "Minor/patch/digest updates: one grouped PR, merged automatically when CI passes.",
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "non-major dependencies",
       "automerge": true
-    },
-    {
-      "description": "lockFileMaintenance",
-      "matchUpdateTypes": [
-        "pin",
-        "digest",
-        "patch",
-        "minor",
-        "major",
-        "lockFileMaintenance"
-      ],
-      "dependencyDashboardApproval": false,
-      "stabilityDays": 0
     }
-  ]
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": true
+  }
 }
