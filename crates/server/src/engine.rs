@@ -78,7 +78,10 @@ struct Client {
     device: DeviceInfo,
     tx: UnboundedSender<Out>,
     page: String,
+    /// Last key press (or connect): drives dim/off.
     last_activity: Instant,
+    /// Last key press, carried across reconnects: drives `home_after`.
+    last_press: Instant,
     power: Power,
     /// Keys whose press woke the display: their release is swallowed too.
     swallow_up: HashSet<u8>,
@@ -92,6 +95,9 @@ pub struct Engine {
     runtime: Option<LuaRuntime>,
     renderer: Renderer,
     clients: BTreeMap<ClientId, Client>,
+    /// Page and last key press of clients that went away, by client_id, so a reconnect (deploy,
+    /// client update) resumes where they were. Expires after `home_after`; lost on restart.
+    remembered: HashMap<String, (String, Instant)>,
     key_deps: HashMap<(ClientId, u8), HashSet<String>>,
     /// dependency -> keys whose last render read it: an entity id, or `img:<cache key>` for a
     /// remote image (so keys re-render when their download completes)
@@ -112,6 +118,7 @@ impl Engine {
                 Assets::new(base, S3Config::from_env()).with_ha(HaApi::from_env()),
             ),
             clients: BTreeMap::new(),
+            remembered: HashMap::new(),
             key_deps: HashMap::new(),
             rev_deps: HashMap::new(),
         }
@@ -194,7 +201,24 @@ impl Engine {
                     device.key_size_px
                 );
                 let sent = vec![None; device.key_count() as usize];
-                let page = self.default_page();
+                // Resume the page of the previous connection (still listed if its disconnect
+                // has not arrived yet), unless it is gone from the config or home_after passed.
+                let home_after = self.settings().idle.home_after;
+                let prev = self
+                    .clients
+                    .values()
+                    .find(|c| c.client_id == client_id)
+                    .map(|c| (c.page.clone(), c.last_press))
+                    .or_else(|| self.remembered.remove(&client_id));
+                let (page, last_press) = match prev {
+                    Some((page, at))
+                        if self.runtime.as_ref().is_some_and(|rt| rt.has_page(&page))
+                            && !home_due(home_after, at, now) =>
+                    {
+                        (page, at)
+                    }
+                    _ => (self.default_page(), now),
+                };
                 self.clients.insert(
                     id,
                     Client {
@@ -203,6 +227,7 @@ impl Engine {
                         tx,
                         page,
                         last_activity: now,
+                        last_press,
                         power: Power::Active,
                         swallow_up: HashSet::new(),
                         sent,
@@ -216,6 +241,10 @@ impl Engine {
             EngineEvent::ClientDisconnected(id) => {
                 if let Some(c) = self.clients.remove(&id) {
                     tracing::info!("client {} disconnected", c.client_id);
+                    // A newer connection of the same client already took over its page.
+                    if !self.clients.values().any(|o| o.client_id == c.client_id) {
+                        self.remembered.insert(c.client_id, (c.page, c.last_press));
+                    }
                 }
                 self.drop_deps(|(cid, _)| *cid == id);
             }
@@ -316,9 +345,24 @@ impl Engine {
         }
     }
 
-    /// Dims, then switches off, clients that have been idle for the configured time.
+    /// Dims, then switches off, clients that have been idle for the configured time, and sends
+    /// them (and forgets disconnected ones) home after `home_after`.
     pub fn tick(&mut self, now: Instant) {
         let idle = self.settings().idle;
+        self.remembered
+            .retain(|_, (_, at)| !home_due(idle.home_after, *at, now));
+        let default = self.default_page();
+        let home: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.page != default && home_due(idle.home_after, c.last_press, now))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in home {
+            // Rendered even while the display is off, so waking shows home.
+            tracing::info!(client = id, page = %default, "idle for home_after, going home");
+            self.goto_page(id, &default);
+        }
         let mut changed = Vec::new();
         for (id, c) in self.clients.iter_mut() {
             let want = power_after(&idle, now.saturating_duration_since(c.last_activity));
@@ -339,6 +383,7 @@ impl Engine {
         };
         if down {
             c.last_activity = now;
+            c.last_press = now;
             if c.power != Power::Active {
                 // The press only wakes the display; it is not a button press.
                 tracing::info!(client = %c.client_id, key, "woken by key press");
@@ -494,6 +539,11 @@ impl Engine {
     fn dep_count(&self, entity: &str) -> usize {
         self.rev_deps.get(entity).map_or(0, HashSet::len)
     }
+}
+
+/// Whether `home_after` has passed since `last_press`.
+fn home_due(home_after: Option<Duration>, last_press: Instant, now: Instant) -> bool {
+    home_after.is_some_and(|t| now.saturating_duration_since(last_press) >= t)
 }
 
 /// The power state a client is in after being idle for `idle`.
@@ -910,6 +960,121 @@ mod tests {
         write_config(d.path(), r##"sdc.brightness(30) sdc.page("home", {})"##);
         e.handle_at(EngineEvent::Reload, t0 + secs(33));
         assert_eq!(brightness(&drain_out(&mut rx)), [30]);
+    }
+
+    const HOME_CONFIG: &str = r##"
+        sdc.idle { dim_after = 120, off_after = 600, home_after = 3600 }
+        sdc.page("home", { sdc.button{ render = { text = "H" }, press = function(ctx) ctx.goto_page("two") end } })
+        sdc.page("two", { sdc.button{ render = { text = "T" } } })
+    "##;
+
+    fn connect_at(e: &mut Engine, id: ClientId, name: &str, t: Instant) -> UnboundedReceiver<Out> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        e.handle_at(
+            EngineEvent::ClientConnected {
+                id,
+                client_id: name.into(),
+                device: device(),
+                tx,
+            },
+            t,
+        );
+        rx
+    }
+
+    #[test]
+    fn page_is_remembered_across_reconnect() {
+        let (mut e, rx, _ha, _d) = setup(HOME_CONFIG);
+        drop(rx);
+        let t0 = Instant::now();
+        e.goto_page(1, "two");
+        e.handle_at(EngineEvent::ClientDisconnected(1), t0);
+        let mut rx2 = connect_at(&mut e, 2, "c1", t0 + secs(10));
+        assert_eq!(e.clients[&2].page, "two");
+        assert_eq!(drain(&mut rx2).len(), 15);
+        // a different client_id starts at home
+        connect_at(&mut e, 3, "other", t0 + secs(10));
+        assert_eq!(e.clients[&3].page, "home");
+        // reconnect before the old disconnect arrived keeps the page, and the stale
+        // disconnect does not overwrite the memory
+        connect_at(&mut e, 4, "c1", t0 + secs(11));
+        assert_eq!(e.clients[&4].page, "two");
+        e.handle_at(EngineEvent::ClientDisconnected(2), t0 + secs(12));
+        e.handle_at(EngineEvent::ClientDisconnected(4), t0 + secs(13));
+        connect_at(&mut e, 5, "c1", t0 + secs(14));
+        assert_eq!(e.clients[&5].page, "two");
+    }
+
+    #[test]
+    fn remembered_page_expires_after_home_after() {
+        let (mut e, rx, _ha, _d) = setup(HOME_CONFIG);
+        drop(rx);
+        let t0 = Instant::now();
+        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0); // goes to "two"
+        assert_eq!(e.clients[&1].page, "two");
+        e.handle_at(EngineEvent::ClientDisconnected(1), t0 + secs(1));
+        // the press time survives the reconnect: 3599s after it, still "two"
+        connect_at(&mut e, 2, "c1", t0 + secs(3599));
+        assert_eq!(e.clients[&2].page, "two");
+        e.handle_at(EngineEvent::ClientDisconnected(2), t0 + secs(3599));
+        connect_at(&mut e, 3, "c1", t0 + secs(3600));
+        assert_eq!(e.clients[&3].page, "home");
+        // tick forgets expired entries
+        e.handle_at(EngineEvent::ClientDisconnected(3), t0 + secs(3600));
+        assert!(e.remembered.contains_key("c1"));
+        e.tick(t0 + secs(3600 + 3600));
+        assert!(e.remembered.is_empty());
+    }
+
+    #[test]
+    fn home_after_returns_to_default_even_when_off() {
+        let (mut e, mut rx, _ha, _d) = setup(HOME_CONFIG);
+        drain_out(&mut rx);
+        let t0 = Instant::now();
+        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0);
+        assert_eq!(e.clients[&1].page, "two");
+        drain_out(&mut rx);
+        e.tick(t0 + secs(600));
+        assert_eq!(brightness(&drain_out(&mut rx)), [0]);
+        e.tick(t0 + secs(3599));
+        assert_eq!(e.clients[&1].page, "two");
+        e.tick(t0 + secs(3600));
+        assert_eq!(e.clients[&1].page, "home");
+        assert!(!drain(&mut rx).is_empty(), "home is rendered while off");
+        // waking keeps it on home; the waking press does nothing else
+        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0 + secs(4000));
+        assert_eq!(e.clients[&1].page, "home");
+        assert_eq!(brightness(&drain_out(&mut rx)), [60]);
+    }
+
+    #[test]
+    fn waking_before_home_after_keeps_page() {
+        let (mut e, mut rx, _ha, _d) = setup(HOME_CONFIG);
+        drain_out(&mut rx);
+        let t0 = Instant::now();
+        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0);
+        e.tick(t0 + secs(700)); // off
+        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0 + secs(1000)); // wakes only
+        e.handle_at(EngineEvent::KeyUp { id: 1, key: 0 }, t0 + secs(1000));
+        assert_eq!(e.clients[&1].page, "two");
+        // the wake press restarted the home clock
+        e.tick(t0 + secs(1000 + 3599));
+        assert_eq!(e.clients[&1].page, "two");
+        e.tick(t0 + secs(1000 + 3600));
+        assert_eq!(e.clients[&1].page, "home");
+    }
+
+    #[test]
+    fn remembered_page_removed_by_reload_falls_back_to_default() {
+        let (mut e, rx, _ha, d) = setup(HOME_CONFIG);
+        drop(rx);
+        let t0 = Instant::now();
+        e.goto_page(1, "two");
+        e.handle_at(EngineEvent::ClientDisconnected(1), t0);
+        write_config(d.path(), r##"sdc.page("home", {})"##);
+        e.handle_at(EngineEvent::Reload, t0);
+        connect_at(&mut e, 2, "c1", t0 + secs(5));
+        assert_eq!(e.clients[&2].page, "home");
     }
 
     /// Serves a solid red PNG at /ok.png and 404 elsewhere; returns its base URL.

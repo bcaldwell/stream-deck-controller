@@ -44,7 +44,7 @@ task lint test         # fmt + clippy -D warnings, tests
 ```
 
 Client flags/env: `--server/SDC_SERVER`, `--client-id/SDC_CLIENT_ID` (default hostname),
-`--token/SDC_CLIENT_TOKEN`, `--brightness/SDC_BRIGHTNESS` (60), `--no-update/SDC_NO_UPDATE`, `--list`, `--fake-device`, `--fake-out`, `--test-pattern <secs>`.
+`--token/SDC_CLIENT_TOKEN`, `--brightness/SDC_BRIGHTNESS` (60), `--offline-after/SDC_OFFLINE_AFTER` (20, seconds before the offline state shows), `--no-update/SDC_NO_UPDATE`, `--list`, `--fake-device`, `--fake-out`, `--test-pattern <secs>`.
 
 Note: `vendor/elgato-streamdeck` is a copy of the upstream crate with its hidapi backend switched to the
 pure-Rust Linux backend so the client builds as a static musl binary (see `vendor/elgato-streamdeck/PATCHED.md`).

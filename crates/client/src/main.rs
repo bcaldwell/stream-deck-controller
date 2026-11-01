@@ -32,6 +32,16 @@ struct Args {
           value_parser = clap::value_parser!(u8).range(0..=100))]
     brightness: u8,
 
+    /// Seconds without a server connection before the deck shows its offline state; until
+    /// then (also at startup) it keeps showing the last images
+    #[arg(
+        long,
+        env = "SDC_OFFLINE_AFTER",
+        default_value_t = 20,
+        value_name = "SECONDS"
+    )]
+    offline_after: u64,
+
     /// Hardware smoke test: paint each key a distinct colour, log key presses for N seconds, exit
     #[arg(long, value_name = "SECONDS")]
     test_pattern: Option<u64>,
@@ -131,6 +141,7 @@ async fn main() -> Result<()> {
         token: args.token.filter(|t| !t.is_empty()),
         client_id: args.client_id.unwrap_or_else(hostname),
         brightness: args.brightness,
+        offline_after: Duration::from_secs(args.offline_after),
         client_sha256: update::exe_sha256()
             .map_err(|e| warn!("cannot hash own executable, self-update disabled: {e:#}"))
             .ok(),

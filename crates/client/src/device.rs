@@ -219,7 +219,7 @@ impl Deck {
         Ok(())
     }
 
-    /// Visual "not connected" state: all keys blank except key 0, which is solid red.
+    /// Visual "not connected" state: all keys black except key 0, which has a small red dot.
     pub async fn show_disconnected(&self) -> Result<()> {
         self.clear().await?;
         let mut jpeg = Vec::new();
@@ -229,8 +229,18 @@ impl Deck {
     }
 }
 
+/// A black key with a small red dot near the top-left corner.
 pub fn disconnected_tile(size: u32) -> DynamicImage {
-    DynamicImage::ImageRgb8(RgbImage::from_pixel(size, size, Rgb([140, 0, 0])))
+    let mut img = RgbImage::from_pixel(size, size, Rgb([0, 0, 0]));
+    let s = size as f32;
+    let (cx, cy, r) = (s * 0.22, s * 0.22, s * 0.09);
+    for (x, y, px) in img.enumerate_pixels_mut() {
+        let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+        if dx * dx + dy * dy <= r * r {
+            *px = Rgb([200, 0, 0]);
+        }
+    }
+    DynamicImage::ImageRgb8(img)
 }
 
 /// Solid colour tile for hue in 0..1 (used by `--test-pattern`).
@@ -348,6 +358,9 @@ mod tests {
         assert!(dir.join("key-3.jpg").exists());
         assert!(deck.set_image_jpeg(15, &jpeg(72)).await.is_err());
         deck.show_disconnected().await.unwrap();
+        let tile = disconnected_tile(72).to_rgb8();
+        assert_eq!(tile.get_pixel(16, 16).0, [200, 0, 0]);
+        assert_eq!(tile.get_pixel(50, 50).0, [0, 0, 0]);
         assert!(!dir.join("key-3.jpg").exists());
         assert!(dir.join("key-0.jpg").exists());
         std::fs::remove_dir_all(dir).ok();

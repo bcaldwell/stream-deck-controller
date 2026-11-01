@@ -64,7 +64,7 @@ sdc.page("home", {                -- list index = key index, row-major, key 1 (L
 })
 sdc.default_page("home")          -- optional; default is the first page defined
 sdc.brightness(60)                -- optional; active brightness 0-100 (sent on connect and on wake)
-sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600 }   -- optional, seconds
+sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }   -- optional, seconds
 ```
 
 - Render descriptor: `text` (`\n` allowed; wraps and auto-shrinks), `bg`/`fg` (`#rgb`, `#rrggbb`),
@@ -82,6 +82,11 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600 }   -- optional
   brightness (`sdc.brightness`, default 60) and is consumed: it only wakes the deck, its press and release
   handlers do not run. Any press while awake restarts the timer. Clients are checked once a second; a config
   reload re-reads the settings without waking or dimming anyone (a changed setting takes effect on the next check).
+- Pages: the server remembers each client's page by `client_id` (in memory), so a client that reconnects (server
+  deploy, client self-update) returns to the page it was on, unless that page no longer exists. Waking an idle
+  deck also keeps its page. `home_after` (optional) switches a client to the default page after that many seconds
+  without a key press, rendering it even while the display is off, so waking shows home; a disconnected client's
+  remembered page expires after the same time. Without `home_after` pages are remembered until the server restarts.
 - Rendering: Lua `render` functions run one after the other, then the keys of a page (connect, page switch,
   reload) are rasterized and JPEG-encoded in parallel. Pictures are premultiplied and shrunk (shorter side
   <= 256 px) when decoded, and scaled once per key size and cached until the next config reload.

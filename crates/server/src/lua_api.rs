@@ -42,14 +42,17 @@ pub struct ButtonDef {
     release: Option<Function>,
 }
 
-/// `sdc.idle{...}`: dim, then switch the display off, after this long without a key press.
-/// With neither set a client never idles.
+/// `sdc.idle{...}`: dim, then switch the display off, after this long without a key press;
+/// `home_after` returns the client to the default page. With none set a client never idles.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IdleConfig {
     pub dim_after: Option<Duration>,
     /// Brightness while dimmed (percent).
     pub dim_brightness: u8,
     pub off_after: Option<Duration>,
+    /// Back to the default page after this long without a key press (also bounds how long a
+    /// disconnected client's page is remembered).
+    pub home_after: Option<Duration>,
 }
 
 /// Brightness restored on wake when the config has no `sdc.brightness`.
@@ -78,6 +81,7 @@ impl Default for Settings {
                 dim_after: None,
                 dim_brightness: DEFAULT_DIM_BRIGHTNESS,
                 off_after: None,
+                home_after: None,
             },
             brightness: None,
         }
@@ -341,6 +345,7 @@ fn install(
                 match k.as_str() {
                     "dim_after" => idle.dim_after = Some(seconds_arg(&k, &v)?),
                     "off_after" => idle.off_after = Some(seconds_arg(&k, &v)?),
+                    "home_after" => idle.home_after = Some(seconds_arg(&k, &v)?),
                     "dim_brightness" => match v {
                         Value::Integer(i) => {
                             idle.dim_brightness = percent_arg("sdc.idle: 'dim_brightness'", i)?
@@ -353,7 +358,7 @@ fn install(
                     },
                     _ => {
                         return Err(mlua::Error::runtime(format!(
-                        "sdc.idle: unknown field '{k}' (use dim_after, dim_brightness, off_after)"
+                        "sdc.idle: unknown field '{k}' (use dim_after, dim_brightness, off_after, home_after)"
                     )))
                     }
                 }
@@ -678,13 +683,14 @@ mod tests {
         assert_eq!(rt.settings(), Settings::default());
         assert_eq!(rt.settings().active_brightness(), DEFAULT_BRIGHTNESS);
         let rt = LuaRuntime::load_str(
-            "sdc.idle { dim_after = 120, off_after = 600.5 } sdc.brightness(40)",
+            "sdc.idle { dim_after = 120, off_after = 600.5, home_after = 3600 } sdc.brightness(40)",
             Host::new(None),
         )
         .unwrap();
         let s = rt.settings();
         assert_eq!(s.idle.dim_after, Some(Duration::from_secs(120)));
         assert_eq!(s.idle.off_after, Some(Duration::from_millis(600_500)));
+        assert_eq!(s.idle.home_after, Some(Duration::from_secs(3600)));
         assert_eq!(s.idle.dim_brightness, 10);
         assert_eq!(s.active_brightness(), 40);
         for bad in [
@@ -692,6 +698,7 @@ mod tests {
             "sdc.idle { dim_after = 0 }",
             "sdc.idle { dim_brightness = 200 }",
             "sdc.idle { dim_aftr = 5 }",
+            "sdc.idle { home_after = -1 }",
         ] {
             assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
         }

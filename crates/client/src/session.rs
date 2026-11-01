@@ -18,6 +18,66 @@ use crate::device::{Deck, KeyEvent};
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const PING_EVERY: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Brightness cap (percent) of the offline state.
+const OFFLINE_BRIGHTNESS: u8 = 20;
+
+/// Tracks how long the server has been unreachable, to decide when the deck should show its
+/// offline state. Short outages (deploys, client restarts) leave the last images untouched.
+/// Time is passed in, so this is testable without a device.
+#[derive(Debug)]
+pub struct Link {
+    grace: Duration,
+    /// When the connection was lost (or the client started); `None` while connected.
+    down_since: Option<Instant>,
+    offline_shown: bool,
+}
+
+impl Link {
+    /// Starts out disconnected, as at process start.
+    pub fn new(grace: Duration, now: Instant) -> Self {
+        Self {
+            grace,
+            down_since: Some(now),
+            offline_shown: false,
+        }
+    }
+
+    /// The server connection is up. Returns whether the offline state was showing.
+    pub fn up(&mut self) -> bool {
+        self.down_since = None;
+        std::mem::take(&mut self.offline_shown)
+    }
+
+    /// The server connection was lost (keeps the original time if already down).
+    pub fn down(&mut self, now: Instant) {
+        self.down_since.get_or_insert(now);
+    }
+
+    /// When the offline state is due, if it is not showing and the link is down.
+    pub fn deadline(&self) -> Option<Instant> {
+        if self.offline_shown {
+            return None;
+        }
+        self.down_since.map(|t| t + self.grace)
+    }
+
+    /// True once when the offline state should be drawn now; the caller then draws it.
+    pub fn take_due(&mut self, now: Instant) -> bool {
+        if self.deadline().is_some_and(|d| now >= d) {
+            self.offline_shown = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// Draws the offline state: dimmed, black keys with a red dot on key 0.
+async fn show_offline(cfg: &Config, deck: &Deck) -> Result<()> {
+    warn!(after = ?cfg.offline_after, "server unreachable, showing offline state");
+    deck.set_brightness(cfg.brightness.min(OFFLINE_BRIGHTNESS))
+        .await?;
+    deck.show_disconnected().await
+}
 
 pub struct Config {
     pub server: String,
@@ -25,6 +85,8 @@ pub struct Config {
     pub token: Option<String>,
     pub client_id: String,
     pub brightness: u8,
+    /// How long the server may be unreachable before the deck shows its offline state.
+    pub offline_after: Duration,
     /// Hash of the running executable, reported in Hello (None: could not read it).
     pub client_sha256: Option<String>,
     /// Apply `Update` messages from the server (`--no-update` turns this off).
@@ -85,13 +147,13 @@ pub fn handle_message(msg: &Message) -> Result<Action> {
 /// Returns only when the device fails.
 pub async fn run(cfg: &Config, deck: &mut Deck) -> String {
     let mut backoff = Duration::from_millis(500);
+    let mut link = Link::new(cfg.offline_after, Instant::now());
     loop {
-        if let Err(e) = deck.show_disconnected().await {
-            return format!("device error: {e:#}");
-        }
         info!(server = %cfg.server, "connecting");
         let started = Instant::now();
-        match session(cfg, deck).await {
+        let res = session(cfg, deck, &mut link).await;
+        link.down(Instant::now());
+        match res {
             Ok(End::Device(why)) => return why,
             Ok(End::Server(why)) => warn!("disconnected from server: {why}"),
             Err(e) => warn!("server connection failed: {e:#}"),
@@ -101,12 +163,24 @@ pub async fn run(cfg: &Config, deck: &mut Deck) -> String {
             backoff = Duration::from_millis(500);
         }
         info!(?backoff, "retrying");
-        crate::device::sleep(backoff).await;
+        let wake = Instant::now() + backoff;
+        loop {
+            let until = link.deadline().map_or(wake, |d| d.min(wake));
+            tokio::time::sleep_until(until).await;
+            if link.take_due(Instant::now()) {
+                if let Err(e) = show_offline(cfg, deck).await {
+                    return format!("device error: {e:#}");
+                }
+            }
+            if Instant::now() >= wake {
+                break;
+            }
+        }
         backoff = (backoff * 2).min(Duration::from_secs(15));
     }
 }
 
-async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
+async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link) -> Result<End> {
     let mut request = cfg.server.as_str().into_client_request()?;
     if let Some(token) = &cfg.token {
         request.headers_mut().insert(
@@ -115,10 +189,23 @@ async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
                 .map_err(|_| anyhow!("token contains characters not allowed in a header"))?,
         );
     }
-    let (ws, _) = match timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
-        .await
-        .map_err(|_| anyhow!("connect timed out"))?
-    {
+    // The offline state can fall due while the connect attempt is still pending.
+    let connect = timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request));
+    tokio::pin!(connect);
+    let connected = loop {
+        let due = link.deadline();
+        tokio::select! {
+            r = &mut connect => break r,
+            _ = async { tokio::time::sleep_until(due.unwrap()).await }, if due.is_some() => {
+                if link.take_due(Instant::now()) {
+                    if let Err(e) = show_offline(cfg, deck).await {
+                        return Ok(End::Device(format!("device error: {e:#}")));
+                    }
+                }
+            }
+        }
+    };
+    let (ws, _) = match connected.map_err(|_| anyhow!("connect timed out"))? {
         Ok(ok) => ok,
         Err(WsError::Http(resp)) if resp.status() == StatusCode::UNAUTHORIZED => {
             error!("server rejected token (HTTP 401): check SDC_CLIENT_TOKEN / --token");
@@ -128,6 +215,7 @@ async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
     };
     let (mut tx, mut rx) = ws.split();
     info!("connected");
+    link.up();
 
     let hello = ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
@@ -141,7 +229,7 @@ async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
     if let Err(e) = deck.set_brightness(cfg.brightness).await {
         return Ok(End::Device(format!("device error: {e:#}")));
     }
-    deck.clear().await.ok();
+    // No clear here: the deck keeps its last images until the server's frames replace them.
 
     let mut ping = interval(PING_EVERY);
     let mut last_rx = Instant::now();
@@ -191,7 +279,6 @@ async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
                             match res {
                                 Ok(Ok(())) => {
                                     info!("client updated; exiting so the service manager restarts the new version");
-                                    deck.clear().await.ok();
                                     std::process::exit(0);
                                 }
                                 Ok(Err(e)) => warn!("self-update failed, staying on this version: {e:#}"),
@@ -258,6 +345,37 @@ mod tests {
             }
         );
         assert!(handle_message(&Message::Binary(vec![].into())).is_err());
+    }
+
+    #[test]
+    fn link_shows_offline_only_after_grace() {
+        let t0 = Instant::now();
+        let secs = Duration::from_secs;
+        // startup: counts as down from the start, nothing drawn before the grace
+        let mut l = Link::new(secs(20), t0);
+        assert_eq!(l.deadline(), Some(t0 + secs(20)));
+        assert!(!l.take_due(t0 + secs(19)));
+        assert!(l.take_due(t0 + secs(20)));
+        assert!(!l.take_due(t0 + secs(21)), "drawn only once");
+        assert_eq!(l.deadline(), None);
+        // reconnect reports that the offline state has to be undone
+        assert!(l.up());
+        assert!(!l.up());
+        assert_eq!(l.deadline(), None, "connected: nothing due");
+        assert!(!l.take_due(t0 + secs(1000)));
+
+        // a short outage never draws anything
+        l.down(t0 + secs(100));
+        l.down(t0 + secs(105)); // repeated failures keep the original loss time
+        assert_eq!(l.deadline(), Some(t0 + secs(120)));
+        assert!(!l.take_due(t0 + secs(119)));
+        assert!(!l.up());
+        assert!(!l.take_due(t0 + secs(130)));
+
+        // a second long outage draws again
+        l.down(t0 + secs(200));
+        assert!(l.take_due(t0 + secs(220)));
+        assert!(l.up());
     }
 
     #[test]
