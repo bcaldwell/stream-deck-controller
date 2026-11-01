@@ -82,6 +82,10 @@ jobs:
           mkdir -p dist/linux/amd64 dist/linux/arm64
           install -m 0755 bin/sdc-server-x86_64-linux dist/linux/amd64/sdc-server
           install -m 0755 bin/sdc-server-aarch64-linux dist/linux/arm64/sdc-server
+          # client binaries the server distributes (same in both image arches)
+          mkdir -p dist/clients
+          install -m 0755 bin/sdc-client-x86_64-linux dist/clients/sdc-client-x86_64-linux
+          install -m 0755 bin/sdc-client-aarch64-linux dist/clients/sdc-client-aarch64-linux
       # No QEMU needed: the binaries are prebuilt, the Dockerfile only copies them.
       - uses: docker/setup-buildx-action@v3
       # Tagged by commit SHA (what a deployment should pin), plus the branch name

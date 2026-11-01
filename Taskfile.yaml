@@ -61,10 +61,26 @@ tasks:
       - cargo zigbuild --release --target {{.X86}} -p sdc-server -p sdc-client
 
   docker:
-    desc: Build the server image locally (both arches' binaries are staged in dist/)
+    desc: Build the server image locally (server and client binaries for both arches are staged in dist/)
     deps: [build-linux]
     cmds:
-      - mkdir -p dist/linux/amd64 dist/linux/arm64
+      - mkdir -p dist/linux/amd64 dist/linux/arm64 dist/clients
       - cp target/{{.X86}}/release/sdc-server dist/linux/amd64/sdc-server
       - cp target/{{.ARM}}/release/sdc-server dist/linux/arm64/sdc-server
+      - cp target/{{.X86}}/release/sdc-client dist/clients/sdc-client-x86_64-linux
+      - cp target/{{.ARM}}/release/sdc-client dist/clients/sdc-client-aarch64-linux
       - docker build -t {{.IMAGE}} .
+
+  deploy-pi:
+    desc: Copy a locally built aarch64 client to the Pi (PI_HOST, default 192.168.2.81); prints the install command
+    deps: [build-pi]
+    vars:
+      PI_HOST: '{{.PI_HOST | default "192.168.2.81"}}'
+    cmds:
+      - scp target/{{.ARM}}/release/sdc-client pi@{{.PI_HOST}}:/tmp/sdc-client
+      - |
+        echo "On the Pi, install with the server's own binary and installer:"
+        echo "  curl -fsSL http://<server>:7700/install.sh | sudo sh -s -- --server ws://<server>:7700/ws"
+        echo "or hot-swap this build: sudo install -o sdc -g sdc -m755 /tmp/sdc-client /var/lib/sdc-client/sdc-client && sudo systemctl restart sdc-client"
+        echo "(the server will replace it again if it serves a different build; use --no-update to pin)"
+

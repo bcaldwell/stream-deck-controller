@@ -2,6 +2,7 @@
 
 mod device;
 mod session;
+mod update;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -43,6 +44,10 @@ struct Args {
     /// With --fake-device: write received images to this directory as key-<n>.jpg
     #[arg(long, env = "SDC_FAKE_OUT")]
     fake_out: Option<PathBuf>,
+
+    /// Do not replace this binary when the server offers a different one
+    #[arg(long, env = "SDC_NO_UPDATE")]
+    no_update: bool,
 }
 
 fn hostname() -> String {
@@ -121,8 +126,18 @@ async fn main() -> Result<()> {
         server: args.server,
         client_id: args.client_id.unwrap_or_else(hostname),
         brightness: args.brightness,
+        client_sha256: update::exe_sha256()
+            .map_err(|e| warn!("cannot hash own executable, self-update disabled: {e:#}"))
+            .ok(),
+        auto_update: !args.no_update,
     };
-    info!(server = %cfg.server, client_id = %cfg.client_id, "sdc-client starting");
+    info!(
+        server = %cfg.server,
+        client_id = %cfg.client_id,
+        sha256 = cfg.client_sha256.as_deref().map(|s| &s[..12.min(s.len())]),
+        auto_update = cfg.auto_update,
+        "sdc-client starting"
+    );
 
     let mut fake = if args.fake_device {
         Some(device::Deck::fake(args.fake_out)?)
