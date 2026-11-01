@@ -1,0 +1,11 @@
+# Placeholder. Preferably generate from the real file instead:
+#   kubectl -n stream-deck create configmap sdc-config --from-file=config.lua=../../config.lua \
+#     --dry-run=client -o yaml | kubectl apply -f -
+# (If you do that, remove this file from kustomization.yaml.)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sdc-config
+data:
+  config.lua: |
+    -- replace with the contents of config.lua

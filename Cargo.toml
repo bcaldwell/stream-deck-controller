@@ -1,8 +1,28 @@
 [workspace]
-members = ["sdc_core", "integrations", "server", "client"]
-
-default-members = ["server", "client"]
+resolver = "2"
+members = ["crates/protocol", "crates/server", "crates/client"]
 
 [workspace.package]
-edition = '2021'
+version = "0.2.0"
+edition = "2021"
 
+[workspace.dependencies]
+sdc-protocol = { path = "crates/protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+
+# elgato-streamdeck pulls hidapi with default features (linux-static-hidraw -> needs libudev),
+# and hidapi allows exactly one Linux backend. Patch in a copy that selects the pure-Rust
+# backend so static musl cross builds work. See vendor/elgato-streamdeck/PATCHED.md.
+[patch.crates-io]
+elgato-streamdeck = { path = "vendor/elgato-streamdeck" }

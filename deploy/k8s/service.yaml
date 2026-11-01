@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sdc-server
+spec:
+  # Clients on the LAN (the Pis) must reach this. LoadBalancer assumes MetalLB/kube-vip or similar;
+  # otherwise use `type: NodePort` and point clients at ws://<node-ip>:<nodePort>/ws.
+  type: LoadBalancer
+  selector: {app: sdc-server}
+  ports:
+    - {name: ws, port: 7700, targetPort: 7700}
