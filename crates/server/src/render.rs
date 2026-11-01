@@ -808,9 +808,9 @@ fn premultiply(img: &mut RgbaImage) {
 fn unpremultiply(img: &mut RgbaImage) {
     for p in img.pixels_mut() {
         let a = p.0[3] as u32;
-        if a > 0 {
-            for c in &mut p.0[..3] {
-                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+        for c in &mut p.0[..3] {
+            if let Some(q) = (*c as u32 * 255 + a / 2).checked_div(a) {
+                *c = q.min(255) as u8;
             }
         }
     }
