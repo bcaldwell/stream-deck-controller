@@ -2,6 +2,10 @@ version: "3"
 
 # Run inside the devShell (`nix develop` / direnv) so the pinned toolchain + zig are on PATH.
 
+# Local secrets (HA_TOKEN, SDC_CLIENT_TOKEN, ...) without relying on direnv having
+# reloaded; values already in the environment win.
+dotenv: [".env"]
+
 vars:
   ARM: aarch64-unknown-linux-musl
   X86: x86_64-unknown-linux-musl
