@@ -1,0 +1,22 @@
+[Unit]
+Description=Stream Deck Controller client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/sdc-client.env
+ExecStart=/var/lib/sdc-client/sdc-client
+# The client exits after replacing itself with a newer binary from the server.
+Restart=always
+RestartSec=3
+# Generic, low-privilege hardening (device access is granted by the udev rule).
+# StateDirectory is the only writable path: it holds the self-updating binary.
+User=sdc
+Group=sdc
+StateDirectory=sdc-client
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

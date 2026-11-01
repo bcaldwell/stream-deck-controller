@@ -1,0 +1,3 @@
+# Allow non-root access to Elgato Stream Decks (vendor 0fd9) via hidraw/usb.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", MODE="0666"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", MODE="0666"
