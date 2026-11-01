@@ -119,6 +119,29 @@ jobs:
           # and nothing here verifies it.
           provenance: false
 
+  # Bumps the tag in k8s-config through its update-image workflow, which commits
+  # to main there and lets ArgoCD roll it out (same as rankd). Only main deploys.
+  # Skipped until a K8S_CONFIG_TOKEN secret exists: a fine-grained PAT scoped to
+  # bcaldwell/k8s-config with Actions: read and write.
+  deploy:
+    name: deploy via k8s-config
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      DEPLOY: ${{ secrets.K8S_CONFIG_TOKEN != '' }}
+    steps:
+      # The REST dispatch, not `gh workflow run`: that first looks up the default
+      # branch over GraphQL, which the Actions-only token cannot.
+      - name: Dispatch update-image
+        if: env.DEPLOY == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.K8S_CONFIG_TOKEN }}
+        run: |
+          gh api -X POST repos/bcaldwell/k8s-config/actions/workflows/update-image.yaml/dispatches \
+            -f ref=main -f "inputs[repository]=$IMAGE" -f "inputs[tag]=$GITHUB_SHA"
+
   # Each push adds ~8 MB (one static binary layer per arch over distroless).
   # Keep enough SHAs for a rollback; anything older can be rebuilt from its commit.
   cleanup:
