@@ -28,7 +28,7 @@ pub fn router(
 ) -> Router {
     Router::new()
         .route("/ws", get(ws::upgrade))
-        .route("/client/:file", get(client_file))
+        .route("/client/{file}", get(client_file))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(WsState {
             engine,

@@ -5,7 +5,7 @@
 //! over the current executable. The process then exits and the service manager (systemd
 //! `Restart=always`) starts the new version; a clean exit 0 is used so it is not a failure.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -55,18 +55,20 @@ pub fn apply(server: &str, token: Option<&str>, path: &str, sha256: &str) -> Res
         .ok_or_else(|| anyhow!("executable has no directory"))?;
     check_writable(dir)?;
 
-    let mut req = ureq::AgentBuilder::new()
-        .timeout(HTTP_TIMEOUT)
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(HTTP_TIMEOUT))
         .build()
-        .get(&url);
+        .new_agent();
+    let mut req = agent.get(&url);
     if let Some(token) = token {
-        req = req.set("Authorization", &format!("Bearer {token}"));
+        req = req.header("Authorization", format!("Bearer {token}"));
     }
-    let resp = req.call().with_context(|| format!("downloading {url}"))?;
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(MAX_BINARY_BYTES)
-        .read_to_end(&mut bytes)
+    let mut resp = req.call().with_context(|| format!("downloading {url}"))?;
+    let bytes = resp
+        .body_mut()
+        .with_config()
+        .limit(MAX_BINARY_BYTES)
+        .read_to_vec()
         .with_context(|| format!("reading {url}"))?;
     replace_exe(&exe, &bytes, sha256)
 }

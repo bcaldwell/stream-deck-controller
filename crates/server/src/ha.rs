@@ -131,7 +131,9 @@ async fn session(
         match msg["type"].as_str() {
             Some("auth_required") => {
                 tx.send(Message::Text(
-                    json!({"type": "auth", "access_token": cfg.token}).to_string(),
+                    json!({"type": "auth", "access_token": cfg.token})
+                        .to_string()
+                        .into(),
                 ))
                 .await?;
             }
@@ -169,7 +171,7 @@ async fn session(
                     send_json(&mut tx, m).await?;
                 }
             },
-            _ = ping.tick() => tx.send(Message::Ping(Vec::new())).await?,
+            _ = ping.tick() => tx.send(Message::Ping(Vec::new().into())).await?,
         }
     }
 }
@@ -216,7 +218,7 @@ where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    tx.send(Message::Text(v.to_string())).await?;
+    tx.send(Message::Text(v.to_string().into())).await?;
     Ok(())
 }
 

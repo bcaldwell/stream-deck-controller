@@ -2,7 +2,6 @@
 //! objects in an S3 bucket (Garage), plus the background fetcher. The renderer never blocks on any of this: it asks
 //! [`Fetcher::spawn`] for a download and gets the decoded image back through a callback.
 
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -260,22 +259,24 @@ impl Fetcher {
 /// Downloads and decodes an image. Blocking.
 pub fn fetch_image(dl: &Download) -> Result<RgbaImage> {
     let url = dl.url.as_str();
-    let mut req = ureq::AgentBuilder::new()
-        .timeout(FETCH_TIMEOUT)
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(FETCH_TIMEOUT))
         .build()
-        .get(url);
+        .new_agent();
+    let mut req = agent.get(url);
     if let Some(token) = &dl.bearer {
-        req = req.set("Authorization", &format!("Bearer {token}"));
+        req = req.header("Authorization", format!("Bearer {token}"));
     }
-    let resp = req.call().map_err(|e| match e {
+    let mut resp = req.call().map_err(|e| match e {
         // Presigned URLs (and HA artwork) carry secrets in the query string: keep it out of logs.
-        ureq::Error::Status(code, _) => anyhow!("HTTP {code} from {}", redact(url)),
+        ureq::Error::StatusCode(code) => anyhow!("HTTP {code} from {}", redact(url)),
         other => anyhow!("{other}"),
     })?;
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(MAX_IMAGE_BYTES)
-        .read_to_end(&mut bytes)
+    let bytes = resp
+        .body_mut()
+        .with_config()
+        .limit(MAX_IMAGE_BYTES)
+        .read_to_vec()
         .context("reading response")?;
     Ok(image::load_from_memory(&bytes)
         .context("decoding image")?

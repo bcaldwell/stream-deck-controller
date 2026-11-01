@@ -215,7 +215,7 @@ async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
                 if last_rx.elapsed() > IDLE_TIMEOUT {
                     return Ok(End::Server("idle timeout".into()));
                 }
-                tx.send(Message::Ping(vec![])).await?;
+                tx.send(Message::Ping(vec![].into())).await?;
             }
         }
     }
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn handles_binary_frames() {
-        let m = Message::Binary(ImageFrame::encode(7, &[1, 2, 3]));
+        let m = Message::Binary(ImageFrame::encode(7, &[1, 2, 3]).into());
         assert_eq!(
             handle_message(&m).unwrap(),
             Action::Image {
@@ -257,7 +257,7 @@ mod tests {
                 jpeg: vec![1, 2, 3]
             }
         );
-        assert!(handle_message(&Message::Binary(vec![])).is_err());
+        assert!(handle_message(&Message::Binary(vec![].into())).is_err());
     }
 
     #[test]

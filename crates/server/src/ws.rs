@@ -83,7 +83,7 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
                 "unsupported protocol version {protocol_version}, server speaks {PROTOCOL_VERSION}"
             ),
         };
-        sink.send(Message::Text(serde_json::to_string(&msg)?))
+        sink.send(Message::Text(serde_json::to_string(&msg)?.into()))
             .await?;
         let _ = sink.close().await;
         bail!("client {client_id} protocol version {protocol_version} unsupported");
@@ -93,17 +93,18 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
         let msg = ServerMessage::Error {
             message: "invalid device info".into(),
         };
-        sink.send(Message::Text(serde_json::to_string(&msg)?))
+        sink.send(Message::Text(serde_json::to_string(&msg)?.into()))
             .await?;
         bail!("client {client_id} sent invalid device info");
     }
     let key_count = device.key_count();
 
-    sink.send(Message::Text(serde_json::to_string(
-        &ServerMessage::Welcome {
+    sink.send(Message::Text(
+        serde_json::to_string(&ServerMessage::Welcome {
             protocol_version: PROTOCOL_VERSION,
-        },
-    )?))
+        })?
+        .into(),
+    ))
     .await?;
 
     if let Some(update) = binaries.update_for(client_target.as_deref(), client_sha256.as_deref()) {
@@ -111,7 +112,7 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
             "client {client_id} ({}) runs a stale binary, telling it to update",
             client_target.as_deref().unwrap_or("?")
         );
-        sink.send(Message::Text(serde_json::to_string(&update)?))
+        sink.send(Message::Text(serde_json::to_string(&update)?.into()))
             .await?;
     }
 
@@ -128,10 +129,10 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
         loop {
             tokio::select! {
                 out = rx.recv() => match out {
-                    Some(Out::Frame(f)) => sink.send(Message::Binary(ImageFrame::encode(f.key, &f.jpeg))).await?,
+                    Some(Out::Frame(f)) => sink.send(Message::Binary(ImageFrame::encode(f.key, &f.jpeg).into())).await?,
                     Some(Out::Brightness(percent)) => {
                         let msg = ServerMessage::Brightness { percent };
-                        sink.send(Message::Text(serde_json::to_string(&msg)?)).await?
+                        sink.send(Message::Text(serde_json::to_string(&msg)?.into())).await?
                     }
                     None => return Ok(()),
                 },
