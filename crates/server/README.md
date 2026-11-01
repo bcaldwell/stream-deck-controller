@@ -94,15 +94,27 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600 }   -- optional
 - `image`: a full-bleed picture, scaled to cover the whole key (center-cropped). `text` is drawn on top
   along the bottom, over a subtle dark gradient and shadow so it stays legible. `icon` can still be
   combined with it.
-- Both take the same string, resolved in this order: `http://` / `https://` URL (downloaded); else a file
-  that exists relative to the config directory; else, when the `SDC_ASSETS_S3_*` variables are set, an
+- Both take the same string, resolved in this order: `http://` / `https://` URL (downloaded); a path starting
+  with `/api/` (fetched from Home Assistant, see below); else a file that exists relative to the config directory; else, when the `SDC_ASSETS_S3_*` variables are set, an
   object key in the assets bucket (path-style addressing, presigned GET requests); else an error.
   ```lua
   { text = "Movies", image = "tv/popcorn.png" }                         -- bucket object
   { text = "Lamp", icon = "https://example.com/bulb.png", bg = "#FFA000" }
   ```
-- Rendering never waits for the network. Downloaded images are cached decoded in memory (until the server
-  restarts); a key whose image is not there yet renders without it, and is re-rendered as soon as the
+- Home Assistant paths: a source starting with `/api/` is fetched from `HA_URL` + the path with
+  `Authorization: Bearer <HA_TOKEN>`; without `HA_URL`/`HA_TOKEN` it is an error source. This is how media
+  artwork works (`attributes.entity_picture` is such a path and changes with every track):
+  ```lua
+  sdc.button { render = function()
+    local p = ha.state("media_player.living_room_2")
+    local art = p and p.state == "playing" and p.attributes.entity_picture
+    return art and { image = art } or { icon = "tv/play_pause.png", bg = "#000000" }
+  end }
+  ```
+  Artwork that cannot be fetched (404, player stopped) is logged at debug level and rendered as if no
+  picture was given, not as an `ERR` tile; `image = nil` is likewise just no picture.
+- Rendering never waits for the network. Downloaded images are cached decoded in memory (the 128 most recently
+  rendered, failed downloads included, so changing sources such as artwork do not pile up); a key whose image is not there yet renders without it, and is re-rendered as soon as the
   download completes. A failed download is logged once and shown as a red `ERR` tile in the picture's area
   only (icon area, or the top half of the key for `image`); it is retried after 60 s, or on a config reload.
   Static `icon`/`image` strings in the config are prefetched on every (re)load. `sdc-server render` waits
