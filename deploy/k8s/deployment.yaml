@@ -30,7 +30,7 @@ spec:
           volumeMounts:
             - {name: config, mountPath: /config, readOnly: true}
           readinessProbe:
-            tcpSocket: {port: 7700}
+            httpGet: {path: /healthz, port: 7700}
             periodSeconds: 10
           resources:
             requests: {cpu: 20m, memory: 32Mi}

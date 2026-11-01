@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use sdc_server::clients::{self, ClientBinaries};
 use sdc_server::ha::{self, HaConfig};
-use sdc_server::{engine, preview, watch, ws};
+use sdc_server::{engine, http, preview, watch};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -94,9 +96,13 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
+    let client_dir = std::env::var_os("SDC_CLIENT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(clients::DEFAULT_DIR));
+    let binaries = Arc::new(ClientBinaries::load(&client_dir));
     tracing::info!("listening on ws://{}/ws", listener.local_addr()?);
     tokio::select! {
-        _ = ws::serve(listener, engine_tx) => {}
+        _ = http::serve(listener, engine_tx, binaries) => {}
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
     }
     Ok(())

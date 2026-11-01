@@ -21,12 +21,22 @@ states (or the fake ones from `--states`, a JSON list of `{entity_id, state, att
 | `HA_URL`     | -                | e.g. `http://homeassistant.local:8123` (`/api/websocket` and ws/wss derived) |
 | `HA_TOKEN`   | -                | Long-lived access token |
 | `SDC_LISTEN` | `0.0.0.0:7700`   | Client WebSocket listen address (path `/ws`) |
+| `SDC_CLIENT_DIR` | `/usr/local/share/sdc/clients` | Dir of `sdc-client-<target>` binaries to distribute; missing = feature off |
 | `RUST_LOG`   | `info`           | tracing filter |
 
 Without `HA_URL`/`HA_TOKEN` (or if HA is down) the server still serves clients; `ha.state` returns
 `nil` and `ha.call` is dropped. The HA connection reconnects with backoff and reseeds all states.
 The config file is hot-reloaded on save; a config that fails to load is logged and the previous one
 stays active.
+
+## HTTP endpoints and client updates
+
+Besides the `/ws` WebSocket, the same port serves `GET /client/<target>` (client binary, 404 if the
+server has none), `GET /client/<target>.sha256`, `GET /install.sh` (Pi installer, embedded from
+`deploy/pi/install.sh`) and `GET /healthz`. Binaries are read and hashed once at startup. When a
+client's `Hello` reports a target we have a binary for and a different sha256, the server sends
+`Update { path, sha256 }` right after `Welcome` and the client replaces itself. Install on a Pi with
+`curl -fsSL http://<server>:7700/install.sh | sudo sh -s -- --server ws://<server>:7700/ws`.
 
 ## Lua API
 
@@ -63,4 +73,4 @@ sdc.default_page("home")          -- optional; default is the first page defined
 
 `ha.rs` HA websocket client (channel boundary), `engine.rs` event loop / per-client state /
 dependency map, `lua_api.rs` Lua bindings, `render.rs` JPEG key renderer (embedded Open Sans, OFL;
-see `assets/OFL.txt`), `ws.rs` client server, `watch.rs` hot reload, `preview.rs` `render` command.
+see `assets/OFL.txt`), `ws.rs` client WebSocket, `http.rs` routes (client downloads, installer, health), `clients.rs` distributed binaries, `watch.rs` hot reload, `preview.rs` `render` command.

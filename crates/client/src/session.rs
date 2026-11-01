@@ -20,6 +20,10 @@ pub struct Config {
     pub server: String,
     pub client_id: String,
     pub brightness: u8,
+    /// Hash of the running executable, reported in Hello (None: could not read it).
+    pub client_sha256: Option<String>,
+    /// Apply `Update` messages from the server (`--no-update` turns this off).
+    pub auto_update: bool,
 }
 
 pub enum End {
@@ -35,6 +39,7 @@ pub enum Action {
     None,
     Brightness(u8),
     Image { key: u8, jpeg: Vec<u8> },
+    Update { path: String, sha256: String },
 }
 
 /// Pure decoding of a websocket frame into an [`Action`].
@@ -54,6 +59,7 @@ pub fn handle_message(msg: &Message) -> Result<Action> {
                 Ok(Action::None)
             }
             ServerMessage::Brightness { percent } => Ok(Action::Brightness(percent.min(100))),
+            ServerMessage::Update { path, sha256 } => Ok(Action::Update { path, sha256 }),
             ServerMessage::Error { message } => {
                 error!("server error: {message}");
                 Ok(Action::None)
@@ -109,6 +115,8 @@ async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
         protocol_version: PROTOCOL_VERSION,
         client_id: cfg.client_id.clone(),
         device: deck.info.clone(),
+        client_target: sdc_protocol::client_target().map(str::to_string),
+        client_sha256: cfg.client_sha256.clone(),
     };
     tx.send(Message::text(serde_json::to_string(&hello)?))
         .await?;
@@ -119,6 +127,8 @@ async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
 
     let mut ping = interval(PING_EVERY);
     let mut last_rx = Instant::now();
+    // One update attempt per connection, so an unwritable install does not retry in a loop.
+    let mut update_tried = false;
     loop {
         tokio::select! {
             ev = deck.events.recv() => {
@@ -144,6 +154,30 @@ async fn session(cfg: &Config, deck: &mut Deck) -> Result<End> {
                         info!(percent = p, "brightness");
                         if let Err(e) = deck.set_brightness(p).await {
                             return Ok(End::Device(format!("device error: {e:#}")));
+                        }
+                    }
+                    Ok(Action::Update { path, sha256 }) => {
+                        if !cfg.auto_update {
+                            info!("server offers a client update; ignored (--no-update)");
+                        } else if update_tried || cfg.client_sha256.as_deref() == Some(sha256.as_str()) {
+                            debug!("ignoring update message");
+                        } else {
+                            update_tried = true;
+                            info!(%path, "server offers a new client binary, updating");
+                            let server = cfg.server.clone();
+                            let res = tokio::task::spawn_blocking(move || {
+                                crate::update::apply(&server, &path, &sha256)
+                            })
+                            .await;
+                            match res {
+                                Ok(Ok(())) => {
+                                    info!("client updated; exiting so the service manager restarts the new version");
+                                    deck.clear().await.ok();
+                                    std::process::exit(0);
+                                }
+                                Ok(Err(e)) => warn!("self-update failed, staying on this version: {e:#}"),
+                                Err(e) => warn!("self-update task failed: {e}"),
+                            }
                         }
                     }
                     Ok(Action::Image { key, jpeg }) => {
@@ -181,6 +215,14 @@ mod tests {
         assert_eq!(handle_message(&m).unwrap(), Action::Brightness(100));
         let m = Message::text(r#"{"type":"welcome","protocol_version":1}"#);
         assert_eq!(handle_message(&m).unwrap(), Action::None);
+        let m = Message::text(r#"{"type":"update","path":"/client/x","sha256":"ab"}"#);
+        assert_eq!(
+            handle_message(&m).unwrap(),
+            Action::Update {
+                path: "/client/x".into(),
+                sha256: "ab".into()
+            }
+        );
         let m = Message::text(r#"{"type":"error","message":"boom"}"#);
         assert_eq!(handle_message(&m).unwrap(), Action::None);
         assert!(handle_message(&Message::text("garbage")).is_err());
@@ -205,6 +247,8 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             client_id: "pi".into(),
             device: crate::device::device_info(elgato_streamdeck::info::Kind::Original, None),
+            client_target: Some("aarch64-linux".into()),
+            client_sha256: None,
         };
         let s = serde_json::to_string(&hello).unwrap();
         assert!(s.contains(r#""type":"hello""#) && s.contains(r#""key_size_px":72"#));

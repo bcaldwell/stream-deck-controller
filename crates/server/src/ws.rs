@@ -1,52 +1,40 @@
 //! WebSocket server for clients (`/ws`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{State, WebSocketUpgrade};
+use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use sdc_protocol::{ClientMessage, ImageFrame, ServerMessage, PROTOCOL_VERSION};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::http::StatusCode;
-use tokio_tungstenite::tungstenite::Message;
 
+use crate::clients::ClientBinaries;
 use crate::engine::{EngineEvent, Frame};
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn serve(listener: TcpListener, engine: UnboundedSender<EngineEvent>) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                let engine = engine.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, engine).await {
-                        tracing::warn!("connection from {addr} ended: {e:#}");
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::error!("accept failed: {e}");
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
+#[derive(Clone)]
+pub struct WsState {
+    pub engine: UnboundedSender<EngineEvent>,
+    pub binaries: Arc<ClientBinaries>,
 }
 
-async fn handle_conn(stream: TcpStream, engine: UnboundedSender<EngineEvent>) -> Result<()> {
-    let check_path = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-        if req.uri().path() == "/ws" {
-            Ok(resp)
-        } else {
-            let mut r = ErrorResponse::new(Some("not found".to_string()));
-            *r.status_mut() = StatusCode::NOT_FOUND;
-            Err(r)
+/// Upgrade handler for `/ws`.
+pub async fn upgrade(State(state): State<WsState>, ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(move |socket| async move {
+        if let Err(e) = handle_conn(socket, state).await {
+            tracing::warn!("connection ended: {e:#}");
         }
-    };
-    let ws = tokio_tungstenite::accept_hdr_async(stream, check_path).await?;
+    })
+}
+
+async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
+    let WsState { engine, binaries } = state;
     let (mut sink, mut stream) = ws.split();
 
     // Hello
@@ -69,6 +57,8 @@ async fn handle_conn(stream: TcpStream, engine: UnboundedSender<EngineEvent>) ->
         protocol_version,
         client_id,
         device,
+        client_target,
+        client_sha256,
     } = hello
     else {
         bail!("first message was not hello");
@@ -101,6 +91,15 @@ async fn handle_conn(stream: TcpStream, engine: UnboundedSender<EngineEvent>) ->
         },
     )?))
     .await?;
+
+    if let Some(update) = binaries.update_for(client_target.as_deref(), client_sha256.as_deref()) {
+        tracing::info!(
+            "client {client_id} ({}) runs a stale binary, telling it to update",
+            client_target.as_deref().unwrap_or("?")
+        );
+        sink.send(Message::Text(serde_json::to_string(&update)?))
+            .await?;
+    }
 
     let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();

@@ -2,14 +2,19 @@
 //! Home Assistant replaced either by channels (fake) or by a mock HA WebSocket server.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use sdc_protocol::{ClientMessage, DeviceInfo, ImageFrame, ServerMessage, PROTOCOL_VERSION};
+use sdc_protocol::{
+    sha256_hex, ClientMessage, DeviceInfo, ImageFrame, ServerMessage, PROTOCOL_VERSION,
+};
+use sdc_server::clients::ClientBinaries;
 use sdc_server::engine::{self, EngineEvent};
 use sdc_server::ha::{self, EntityState, HaCommand, HaConfig, HaEvent};
-use sdc_server::ws;
+use sdc_server::http;
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::Message;
@@ -58,22 +63,36 @@ async fn start_server(
     tag: &str,
     ha_tx: UnboundedSender<HaCommand>,
 ) -> (UnboundedSender<EngineEvent>, String, TempDir) {
+    start_server_with(tag, ha_tx, ClientBinaries::default()).await
+}
+
+async fn start_server_with(
+    tag: &str,
+    ha_tx: UnboundedSender<HaCommand>,
+    binaries: ClientBinaries,
+) -> (UnboundedSender<EngineEvent>, String, TempDir) {
     let dir = TempDir::new(tag);
     let cfg = dir.0.join("config.lua");
     std::fs::write(&cfg, CONFIG).unwrap();
     let engine_tx = engine::spawn(cfg, Some(ha_tx));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    tokio::spawn(ws::serve(listener, engine_tx.clone()));
+    tokio::spawn(http::serve(listener, engine_tx.clone(), Arc::new(binaries)));
     (engine_tx, url, dir)
 }
 
 async fn connect(url: &str) -> Client {
+    connect_as(url, None, None).await
+}
+
+async fn connect_as(url: &str, target: Option<&str>, sha256: Option<&str>) -> Client {
     let (mut c, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let hello = ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
         client_id: "test".into(),
         device: device(),
+        client_target: target.map(Into::into),
+        client_sha256: sha256.map(Into::into),
     };
     c.send(Message::Text(serde_json::to_string(&hello).unwrap()))
         .await
@@ -194,6 +213,8 @@ async fn rejects_wrong_protocol_version() {
         protocol_version: 999,
         client_id: "x".into(),
         device: device(),
+        client_target: None,
+        client_sha256: None,
     };
     c.send(Message::Text(serde_json::to_string(&hello).unwrap()))
         .await
@@ -204,6 +225,103 @@ async fn rejects_wrong_protocol_version() {
             ServerMessage::Error { .. }
         )),
         other => panic!("expected error, got {other:?}"),
+    }
+}
+
+// ---- client distribution ------------------------------------------------
+
+/// Minimal HTTP/1.0 GET against `ws://addr/ws`-style server urls: (status, body).
+async fn http_get(ws_url: &str, path: &str) -> (u16, Vec<u8>) {
+    let addr = ws_url
+        .strip_prefix("ws://")
+        .unwrap()
+        .strip_suffix("/ws")
+        .unwrap();
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).await.unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, raw[split..].to_vec())
+}
+
+#[tokio::test]
+async fn serves_clients_installer_and_health() {
+    let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
+    let bin = b"\x7fELF fake client";
+    let (_e, url, _dir) =
+        start_server_with("http", ha_tx, ClientBinaries::with("aarch64-linux", bin)).await;
+
+    let (st, body) = http_get(&url, "/client/aarch64-linux").await;
+    assert_eq!((st, body.as_slice()), (200, &bin[..]));
+    let (st, body) = http_get(&url, "/client/aarch64-linux.sha256").await;
+    assert_eq!(st, 200);
+    assert_eq!(String::from_utf8(body).unwrap().trim(), sha256_hex(bin));
+    assert_eq!(http_get(&url, "/client/x86_64-linux").await.0, 404);
+    assert_eq!(http_get(&url, "/client/x86_64-linux.sha256").await.0, 404);
+
+    let (st, body) = http_get(&url, "/install.sh").await;
+    let script = String::from_utf8(body).unwrap();
+    assert!(st == 200 && script.starts_with("#!/bin/sh"));
+    // the embedded udev rule / unit must match the files they are sourced from
+    for f in [
+        include_str!("../../../deploy/pi/50-streamdeck.rules"),
+        include_str!("../../../deploy/pi/sdc-client.service"),
+    ] {
+        assert!(
+            script.contains(f),
+            "install.sh is out of sync with deploy/pi"
+        );
+    }
+
+    assert_eq!(http_get(&url, "/healthz").await, (200, b"ok".to_vec()));
+    assert_eq!(http_get(&url, "/nope").await.0, 404);
+}
+
+#[tokio::test]
+async fn stale_client_gets_update_after_welcome() {
+    let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
+    let bin = b"new client";
+    let (_e, url, _dir) =
+        start_server_with("stale", ha_tx, ClientBinaries::with("aarch64-linux", bin)).await;
+
+    let mut c = connect_as(&url, Some("aarch64-linux"), Some("deadbeef")).await;
+    match next_msg(&mut c).await {
+        Message::Text(t) => match serde_json::from_str(&t).unwrap() {
+            ServerMessage::Update { path, sha256 } => {
+                assert_eq!(path, "/client/aarch64-linux");
+                assert_eq!(sha256, sha256_hex(bin));
+            }
+            other => panic!("expected update, got {other:?}"),
+        },
+        other => panic!("expected update, got {other:?}"),
+    }
+    // the client is still served normally
+    assert!(next_frame(&mut c).await.0 < 15);
+}
+
+#[tokio::test]
+async fn up_to_date_unknown_and_old_clients_get_no_update() {
+    let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
+    let bin = b"new client";
+    let (_e, url, _dir) =
+        start_server_with("fresh", ha_tx, ClientBinaries::with("aarch64-linux", bin)).await;
+
+    let same = sha256_hex(bin);
+    for (target, sha) in [
+        (Some("aarch64-linux"), Some(same.as_str())), // matching hash
+        (Some("x86_64-linux"), Some("deadbeef")),     // no binary for that target
+        (Some("aarch64-macos"), Some("deadbeef")),
+        (Some("aarch64-linux"), None), // hash unknown
+        (None, None),                  // old client
+    ] {
+        let mut c = connect_as(&url, target, sha).await;
+        // first thing after Welcome is an image frame, never an Update
+        next_frame(&mut c).await;
     }
 }
 
