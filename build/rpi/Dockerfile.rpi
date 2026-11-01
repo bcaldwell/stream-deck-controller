@@ -1,8 +1,0 @@
-FROM rust:1.68.2-buster
-RUN rustup target add arm-unknown-linux-gnueabihf
-RUN cargo install cargo-deb
-ADD build-pi-armv6hf.sh /build-pi-armv6hf.sh
-
-RUN mkdir /build && \
-    mkdir /pi-tools && \
-    curl -L https://github.com/raspberrypi/tools/archive/648a6eeb1e3c2b40af4eb34d88941ee0edeb3e9a.tar.gz | tar xz --strip-components 1 -C /pi-tools

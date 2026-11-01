@@ -1,28 +1,103 @@
 version: "3"
 
+# Run inside the devShell (`nix develop` / direnv) so the pinned toolchain + zig are on PATH.
+
+# Local secrets (HA_TOKEN, SDC_CLIENT_TOKEN, ...) without relying on direnv having
+# reloaded; values already in the environment win.
+dotenv: [".env"]
+
+vars:
+  ARM: aarch64-unknown-linux-musl
+  X86: x86_64-unknown-linux-musl
+  IMAGE: stream-deck-controller:dev
+
 tasks:
   default:
     cmds:
       - task: build
 
   build:
+    desc: Build the whole workspace (debug)
     cmds:
-      - cargo build
+      - cargo build --workspace
+
+  test:
+    desc: Run all tests
+    cmds:
+      - cargo test --workspace
+
+  lint:
+    desc: fmt check + clippy -D warnings
+    cmds:
+      - cargo fmt --all -- --check
+      - cargo clippy --workspace --all-targets -- -D warnings
 
   run-server:
+    desc: Run the server against ./config.lua (needs HA_URL / HA_TOKEN)
     cmds:
-      - cargo run -p server
-    silent: true
-  build-server:
-    cmds:
-      - cargo build -p server
-    silent: true
+      - cargo run -p sdc-server -- config.lua
 
   run-client:
+    desc: Run the client against a local server (override with SDC_SERVER)
     cmds:
-      - cargo run -p client
-    silent: true
-  build-client:
+      - cargo run -p sdc-client -- {{.CLI_ARGS}}
+
+  run-fake-client:
+    desc: Run the client without hardware; images go to ./tmp/fake, type "press 3" on stdin
     cmds:
-      - cargo build -p client
-    silent: true
+      - cargo run -p sdc-client -- --fake-device --fake-out tmp/fake {{.CLI_ARGS}}
+
+  list-devices:
+    desc: List attached Stream Decks
+    cmds:
+      - cargo run -q -p sdc-client -- --list
+
+  build-pi:
+    desc: Static aarch64 client for the Raspberry Pi
+    cmds:
+      - cargo zigbuild --release --target {{.ARM}} -p sdc-client
+      - file target/{{.ARM}}/release/sdc-client
+
+  build-linux:
+    desc: Static server + client for aarch64 and x86_64 (musl)
+    cmds:
+      - cargo zigbuild --release --target {{.ARM}} -p sdc-server -p sdc-client
+      - cargo zigbuild --release --target {{.X86}} -p sdc-server -p sdc-client
+
+  docker:
+    desc: Build the server image locally (server and client binaries for both arches are staged in dist/)
+    deps: [build-linux]
+    cmds:
+      - mkdir -p dist/linux/amd64 dist/linux/arm64 dist/clients
+      - cp target/{{.X86}}/release/sdc-server dist/linux/amd64/sdc-server
+      - cp target/{{.ARM}}/release/sdc-server dist/linux/arm64/sdc-server
+      - cp target/{{.X86}}/release/sdc-client dist/clients/sdc-client-x86_64-linux
+      - cp target/{{.ARM}}/release/sdc-client dist/clients/sdc-client-aarch64-linux
+      - docker build -t {{.IMAGE}} .
+
+  pi:install:
+    desc: Build the Pi client, push it + the installer from this Mac and install it over ssh (HOST, SERVER; token from env SDC_CLIENT_TOKEN)
+    deps: [build-pi]
+    vars:
+      HOST: '{{.HOST | default "pi@192.168.2.81"}}'
+      SERVER: '{{.SERVER | default "wss://streamdeck.bcaldwell.co/ws"}}'
+    cmds:
+      # One ssh session runs the install under sudo, so there is a single password prompt.
+      # The token goes over ssh stdin into a 0600 file in a private temp dir (never on a
+      # command line, where `ps` could show it); install.sh deletes it and the dir is removed.
+      - |
+        set -eu
+        host='{{.HOST}}'
+        dir="$(ssh "$host" 'mktemp -d')"
+        scp -q target/{{.ARM}}/release/sdc-client deploy/pi/install.sh deploy/pi/50-streamdeck.rules deploy/pi/sdc-client.service "$host:$dir/"
+        token_arg=""
+        if [ -n "${SDC_CLIENT_TOKEN:-}" ]; then
+          printf '%s' "$SDC_CLIENT_TOKEN" | ssh "$host" "umask 077 && cat > '$dir/token'"
+          token_arg="--token-file '$dir/token'"
+        else
+          echo "SDC_CLIENT_TOKEN not set: keeping the token already on the Pi (if any)" >&2
+        fi
+        rc=0
+        ssh -t "$host" "sudo sh '$dir/install.sh' --server '{{.SERVER}}' $token_arg" || rc=$?
+        ssh "$host" "rm -rf '$dir'" || true
+        exit "$rc"

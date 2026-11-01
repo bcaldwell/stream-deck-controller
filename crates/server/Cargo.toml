@@ -1,0 +1,33 @@
+[package]
+name = "sdc-server"
+version.workspace = true
+edition.workspace = true
+description = "Stream Deck controller server: Home Assistant + Lua engine + key renderer"
+
+[lib]
+name = "sdc_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sdc-server"
+path = "src/main.rs"
+
+[dependencies]
+sdc-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+mlua = { version = "0.10", features = ["lua54", "vendored", "async", "serialize"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+ab_glyph = "0.2"
+notify = "6"
+clap = { version = "4", features = ["derive"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rusty-s3 = { version = "0.8", default-features = false }
+ureq = { version = "2", default-features = false, features = ["tls"] }
