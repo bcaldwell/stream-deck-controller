@@ -28,10 +28,29 @@ the network, and it never needs internet access. The install is pushed to it fro
    the service. Options: `--server URL`, `--token-file FILE` (or `--token TOKEN`, visible in `ps`),
    `--binary FILE`; on re-runs omitted `--server`/`--token` keep the existing values.
 4. Check: `journalctl -u sdc-client -f`. Change settings in `/etc/sdc-client.env`
-   (`SDC_SERVER`, `SDC_CLIENT_TOKEN`, `SDC_CLIENT_ID`, `SDC_BRIGHTNESS`, `SDC_NO_UPDATE`, `RUST_LOG`), then
+   (`SDC_SERVER`, `SDC_CLIENT_TOKEN`, `SDC_CLIENT_ID`, `SDC_BRIGHTNESS`, `SDC_USB_SUSPEND`, `SDC_NO_UPDATE`, `RUST_LOG`), then
    `sudo systemctl restart sdc-client`. A log line "server rejected token" means the token is wrong.
 
 Unplugging/replugging the deck or restarting the server is handled automatically.
+
+## Power: USB suspend
+
+On a battery the deck's USB link is the main load that can be switched off. While the server has the
+screen off (`sdc.idle` `off_after`, brightness 0) the client waits ~1s, then closes the device so
+nothing holds it open. The udev rule in `50-streamdeck.rules` sets `power/control=auto` and
+`power/autosuspend_delay_ms=2000` on the deck, so the kernel suspends it about 2s later (the screen
+is dark, the images are kept). The client then only reads `/sys/bus/usb/devices/*/power/runtime_status`
+(every 250ms, no privileges needed, does not wake the deck). A key press makes the deck wake itself
+(`active`); the client reopens it, redraws any images that changed meanwhile, and sends the server a
+`wake` message, which restores the brightness and restarts the idle timers. The press that woke the
+deck is not delivered as a key press, the same as any press on a dimmed deck. A brightness above 0
+from the server also reopens the deck right away. If the server connection drops while asleep the
+deck stays asleep until a press.
+
+An already-installed Pi needs `task pi:install` re-run once to get the udev rule (without it the
+deck never suspends; the client notices after 15s, logs a warning and keeps the device open).
+Turn the feature off with `SDC_USB_SUSPEND=false` in `/etc/sdc-client.env` (restart the service).
+It is Linux only; elsewhere, or if the deck's sysfs entry is not found, the device is never released.
 
 ## Updates
 

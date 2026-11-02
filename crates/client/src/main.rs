@@ -2,6 +2,7 @@
 
 mod device;
 mod session;
+mod sleep;
 mod update;
 
 use std::path::PathBuf;
@@ -59,6 +60,20 @@ struct Args {
     /// With --fake-device: write received images to this directory as key-<n>.jpg
     #[arg(long, env = "SDC_FAKE_OUT")]
     fake_out: Option<PathBuf>,
+
+    /// While the server has the screen off, close the device so the Stream Deck can USB-suspend
+    /// (saves power on battery; needs the udev rule from deploy/pi). A key press wakes it. Linux
+    /// only; default on there
+    #[arg(
+        long,
+        env = "SDC_USB_SUSPEND",
+        default_value_t = cfg!(target_os = "linux"),
+        value_parser = clap::builder::BoolishValueParser::new(),
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    usb_suspend: bool,
 
     /// Do not replace this binary when the server offers a different one
     #[arg(long, env = "SDC_NO_UPDATE")]
@@ -147,6 +162,7 @@ async fn main() -> Result<()> {
             .map_err(|e| warn!("cannot hash own executable, self-update disabled: {e:#}"))
             .ok(),
         auto_update: !args.no_update,
+        usb_suspend: args.usb_suspend,
     };
     info!(
         server = %cfg.server,

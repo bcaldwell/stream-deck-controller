@@ -14,6 +14,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{debug, error, info, warn};
 
 use crate::device::{Deck, DeviceEvent, KeyEvent};
+use crate::sleep::{self, Poll, Sleeper};
 
 /// If nothing (including pongs to our pings) arrives for this long, the link is dead.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -127,8 +128,12 @@ async fn offline_due(
     deck: &Deck,
     link: &mut Link,
     cache: &Cache,
+    sleeper: &Sleeper,
     now: Instant,
 ) -> Result<()> {
+    if sleeper.is_asleep() {
+        return Ok(()); // the device is released; whatever is due is drawn after it wakes
+    }
     if link.take_due(now) {
         show_offline(cfg, deck).await?;
     }
@@ -137,6 +142,84 @@ async fn offline_due(
             .await?;
     }
     Ok(())
+}
+
+/// When something is due for the link, unless the deck is asleep (nothing is drawn then).
+fn link_due(link: &Link, sleeper: &Sleeper) -> Option<Instant> {
+    if sleeper.is_asleep() {
+        None
+    } else {
+        link.wake_at()
+    }
+}
+
+fn is_device_error(deck: &Deck, e: &anyhow::Error) -> bool {
+    !deck.is_fake()
+        && e.downcast_ref::<elgato_streamdeck::StreamDeckError>()
+            .is_some()
+}
+
+/// Reopens the released device, draws the frames that arrived meanwhile, then applies `brightness`.
+async fn resume(
+    deck: &mut Deck,
+    sleeper: &mut Sleeper,
+    cache: &Cache,
+    brightness: Option<u8>,
+) -> Result<(), String> {
+    deck.reopen()
+        .await
+        .map_err(|e| format!("reopening the device failed: {e:#}"))?;
+    for key in sleeper.take_dirty() {
+        let Some(jpeg) = cache.get(&key) else {
+            continue;
+        };
+        if let Err(e) = deck.set_image_jpeg(key, jpeg).await {
+            if is_device_error(deck, &e) {
+                return Err(format!("device error: {e:#}"));
+            }
+            warn!(key, "image rejected: {e:#}");
+        }
+    }
+    if let Some(p) = brightness {
+        deck.set_brightness(p)
+            .await
+            .map_err(|e| format!("device error: {e:#}"))?;
+    }
+    Ok(())
+}
+
+/// Releases the device once the settle time after brightness 0 is over, and while asleep
+/// watches for the deck waking up. `Ok(true)`: it woke and the server (`connected`) should be
+/// told with [`ClientMessage::Wake`]. `Err`: the device is gone; look for it again.
+async fn sleep_step(
+    cfg: &Config,
+    deck: &mut Deck,
+    sleeper: &mut Sleeper,
+    cache: &Cache,
+    connected: bool,
+    now: Instant,
+) -> Result<bool, String> {
+    if sleeper.take_due(now) {
+        deck.release().await;
+        info!("screen off: released the deck so it can USB-suspend");
+        return Ok(false);
+    }
+    let path = deck.status_path().map(|p| p.to_path_buf());
+    match sleeper.poll(now, || path.as_deref().and_then(sleep::read_status)) {
+        Poll::Idle => Ok(false),
+        Poll::Woken => {
+            let plan =
+                sleep::wake_plan(connected, sleeper.take_pending_brightness(), cfg.brightness);
+            info!(connected, "deck woke from USB suspend");
+            resume(deck, sleeper, cache, plan.brightness).await?;
+            Ok(plan.send_wake)
+        }
+        Poll::GaveUp => {
+            warn!("deck did not USB-suspend (is the udev rule installed?); USB suspend disabled");
+            resume(deck, sleeper, cache, None).await?;
+            Ok(false)
+        }
+    }
 }
 
 /// A device event while disconnected: a press flashes the offline marker; nothing is sent.
@@ -170,6 +253,8 @@ pub struct Config {
     pub client_sha256: Option<String>,
     /// Apply `Update` messages from the server (`--no-update` turns this off).
     pub auto_update: bool,
+    /// Release the device while the screen is off so it can USB-suspend (Linux only).
+    pub usb_suspend: bool,
 }
 
 pub enum End {
@@ -228,10 +313,15 @@ pub async fn run(cfg: &Config, deck: &mut Deck) -> String {
     let mut backoff = Duration::from_millis(500);
     let mut link = Link::new(cfg.offline_after, Instant::now());
     let mut cache = Cache::new();
+    if cfg.usb_suspend && deck.status_path().is_none() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| info!("USB suspend not available for this device, keeping it open"));
+    }
+    let mut sleeper = Sleeper::new(cfg.usb_suspend && deck.status_path().is_some());
     loop {
         info!(server = %cfg.server, "connecting");
         let started = Instant::now();
-        let res = session(cfg, deck, &mut link, &mut cache).await;
+        let res = session(cfg, deck, &mut link, &mut cache, &mut sleeper).await;
         link.down(Instant::now());
         match res {
             Ok(End::Device(why)) => return why,
@@ -245,16 +335,25 @@ pub async fn run(cfg: &Config, deck: &mut Deck) -> String {
         info!(?backoff, "retrying");
         let wake = Instant::now() + backoff;
         loop {
-            let until = link.wake_at().map_or(wake, |d| d.min(wake));
+            let until = [link_due(&link, &sleeper), sleeper.next_at()]
+                .into_iter()
+                .flatten()
+                .fold(wake, Instant::min);
             tokio::select! {
                 _ = tokio::time::sleep_until(until) => {}
-                ev = deck.events.recv() => {
+                ev = deck.events.recv(), if !sleeper.is_asleep() => {
                     if let Err(e) = offline_event(deck, &mut link, &cache, ev).await {
                         return format!("device error: {e:#}");
                     }
                 }
             }
-            if let Err(e) = offline_due(cfg, deck, &mut link, &cache, Instant::now()).await {
+            if let Err(e) = sleep_step(cfg, deck, &mut sleeper, &cache, false, Instant::now()).await
+            {
+                return e;
+            }
+            if let Err(e) =
+                offline_due(cfg, deck, &mut link, &cache, &sleeper, Instant::now()).await
+            {
                 return format!("device error: {e:#}");
             }
             if Instant::now() >= wake {
@@ -265,7 +364,13 @@ pub async fn run(cfg: &Config, deck: &mut Deck) -> String {
     }
 }
 
-async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link, cache: &mut Cache) -> Result<End> {
+async fn session(
+    cfg: &Config,
+    deck: &mut Deck,
+    link: &mut Link,
+    cache: &mut Cache,
+    sleeper: &mut Sleeper,
+) -> Result<End> {
     let mut request = cfg.server.as_str().into_client_request()?;
     if let Some(token) = &cfg.token {
         request.headers_mut().insert(
@@ -278,15 +383,21 @@ async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link, cache: &mut Cac
     let connect = timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request));
     tokio::pin!(connect);
     let connected = loop {
-        let due = link.wake_at();
+        let due = [link_due(link, sleeper), sleeper.next_at()]
+            .into_iter()
+            .flatten()
+            .min();
         tokio::select! {
             r = &mut connect => break r,
             _ = async { tokio::time::sleep_until(due.unwrap()).await }, if due.is_some() => {
-                if let Err(e) = offline_due(cfg, deck, link, cache, Instant::now()).await {
+                if let Err(why) = sleep_step(cfg, deck, sleeper, cache, false, Instant::now()).await {
+                    return Ok(End::Device(why));
+                }
+                if let Err(e) = offline_due(cfg, deck, link, cache, sleeper, Instant::now()).await {
                     return Ok(End::Device(format!("device error: {e:#}")));
                 }
             }
-            ev = deck.events.recv() => {
+            ev = deck.events.recv(), if !sleeper.is_asleep() => {
                 if let Err(e) = offline_event(deck, link, cache, ev).await {
                     return Ok(End::Device(format!("device error: {e:#}")));
                 }
@@ -315,8 +426,14 @@ async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link, cache: &mut Cac
     };
     tx.send(Message::text(serde_json::to_string(&hello)?))
         .await?;
-    if let Err(e) = deck.set_brightness(cfg.brightness).await {
-        return Ok(End::Device(format!("device error: {e:#}")));
+    if sleeper.is_asleep() {
+        // stay asleep; the brightness is applied when a press wakes the deck
+        sleeper.set_pending_brightness(cfg.brightness);
+    } else {
+        sleeper.brightness(cfg.brightness, Instant::now());
+        if let Err(e) = deck.set_brightness(cfg.brightness).await {
+            return Ok(End::Device(format!("device error: {e:#}")));
+        }
     }
     // No clear here: the deck keeps its last images until the server's frames replace them.
 
@@ -325,8 +442,16 @@ async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link, cache: &mut Cac
     // One update attempt per connection, so an unwritable install does not retry in a loop.
     let mut update_tried = false;
     loop {
+        let sleep_at = sleeper.next_at();
         tokio::select! {
-            ev = deck.events.recv() => {
+            _ = async { tokio::time::sleep_until(sleep_at.unwrap()).await }, if sleep_at.is_some() => {
+                match sleep_step(cfg, deck, sleeper, cache, true, Instant::now()).await {
+                    Ok(true) => tx.send(Message::text(serde_json::to_string(&ClientMessage::Wake)?)).await?,
+                    Ok(false) => {}
+                    Err(why) => return Ok(End::Device(why)),
+                }
+            }
+            ev = deck.events.recv(), if !sleeper.is_asleep() => {
                 let msg = match ev {
                     Some(Ok(KeyEvent::Down(key))) => ClientMessage::KeyDown { key },
                     Some(Ok(KeyEvent::Up(key))) => ClientMessage::KeyUp { key },
@@ -347,8 +472,14 @@ async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link, cache: &mut Cac
                     Ok(Action::None) => {}
                     Ok(Action::Brightness(p)) => {
                         info!(percent = p, "brightness");
-                        if let Err(e) = deck.set_brightness(p).await {
-                            return Ok(End::Device(format!("device error: {e:#}")));
+                        if sleeper.brightness(p, Instant::now()) {
+                            if let Err(why) = resume(deck, sleeper, cache, Some(p)).await {
+                                return Ok(End::Device(why));
+                            }
+                        } else if !sleeper.is_asleep() {
+                            if let Err(e) = deck.set_brightness(p).await {
+                                return Ok(End::Device(format!("device error: {e:#}")));
+                            }
                         }
                     }
                     Ok(Action::Update { path, sha256 }) => {
@@ -376,12 +507,15 @@ async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link, cache: &mut Cac
                         }
                     }
                     Ok(Action::Image { key, jpeg }) => {
+                        let changed = cache.get(&key) != Some(&jpeg);
                         cache.insert(key, jpeg.clone());
-                        if let Err(e) = deck.set_image_jpeg(key, &jpeg).await {
-                            if deck.is_fake() || e.downcast_ref::<elgato_streamdeck::StreamDeckError>().is_none() {
+                        // while asleep the device is closed: drawn when it wakes
+                        if !sleeper.image(key, changed) {
+                            if let Err(e) = deck.set_image_jpeg(key, &jpeg).await {
+                                if is_device_error(deck, &e) {
+                                    return Ok(End::Device(format!("device error: {e:#}")));
+                                }
                                 warn!(key, "image rejected: {e:#}");
-                            } else {
-                                return Ok(End::Device(format!("device error: {e:#}")));
                             }
                         }
                     }

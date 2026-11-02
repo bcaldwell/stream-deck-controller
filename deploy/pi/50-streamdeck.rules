@@ -1,3 +1,6 @@
 # Allow non-root access to Elgato Stream Decks (vendor 0fd9) via hidraw/usb.
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", MODE="0666"
 SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", MODE="0666"
+# Let the deck USB-autosuspend after 2s of nothing holding it open. sdc-client closes it while the
+# screen is off (see deploy/pi/README.md); an open, reading client keeps it active.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0fd9", ATTR{power/control}="auto", ATTR{power/autosuspend_delay_ms}="2000"

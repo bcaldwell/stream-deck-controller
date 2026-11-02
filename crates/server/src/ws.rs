@@ -248,6 +248,9 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
                         Ok(ClientMessage::KeyUp { key }) if key < key_count => {
                             let _ = engine.send(EngineEvent::KeyUp { id, key });
                         }
+                        Ok(ClientMessage::Wake) => {
+                            let _ = engine.send(EngineEvent::Wake { id });
+                        }
                         Ok(_) => tracing::debug!("ignoring unexpected client message"),
                         Err(e) => tracing::warn!("bad client message: {e}"),
                     },

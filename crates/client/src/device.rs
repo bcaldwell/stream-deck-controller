@@ -27,7 +27,11 @@ pub type DeviceEvent = std::result::Result<KeyEvent, String>;
 
 enum Backend {
     Real(AsyncStreamDeck),
-    Fake { out_dir: Option<PathBuf> },
+    /// Closed on purpose so the USB device can suspend (see [`Deck::release`]).
+    Released,
+    Fake {
+        out_dir: Option<PathBuf>,
+    },
 }
 
 pub struct Deck {
@@ -35,6 +39,9 @@ pub struct Deck {
     backend: Backend,
     pub events: mpsc::Receiver<DeviceEvent>,
     reader: Option<JoinHandle<()>>,
+    kind: Option<Kind>,
+    /// sysfs `power/runtime_status` of the deck's USB device (Linux only).
+    status_path: Option<PathBuf>,
 }
 
 impl Drop for Deck {
@@ -79,15 +86,20 @@ impl Deck {
         let Some(d) = found.into_iter().next() else {
             bail!("no Stream Deck found");
         };
-        let serial = d.serial.clone();
-        let kind = d.kind;
+        Self::open(d.kind, d.serial).await
+    }
+
+    /// Open the deck of `kind` with this serial.
+    async fn open(kind: Kind, serial: String) -> Result<Deck> {
+        let connect_serial = serial.clone();
         let dev = tokio::task::spawn_blocking(move || -> Result<AsyncStreamDeck> {
             let hid = new_hidapi()?;
-            Ok(AsyncStreamDeck::connect(&hid, kind, &serial)?)
+            Ok(AsyncStreamDeck::connect(&hid, kind, &connect_serial)?)
         })
         .await??;
 
-        let info = device_info(kind, Some(d.serial));
+        let info = device_info(kind, Some(serial));
+        let info_serial = info.serial.clone();
         info!(model = %info.model, serial = ?info.serial, rows = info.rows, cols = info.cols,
               key_px = info.key_size_px, "opened Stream Deck");
 
@@ -121,7 +133,38 @@ impl Deck {
             backend: Backend::Real(dev),
             events: rx,
             reader: Some(reader),
+            kind: Some(kind),
+            status_path: if cfg!(target_os = "linux") {
+                crate::sleep::find_status_path(info_serial.as_deref())
+            } else {
+                None
+            },
         })
+    }
+
+    /// sysfs file holding the USB runtime power state; `None` where USB suspend cannot be
+    /// observed (fake deck, not Linux, sysfs entry not found).
+    pub fn status_path(&self) -> Option<&Path> {
+        self.status_path.as_deref()
+    }
+
+    /// Close the HID device and stop reading, so nothing keeps the USB device busy and the
+    /// kernel may autosuspend it. Its screen keeps (and shows) the last images until it suspends.
+    pub async fn release(&mut self) {
+        if let Some(h) = self.reader.take() {
+            h.abort();
+            let _ = h.await; // the reader holds a handle to the device until it is gone
+        }
+        self.backend = Backend::Released;
+    }
+
+    /// Open the same deck again after [`Deck::release`].
+    pub async fn reopen(&mut self) -> Result<()> {
+        let (Some(kind), Some(serial)) = (self.kind, self.info.serial.clone()) else {
+            bail!("cannot reopen this device");
+        };
+        *self = Self::open(kind, serial).await?;
+        Ok(())
     }
 
     /// A pretend 3x5, 72px deck. Key events come from stdin lines (see [`parse_fake_command`]).
@@ -161,6 +204,8 @@ impl Deck {
             backend: Backend::Fake { out_dir },
             events: rx,
             reader: Some(reader),
+            kind: None,
+            status_path: None,
         })
     }
 
@@ -182,6 +227,7 @@ impl Deck {
                 dev.set_button_image(key, img).await?;
                 dev.flush().await?;
             }
+            Backend::Released => bail!("device is released (asleep)"),
             Backend::Fake { out_dir } => {
                 // validate it decodes, then store the original bytes
                 decode_key_image(jpeg, self.info.key_size_px)?;
@@ -198,6 +244,7 @@ impl Deck {
         let percent = percent.min(100);
         match &self.backend {
             Backend::Real(dev) => dev.set_brightness(percent).await?,
+            Backend::Released => bail!("device is released (asleep)"),
             Backend::Fake { .. } => info!(percent, "fake: brightness"),
         }
         Ok(())
@@ -207,6 +254,7 @@ impl Deck {
     pub async fn clear(&self) -> Result<()> {
         match &self.backend {
             Backend::Real(dev) => dev.clear_all_button_images().await?,
+            Backend::Released => bail!("device is released (asleep)"),
             Backend::Fake { out_dir } => {
                 if let Some(dir) = out_dir {
                     for k in 0..self.info.key_count() {

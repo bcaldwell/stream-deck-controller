@@ -107,6 +107,10 @@ pub enum EngineEvent {
         id: ClientId,
         key: u8,
     },
+    /// The client woke from USB suspend: a wake-only key press (no button runs).
+    Wake {
+        id: ClientId,
+    },
     Ha(HaEvent),
     /// A background image download finished (key: the renderer's cache key).
     ImageFetched {
@@ -390,6 +394,7 @@ impl Engine {
             }
             EngineEvent::KeyDown { id, key } => self.key_event(id, key, true, now),
             EngineEvent::KeyUp { id, key } => self.key_event(id, key, false, now),
+            EngineEvent::Wake { id } => self.wake(id, now),
             EngineEvent::Tick => self.tick(now),
             EngineEvent::Ha(e) => self.ha_event(e),
             EngineEvent::ImageFetched { key, result } => {
@@ -553,6 +558,25 @@ impl Engine {
             }
         }
         for id in changed {
+            self.send_brightness(id);
+        }
+    }
+
+    /// A deck woke from USB suspend. Same as a wake-only press: restore the brightness of an
+    /// idle client, restart the idle clocks, run nothing.
+    fn wake(&mut self, id: ClientId, now: Instant) {
+        let id = match self.clients.get(&id) {
+            Some(v) if v.mirror => self.mirror_target(&v.client_id).unwrap_or(id),
+            _ => id,
+        };
+        let Some(c) = self.clients.get_mut(&id) else {
+            return;
+        };
+        c.last_activity = now;
+        c.last_press = now;
+        if c.power != Power::Active {
+            tracing::info!(client = %c.client_id, "woken from USB suspend");
+            c.power = Power::Active;
             self.send_brightness(id);
         }
     }
@@ -1318,6 +1342,27 @@ mod tests {
         e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0 + secs(4000));
         assert_eq!(e.clients[&1].page, "home");
         assert_eq!(brightness(&drain_out(&mut rx)), [60]);
+    }
+
+    #[test]
+    fn wake_message_wakes_without_running_buttons() {
+        let (mut e, mut rx, mut ha, _d) = setup(IDLE_CONFIG);
+        drain_out(&mut rx);
+        let t0 = Instant::now();
+        e.tick(t0 + secs(130));
+        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
+        e.handle_at(EngineEvent::Wake { id: 1 }, t0 + secs(131));
+        assert_eq!(brightness(&drain_out(&mut rx)), [80]);
+        assert!(ha.try_recv().is_err(), "no button ran");
+        // awake already: no brightness message, but the idle clock restarts
+        e.handle_at(EngineEvent::Wake { id: 1 }, t0 + secs(200));
+        assert!(brightness(&drain_out(&mut rx)).is_empty());
+        e.tick(t0 + secs(200 + 119));
+        assert!(brightness(&drain_out(&mut rx)).is_empty());
+        e.tick(t0 + secs(200 + 130));
+        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
+        // a Wake for an unknown client is ignored
+        e.handle_at(EngineEvent::Wake { id: 99 }, t0 + secs(400));
     }
 
     #[test]

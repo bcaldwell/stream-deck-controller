@@ -106,6 +106,10 @@ pub enum ClientMessage {
     KeyUp {
         key: u8,
     },
+    /// The deck woke from USB suspend (a key press brought it back; the press itself was not
+    /// seen). Handled like a key press on a dimmed/off deck that runs no button: the server
+    /// restores the active brightness and restarts the idle timers.
+    Wake,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
