@@ -1022,7 +1022,7 @@ fn tint_premul(img: &mut RgbaImage, tint: [u8; 3]) {
     for p in img.pixels_mut() {
         let a = if opaque {
             let [r, g, b, _] = p.0;
-            ((r as u32 * 299 + g as u32 * 587 + b as u32 * 114 + 500) / 1000)
+            (r as u32 * 299 + g as u32 * 587 + b as u32 * 114 + 500) / 1000
         } else {
             p.0[3] as u32
         };
