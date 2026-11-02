@@ -80,6 +80,9 @@ pub struct RenderSpec {
     pub fg: Color,
     /// Fit-with-padding picture over `bg` (local path, URL or bucket key).
     pub icon: Option<String>,
+    /// Recolours the `icon`'s visible pixels to this colour, keeping their alpha (an icon
+    /// without transparency uses its luminance as alpha). Never applied to `image`.
+    pub tint: Option<Color>,
     /// Full-bleed picture (scaled to cover the key); text is drawn on top of it.
     pub image: Option<String>,
     pub font_size: Option<f32>,
@@ -96,6 +99,7 @@ impl Default for RenderSpec {
             bg: Color([0x1c, 0x1c, 0x1e]),
             fg: Color::WHITE,
             icon: None,
+            tint: None,
             image: None,
             font_size: None,
             chevron: false,
@@ -147,8 +151,9 @@ impl Loaded {
 enum Fit {
     /// Cover a `w` x `h` rectangle, center-cropped.
     Cover(u32, u32),
-    /// An icon's visible part at exactly this size (the aspect ratio is already right).
-    Icon(u32, u32),
+    /// An icon's visible part at exactly this size (the aspect ratio is already right),
+    /// optionally recoloured.
+    Icon(u32, u32, Option<[u8; 3]>),
 }
 
 /// Pictures scaled for a key size, computed once per (source, fit) and shared between the
@@ -176,14 +181,13 @@ impl Scaled {
             self.computed.fetch_add(1, Ordering::Relaxed);
             Arc::new(match fit {
                 Fit::Cover(w, h) => cover(&src.img, w, h),
-                Fit::Icon(w, h) => {
+                Fit::Icon(w, h, tint) => {
                     let (x, y, vw, vh) = src.visible;
-                    resize_premul(
-                        &imageops::crop_imm(&src.img, x, y, vw, vh).to_image(),
-                        w,
-                        h,
-                        true,
-                    )
+                    let mut crop = imageops::crop_imm(&src.img, x, y, vw, vh).to_image();
+                    if let Some(t) = tint {
+                        tint_premul(&mut crop, t);
+                    }
+                    resize_premul(&crop, w, h, true)
                 }
             })
         })
@@ -305,6 +309,8 @@ pub struct Job {
     span: Option<SpanGeom>,
     image: Option<Img>,
     icon: Option<Img>,
+    /// The icon's tint, if any.
+    tint: Option<[u8; 3]>,
 }
 
 impl Job {
@@ -490,6 +496,7 @@ impl Renderer {
             span,
             image: spec.image.as_deref().map(|n| self.lookup(n)),
             icon: spec.icon.as_deref().map(|n| self.lookup(n)),
+            tint: spec.tint.map(|c| c.0),
         }
         .without_missing()
     }
@@ -732,7 +739,7 @@ impl Painter {
             Some(Img::Loading | Img::Missing) | None => {}
         }
         match (icon, icon_area) {
-            (Some(Img::Ready(im)), Some(area)) => self.draw_icon(&mut img, im, area),
+            (Some(Img::Ready(im)), Some(area)) => self.draw_icon(&mut img, im, area, job.tint),
             (Some(Img::Failed), Some(area)) => self.draw_err(&mut img, area, area),
             _ => {}
         }
@@ -775,14 +782,14 @@ impl Painter {
         img
     }
 
-    fn draw_icon(&self, img: &mut RgbImage, icon: &Loaded, area: Area) {
+    fn draw_icon(&self, img: &mut RgbImage, icon: &Loaded, area: Area, tint: Option<[u8; 3]>) {
         let (iw, ih) = (icon.visible.2 as f32, icon.visible.3 as f32);
         let k = (area.w / iw).min(area.h / ih);
         let (tw, th) = (
             ((iw * k).round() as u32).max(1),
             ((ih * k).round() as u32).max(1),
         );
-        let scaled = self.scaled.get(icon, Fit::Icon(tw, th));
+        let scaled = self.scaled.get(icon, Fit::Icon(tw, th, tint));
         let ox = (area.x + (area.w - tw as f32) / 2.0).round() as i64;
         let oy = (area.y + (area.h - th as f32) / 2.0).round() as i64;
         composite(img, &scaled, ox, oy);
@@ -992,6 +999,25 @@ fn premultiply(img: &mut RgbaImage) {
         for c in &mut p.0[..3] {
             *c = ((*c as u32 * a + 127) / 255) as u8;
         }
+    }
+}
+
+/// Recolours a premultiplied image to `tint`, keeping its alpha. An image with no transparent
+/// pixel has nothing to keep, so its luminance becomes the alpha (a white glyph on black
+/// stays a white-ish shape, dark areas fade out).
+fn tint_premul(img: &mut RgbaImage, tint: [u8; 3]) {
+    let opaque = img.pixels().all(|p| p.0[3] == 255);
+    for p in img.pixels_mut() {
+        let a = if opaque {
+            let [r, g, b, _] = p.0;
+            ((r as u32 * 299 + g as u32 * 587 + b as u32 * 114 + 500) / 1000)
+        } else {
+            p.0[3] as u32
+        };
+        for (c, t) in p.0[..3].iter_mut().zip(tint) {
+            *c = ((t as u32 * a + 127) / 255) as u8;
+        }
+        p.0[3] = a as u8;
     }
 }
 
@@ -1245,6 +1271,57 @@ mod tests {
         // tall pictures too
         let out = cover(&RgbaImage::new(30, 300), 72, 72);
         assert_eq!((out.width(), out.height()), (72, 72));
+    }
+
+    #[test]
+    fn tint_recolours_icons_keeping_alpha_and_never_images() {
+        // left half opaque white, right half half-transparent white
+        let mut glyph = RgbaImage::from_pixel(40, 40, image::Rgba([255, 255, 255, 255]));
+        for y in 0..40 {
+            for x in 20..40 {
+                glyph.put_pixel(x, y, image::Rgba([255, 255, 255, 128]));
+            }
+        }
+        // no transparency: luminance is the alpha (white -> solid, black -> gone)
+        let mut flat = RgbaImage::from_pixel(40, 40, image::Rgba([0, 0, 0, 255]));
+        for y in 10..30 {
+            for x in 10..30 {
+                flat.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let dir = png_dir("tint", &[("w.png", glyph), ("flat.png", flat)]);
+        let mut r = Renderer::new(dir);
+        let bg = Color([0x10, 0x10, 0x10]);
+        let spec = |name: &str, tint: Option<Color>, image: bool| RenderSpec {
+            icon: (!image).then(|| name.to_string()),
+            image: image.then(|| name.to_string()),
+            tint,
+            bg,
+            ..Default::default()
+        };
+        let t = Color([0xfa, 0xb3, 0x87]);
+        let img = r.render(&spec("w.png", Some(t), false), 72);
+        assert!(near(px(&img, 30, 36), t.0), "opaque part is the tint");
+        let half = px(&img, 42, 36);
+        assert!(half[0] > 0x10 && half[0] < 0xfa, "alpha kept: {half:?}");
+        assert!(near(px(&img, 1, 1), bg.0));
+
+        let flat_img = r.render(&spec("flat.png", Some(t), false), 72);
+        assert!(near(px(&flat_img, 36, 36), t.0), "white -> tint");
+        assert!(near(px(&flat_img, 1, 1), bg.0), "black -> transparent");
+
+        // untinted stays white; `image` ignores tint
+        let plain = r.render(&spec("w.png", None, false), 72);
+        assert!(near(px(&plain, 30, 36), [255, 255, 255]));
+        let full = r.render(&spec("w.png", Some(t), true), 72);
+        assert!(near(px(&full, 10, 10), [255, 255, 255]));
+
+        // one scaling per (icon, tint, size)
+        let n = r.scalings();
+        r.render(&spec("w.png", Some(t), false), 72);
+        assert_eq!(r.scalings(), n);
+        r.render(&spec("w.png", Some(Color([1, 2, 3])), false), 72);
+        assert_eq!(r.scalings(), n + 1);
     }
 
     #[test]
