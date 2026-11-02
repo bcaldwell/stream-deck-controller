@@ -1,18 +1,44 @@
 # stream-deck-controller
 
-Control Home Assistant from an Elgato Stream Deck, with the key layout and behaviour written in Lua.
+Control Home Assistant from a Stream Deck, with the key layout and behaviour written in Lua.
 
-## Architecture
+![The browser deck, rendered by the server](docs/images/deck-desktop.png)
 
+- **What**: a server that runs your Lua config, follows Home Assistant and renders every key; thin clients (a
+  Raspberry Pi with a real Stream Deck, any browser, Elgato's Stream Deck app via a plugin) just show the images and
+  report presses.
+- **Why**: one `config.lua` drives every deck, hot-reloads on save, and tracks Home Assistant state automatically:
+  a key re-renders only when an entity it read changes.
+- **Extras**: pages, album art spanning several keys, idle dim/off/home, icons from files, URLs, S3 or Home Assistant
+  artwork, USB suspend on the Pi, self-updating clients.
+
+## Quickstart
+
+```sh
+nix develop                      # pinned toolchain (or install Rust + task yourself)
+export HA_URL=https://homeassistant.local:8123 HA_TOKEN=...    # optional: without them keys just show no state
+task run-server                  # runs ./config.lua on :7700
+SDC_DECK_AUTH=none task run-server    # same, and lets you open http://127.0.0.1:7700/deck in a browser
 ```
- Stream Deck --USB--> sdc-client (Pi / Mac)  <--WebSocket /ws-->  sdc-server (Docker / k8s) <--> Home Assistant
-```
+
+Then edit [config.lua](config.lua) and watch the deck update. For a real deck run `task run-client`, set up a Pi with
+`task pi:install`, or deploy the server with Docker or Kubernetes.
+
+## Documentation
+
+- [Overview](docs/overview.md): architecture and feature tour
+- [Configuration guide](docs/configuration.md): writing `config.lua`
+- [Raspberry Pi deck](docs/pi.md), [Browser deck](docs/browser.md), [Elgato plugin](docs/plugin.md)
+- [Deployment](docs/deploy.md): Docker, Kubernetes, CI
+- Reference: [crates/server/README.md](crates/server/README.md) (full Lua API and environment variables)
+
+## Components
 
 - `crates/server` (`sdc-server`): talks to Home Assistant, runs the Lua config (`config.lua`), renders key
   images. Env: `SDC_CONFIG`, `HA_URL`, `HA_TOKEN`, `SDC_LISTEN` (default `0.0.0.0:7700`),
   `SDC_CLIENT_DIR` (client binaries to distribute), `SDC_CLIENT_TOKEN` (shared client secret), `SDC_ASSETS_S3_*`
   (icon bucket, see `crates/server/README.md`), `RUST_LOG`. It also defines and distributes the client
-  binary: see [Client distribution](#client-distribution).
+  binary: see [Client distribution](#client-distribution-and-auth).
 - `crates/client` (`sdc-client`): thin, static binary next to the deck. Sends key down/up, shows JPEG frames
   from the server, reconnects automatically (also handles deck unplug/replug).
 - `crates/protocol` (`sdc-protocol`): the wire contract (JSON text frames + binary image frames).
