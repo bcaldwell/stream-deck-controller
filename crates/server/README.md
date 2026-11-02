@@ -20,10 +20,10 @@ states (or the fake ones from `--states`, a JSON list of `{entity_id, state, att
 | `SDC_CONFIG` | `./config.lua`   | Lua config path (first CLI argument overrides) |
 | `HA_URL`     | -                | e.g. `http://homeassistant.local:8123` (`/api/websocket` and ws/wss derived) |
 | `HA_TOKEN`   | -                | Long-lived access token |
-| `SDC_LISTEN` | `0.0.0.0:7700`   | Client WebSocket listen address (path `/ws`) |
+| `SDC_LISTEN` | `0.0.0.0:7700`   | Listen address (clients on `/ws`, the Elgato plugin on `/plugin/ws`) |
 | `SDC_CLIENT_DIR` | `/usr/local/share/sdc/clients` | Dir of `sdc-client-<target>` binaries to distribute; missing = feature off |
 | `SDC_DECK_AUTH` | (SSO header required) | `none` disables the `/deck` login check (local development only; logged as a warning) |
-| `SDC_CLIENT_TOKEN` | - | Shared secret: `/ws` and `/client/*` need `Authorization: Bearer <token>`. Unset = open (logged as a warning) |
+| `SDC_CLIENT_TOKEN` | - | Shared secret: `/ws`, `/plugin/ws` and `/client/*` need `Authorization: Bearer <token>`. Unset = open (logged as a warning) |
 | `SDC_ASSETS_S3_ENDPOINT` | - | S3 endpoint for icon objects, e.g. `http://garage.garage.svc.cluster.local:3900` (in cluster) or `https://s3.example.com` |
 | `SDC_ASSETS_S3_BUCKET` | - | Bucket holding the images, e.g. `stream-deck-icons` |
 | `SDC_ASSETS_S3_REGION` | `garage` | S3 region used for signing |
@@ -123,6 +123,59 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3
   <= 256 px) when decoded, and scaled once per key size and cached until the next config reload.
   `RUST_LOG=sdc_server=debug` logs how long each render took.
 
+## Exports and dials (Elgato plugin)
+
+`sdc.export(id, item)` makes a button, span or dial available to the Elgato Stream Deck plugin
+(`plugins/elgato`) and returns `item` unchanged, so the same button can also sit in a page. Only exported
+things are visible to plugins. `id` is 1-64 characters of `A-Z a-z 0-9 _ - .` and must be unique; an invalid or
+duplicate id fails the config load (the previous config stays active). An optional `label = "..."` field on the
+button or dial is shown in the plugin's dropdown.
+```lua
+sdc.export("living_light", toggle("light.living_room", "Living", "#a87308"))
+
+sdc.export("living_dimmer", sdc.dial {
+  label = "Living room",
+  render = function(ctx)                       -- required; same dependency tracking as a button
+    local l = ha.state("light.living_room")
+    local pct = l and l.attributes.brightness and math.floor(l.attributes.brightness / 2.55 + 0.5) or 0
+    return { title = "Living", value = (l and l.state == "on") and (pct .. "%") or "off",
+             indicator = pct, icon = "icons/bulb.png", bg = "#000000" }
+  end,
+  rotate  = function(ctx, ticks)               -- once per plugin message (ticks batched over ~100 ms), may be negative
+    ha.call("light", "turn_on", { entity_id = "light.living_room", brightness_step_pct = ticks * 5 })
+  end,
+  press   = function(ctx) ha.call("light", "toggle", { entity_id = "light.living_room" }) end,
+  release = function(ctx) end,                 -- optional
+  touch   = function(ctx) end,                 -- optional: tap on the touch strip
+})
+```
+- `sdc.dial { render, rotate, press, release, touch }`: all handlers optional except `render`. `render` returns
+  `title`, `value` (strings or numbers), `indicator` (0-100, clamped), `icon` (same sources as button icons) and
+  `bg` (`#rrggbb`, behind the icon; default black). A Lua error shows `ERR` as the title and is logged. A dial
+  cannot be placed in a page (the config fails to load with a message saying so); it is only for export.
+- Exported keys render at the size the plugin subscribes with (144 px) as PNG, using the usual descriptor. An
+  exported `sdc.span` renders as a normal single key (the span size is ignored and `ctx.span_*` are absent).
+- `ctx` for exports has `client_id` (the plugin's id) and `slot` (the Elgato action instance); `key`, `page`, `rows`
+  and `cols` are absent. `ctx.goto_page` does nothing there (logged at debug level): plugins have no pages.
+- Every subscribed slot has its own render, dependencies and "changed" check, so a state change re-renders and
+  sends only the slots that read that entity, and only if the image actually changed. A config reload re-resolves
+  every slot by export id: a removed export (or one that changed kind) gives that slot a `SlotError`.
+
+## Plugin websocket (`/plugin/ws`)
+
+Same bearer-token auth as `/ws` (`SDC_CLIENT_TOKEN`); the SSO header does not open it. JSON text frames, defined
+in `crates/protocol` (`PluginClientMessage`, `PluginServerMessage`); `PROTOCOL_VERSION` stays 1. `slot` is the
+Elgato action context id.
+
+| Direction | Message |
+|-----------|---------|
+| plugin -> server | `plugin_hello {protocol_version, client_id}` first; `subscribe {slot, export, kind: "key"\|"dial", size_px}` (replaces an existing subscription of the slot); `unsubscribe {slot}`; `slot_down/slot_up {slot}`; `dial_rotate {slot, ticks}`; `dial_down/dial_up {slot}`; `touch_tap {slot}`; `list_exports` |
+| server -> plugin | `plugin_welcome`; `exports {items: [{id, kind, label?}]}` (after the welcome, on `list_exports` and on every config reload); `key_image {slot, png_base64}`; `dial_feedback {slot, title, value, indicator, icon_png_base64?}`; `slot_error {slot, message}`; `error {message}` |
+
+Images and feedback are only sent when they differ from what that slot last got. Input for a slot of the other
+kind, or for an unknown slot, is ignored. A press handler that raises an error turns that key's image into the
+red ERR tile until its next render. A connection may hold 256 slots; `size_px` must be 1-1024.
+
 ## Icons and images
 
 - `icon`: a picture fitted inside the key (with padding, aspect ratio kept) over `bg`; with `text`, the
@@ -196,4 +249,4 @@ sdc.page("music", {
 
 `ha.rs` HA websocket client (channel boundary), `engine.rs` event loop / per-client state /
 dependency map, `lua_api.rs` Lua bindings, `render.rs` JPEG key renderer (embedded Open Sans, OFL;
-see `assets/OFL.txt`), `assets.rs` image sources (files, URLs, S3 presigning) and the background fetcher, `ws.rs` client WebSocket, `http.rs` routes (client downloads, health) and token check, `clients.rs` distributed binaries, `watch.rs` hot reload, `preview.rs` `render` command.
+see `assets/OFL.txt`), `assets.rs` image sources (files, URLs, S3 presigning) and the background fetcher, `ws.rs` client and plugin WebSockets, `engine/plugin.rs` plugin slots (subscriptions, per-slot dependencies), `http.rs` routes (client downloads, health) and token check, `clients.rs` distributed binaries, `watch.rs` hot reload, `preview.rs` `render` command.

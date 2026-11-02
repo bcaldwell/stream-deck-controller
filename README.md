@@ -16,6 +16,9 @@ Control Home Assistant from an Elgato Stream Deck, with the key layout and behav
 - `crates/client` (`sdc-client`): thin, static binary next to the deck. Sends key down/up, shows JPEG frames
   from the server, reconnects automatically (also handles deck unplug/replug).
 - `crates/protocol` (`sdc-protocol`): the wire contract (JSON text frames + binary image frames).
+- `plugins/elgato`: an Elgato Stream Deck plugin, a client on `/plugin/ws`, for using server-defined buttons and
+  dials (`sdc.export`, `sdc.dial`) next to normal Elgato actions, including on a Stream Deck + attached to a
+  laptop running Elgato's app. See [plugins/elgato/README.md](plugins/elgato/README.md).
 
 ## Client distribution and auth
 
@@ -27,7 +30,7 @@ it, verifies the hash, replaces itself and exits so systemd restarts it. `--no-u
 this off. So the deployed server image decides which client version runs everywhere. The first install on a Pi is
 pushed from your Mac with `task pi:install` ([deploy/pi/README.md](deploy/pi/README.md)).
 
-If the server has `SDC_CLIENT_TOKEN` set, `/ws` and `/client/*` require `Authorization: Bearer <token>` (401
+If the server has `SDC_CLIENT_TOKEN` set, `/ws`, `/plugin/ws` and `/client/*` require `Authorization: Bearer <token>` (401
 otherwise; `/healthz` stays open). Clients take the same value via `--token` / `SDC_CLIENT_TOKEN`. Without it
 the server logs a warning and accepts everyone (fine for local development, not behind a public ingress).
 
@@ -41,6 +44,7 @@ task run-client        # real deck;  SDC_SERVER defaults to ws://127.0.0.1:7700/
 task run-fake-client   # no hardware: images -> tmp/fake/key-N.jpg, type "press 3" on stdin
 task list-devices      # which decks are detected
 task lint test         # fmt + clippy -D warnings, tests
+task plugin:build      # Elgato plugin (needs node, in the devShell); plugin:pack, plugin:link
 ```
 
 Client flags/env: `--server/SDC_SERVER`, `--client-id/SDC_CLIENT_ID` (default hostname),
@@ -53,7 +57,8 @@ pure-Rust Linux backend so the client builds as a static musl binary (see `vendo
 
 `task build-pi` / `task build-linux` produce static musl binaries via cargo-zigbuild. CI (`.github/workflows/ci.yml`)
 checks, builds, pushes the multi-arch server image (including both client binaries) to `ghcr.io/bcaldwell/stream-deck-controller`, and on `v*` tags
-publishes a GitHub Release with `sdc-{server,client}-{aarch64,x86_64}-linux`.
+publishes a GitHub Release with `sdc-{server,client}-{aarch64,x86_64}-linux` and the Elgato plugin
+(`ca.bcaldwell.sdc.streamDeckPlugin`, also a build artifact of every run).
 
 ## Deploying
 

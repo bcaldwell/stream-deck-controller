@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+	<head lang="en">
+		<title>SDC Button settings</title>
+		<meta charset="utf-8" />
+		<script src="https://sdpi-components.dev/releases/v4/sdpi-components.js"></script>
+	</head>
+
+	<body>
+		<sdpi-item label="Export">
+			<sdpi-select setting="export" datasource="getExports" hot-reload loading="Loading exports..." placeholder="Choose a button"></sdpi-select>
+		</sdpi-item>
+		<sdpi-item label="Or type id">
+			<sdpi-textfield setting="exportManual" placeholder="export id (overrides the list)"></sdpi-textfield>
+		</sdpi-item>
+		<sdpi-item label="Server URL">
+			<sdpi-textfield global setting="url" placeholder="wss://your-server/plugin/ws"></sdpi-textfield>
+		</sdpi-item>
+		<sdpi-item label="Token">
+			<sdpi-password global setting="token"></sdpi-password>
+		</sdpi-item>
+	</body>
+</html>

@@ -1,0 +1,19 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"lib": ["ES2023"],
+		"module": "ES2022",
+		"moduleResolution": "Bundler",
+		"customConditions": ["node"],
+		"types": ["node"],
+		"strict": true,
+		"noImplicitOverride": true,
+		"noUncheckedIndexedAccess": true,
+		"erasableSyntaxOnly": false,
+		"skipLibCheck": true,
+		"esModuleInterop": true,
+		"noEmit": false
+	},
+	"include": ["src/**/*.ts"],
+	"exclude": ["node_modules"]
+}

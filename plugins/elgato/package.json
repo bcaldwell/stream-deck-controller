@@ -1,0 +1,35 @@
+{
+  "name": "sdc-elgato-plugin",
+  "version": "0.1.0",
+  "description": "Elgato Stream Deck plugin: use stream-deck-controller buttons and dials next to normal Elgato actions",
+  "scripts": {
+    "build": "rollup -c",
+    "watch": "rollup -c -w --watch.onEnd=\"streamdeck restart ca.bcaldwell.sdc\"",
+    "typecheck": "tsc --noEmit",
+    "pack": "npm run build && streamdeck validate ca.bcaldwell.sdc.sdPlugin && streamdeck pack ca.bcaldwell.sdc.sdPlugin --output . --force",
+    "link": "streamdeck link ca.bcaldwell.sdc.sdPlugin",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@elgato/streamdeck": "^3.0.4",
+    "ws": "^8.22.1"
+  },
+  "devDependencies": {
+    "@elgato/cli": "^1.10.4",
+    "@elgato/utils": "^0.6.2",
+    "@rollup/plugin-commonjs": "^29.0.3",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-terser": "^1.0.2",
+    "@rollup/plugin-typescript": "^12.3.1",
+    "@types/node": "^24.19.2",
+    "@types/ws": "^8.18.2",
+    "rollup": "^4.67.4",
+    "tslib": "^2.9.1",
+    "typescript": "^5.9.3"
+  },
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.5.1"
+  }
+}

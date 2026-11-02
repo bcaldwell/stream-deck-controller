@@ -1,0 +1,72 @@
+{
+	"Name": "Stream Deck Controller",
+	"Version": "0.1.0.0",
+	"Author": "Benjamin Caldwell",
+	"Actions": [
+		{
+			"Name": "SDC Button",
+			"UUID": "ca.bcaldwell.sdc.button",
+			"Icon": "imgs/actions/button/icon",
+			"Tooltip": "A button defined on your stream-deck-controller server (sdc.export).",
+			"PropertyInspectorPath": "ui/button.html",
+			"Controllers": [
+				"Keypad"
+			],
+			"States": [
+				{
+					"Image": "imgs/actions/button/key",
+					"ShowTitle": false
+				}
+			]
+		},
+		{
+			"Name": "SDC Dial",
+			"UUID": "ca.bcaldwell.sdc.dial",
+			"Icon": "imgs/actions/dial/icon",
+			"Tooltip": "A dial defined on your stream-deck-controller server (sdc.export of an sdc.dial).",
+			"PropertyInspectorPath": "ui/dial.html",
+			"Controllers": [
+				"Encoder"
+			],
+			"Encoder": {
+				"layout": "$B1",
+				"Icon": "imgs/actions/dial/encoder",
+				"TriggerDescription": {
+					"Rotate": "Adjust",
+					"Push": "Press",
+					"Touch": "Tap"
+				}
+			},
+			"States": [
+				{
+					"Image": "imgs/actions/dial/key",
+					"ShowTitle": false
+				}
+			]
+		}
+	],
+	"Category": "Stream Deck Controller",
+	"CategoryIcon": "imgs/plugin/category-icon",
+	"CodePath": "bin/plugin.js",
+	"Description": "Use buttons and dials defined on your stream-deck-controller server next to normal Stream Deck actions.",
+	"Icon": "imgs/plugin/marketplace",
+	"SDKVersion": 3,
+	"Software": {
+		"MinimumVersion": "7.1"
+	},
+	"OS": [
+		{
+			"Platform": "mac",
+			"MinimumVersion": "12"
+		},
+		{
+			"Platform": "windows",
+			"MinimumVersion": "10"
+		}
+	],
+	"Nodejs": {
+		"Version": "24",
+		"Debug": "enabled"
+	},
+	"UUID": "ca.bcaldwell.sdc"
+}

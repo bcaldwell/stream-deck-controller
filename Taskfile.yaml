@@ -75,6 +75,29 @@ tasks:
       - cp target/{{.ARM}}/release/sdc-client dist/clients/sdc-client-aarch64-linux
       - docker build -t {{.IMAGE}} .
 
+  plugin:build:
+    desc: Build the Elgato Stream Deck plugin into plugins/elgato/ca.bcaldwell.sdc.sdPlugin
+    dir: plugins/elgato
+    cmds:
+      - npm ci
+      - npm run typecheck
+      - npm run build
+
+  plugin:pack:
+    desc: Build and package the plugin as plugins/elgato/ca.bcaldwell.sdc.streamDeckPlugin (double-click to install)
+    dir: plugins/elgato
+    cmds:
+      - npm ci
+      - npm run pack
+
+  plugin:link:
+    desc: Build the plugin and link it into the local Stream Deck app for development (`npm run watch` in plugins/elgato rebuilds and restarts it)
+    dir: plugins/elgato
+    cmds:
+      - npm ci
+      - npm run build
+      - npm run link
+
   pi:install:
     desc: Build the Pi client, push it + the installer from this Mac and install it over ssh (HOST, SERVER; token from env SDC_CLIENT_TOKEN)
     deps: [build-pi]

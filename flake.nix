@@ -26,6 +26,8 @@
             pkgs.cargo-zigbuild
             pkgs.zig
             pkgs.go-task
+            # builds plugins/elgato (the Stream Deck app runs the plugin on its own Node)
+            pkgs.nodejs_22
             pkgs.pkg-config
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.udev ];
           RUST_BACKTRACE = "1";

@@ -63,6 +63,29 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  plugin:
+    name: elgato plugin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/elgato
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: plugins/elgato/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      # builds, validates the manifest and packs ca.bcaldwell.sdc.streamDeckPlugin
+      - run: npm run pack
+      - uses: actions/upload-artifact@v7
+        with:
+          name: elgato-plugin
+          path: plugins/elgato/ca.bcaldwell.sdc.streamDeckPlugin
+          if-no-files-found: error
+
   docker:
     name: docker image
     needs: [check, build]
@@ -166,7 +189,7 @@ jobs:
   release:
     name: GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, build]
+    needs: [check, build, plugin]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -176,9 +199,13 @@ jobs:
           pattern: binaries-*
           path: release
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: elgato-plugin
+          path: release
       - name: Checksums
         working-directory: release
-        run: sha256sum sdc-* > checksums.txt
+        run: sha256sum -- sdc-* *.streamDeckPlugin > checksums.txt
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
