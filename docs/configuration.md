@@ -272,8 +272,9 @@ sdc.button { render = { text = "Quiet" }, feedback = false, press = function() e
 It does not flash for a press that only woke the display, a press that called `ctx.goto_page` (the page change is the
 feedback), a button without `press`, or a span.
 
-**Navigation chevron.** `chevron = true` in a render descriptor draws a small, subtle "›" in the top-right corner to
-mark a key that changes page. It does not affect the layout of the label or icon.
+**Navigation chevron.** `chevron = true` (or `"forward"`) in a render descriptor draws a faint "›" in the
+bottom-right corner of a key that opens another page; `chevron = "back"` draws "‹" in the top-left for a key that
+goes back (e.g. Home). On an icon-only key the icon shrinks slightly and moves away from the chevron so it has room.
 
 ```lua
 sdc.button {

@@ -13,7 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use sdc_protocol::{ExportItem, SlotKind, DEVICE_TYPES};
 
 use crate::ha::{EntityState, HaCommand};
-use crate::render::{Color, RenderSpec};
+use crate::render::{Chevron, Color, RenderSpec};
 
 pub fn lerr(e: mlua::Error) -> anyhow::Error {
     anyhow!("{e}")
@@ -1149,7 +1149,17 @@ fn parse_spec(v: &Value) -> mlua::Result<RenderSpec> {
     spec.icon = t.get("icon")?;
     spec.image = t.get("image")?;
     spec.font_size = t.get("font_size")?;
-    spec.chevron = t.get::<Option<bool>>("chevron")?.unwrap_or(false);
+    spec.chevron = match t.get::<Value>("chevron")? {
+        Value::Nil | Value::Boolean(false) => Chevron::None,
+        Value::Boolean(true) => Chevron::Forward,
+        Value::String(v) if v.to_str()? == "forward" => Chevron::Forward,
+        Value::String(v) if v.to_str()? == "back" => Chevron::Back,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "chevron: expected true, false, \"forward\" or \"back\", got {other:?}"
+            )))
+        }
+    };
     Ok(spec)
 }
 

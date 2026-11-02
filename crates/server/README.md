@@ -103,7 +103,7 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3
 
 - Render descriptor: `text` (`\n` allowed; wraps and auto-shrinks), `bg`/`fg` (`#rgb`, `#rrggbb`),
   `icon` and `image` (see [Icons and images](#icons-and-images)), `font_size` (px at a 72 px key, scaled with the key's size; auto-fit when absent),
-  `chevron = true` (a small, subtle "›" in the top-right corner to mark a key that changes page; it does not affect the layout).
+  `chevron = true | "forward" | "back"` (a faint "›" in the bottom-right corner for a key that opens another page, or "‹" in the top-left for one that goes back; on an icon-only key the icon shrinks slightly and moves away from it).
 - Press feedback: after a `press` handler finishes without a Lua error, the key shows a white ring for 400 ms (physical, browser and
   Elgato plugin keys). Not shown for presses that only wake the display, that call `ctx.goto_page`, for buttons without `press`, for
   spans, or when turned off globally with `sdc.feedback(false)` or per button with `feedback = false` in `sdc.button{}`.

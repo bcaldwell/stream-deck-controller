@@ -32,6 +32,12 @@ const TEXT_FONT: f32 = 0.2;
 const TEXT_FONT_MULTI: f32 = 0.21;
 /// Box (fraction of the shorter side, centered) for a key with only an icon.
 const ICON_ONLY: f32 = 0.66;
+/// On a key with a chevron the icon box is scaled by this and moved this far (fraction of
+/// the key) away from the chevron: up for forward (bottom right), down for back (top left).
+const CHEVRON_ICON: f32 = 0.82;
+const CHEVRON_SHIFT: f32 = 0.05;
+/// Chevron opacity: a hint, not a glyph.
+const CHEVRON_ALPHA: f32 = 0.35;
 /// Alpha at or below this counts as empty when trimming an icon's transparent border.
 const TRIM_ALPHA: u8 = 8;
 /// How long a failed download is remembered before it is tried again.
@@ -83,8 +89,9 @@ pub struct RenderSpec {
     /// Full-bleed picture (scaled to cover the key); text is drawn on top of it.
     pub image: Option<String>,
     pub font_size: Option<f32>,
-    /// Small "›" in the top-right corner, marking a key that changes page.
-    pub chevron: bool,
+    /// Small chevron marking a key that changes page: "›" bottom right (forward), "‹" top left
+    /// (back).
+    pub chevron: Chevron,
     /// Press feedback: a white ring around the key (set by the engine, not by Lua).
     pub flash: bool,
 }
@@ -98,7 +105,7 @@ impl Default for RenderSpec {
             icon: None,
             image: None,
             font_size: None,
-            chevron: false,
+            chevron: Chevron::None,
             flash: false,
         }
     }
@@ -651,10 +658,15 @@ impl Painter {
             w: w as f32 - 2.0 * pad,
             h: h as f32 - 2.0 * pad,
         };
-        let box_ = s * ICON_ONLY;
+        // a chevron gets room of its own: the icon shrinks a little and moves away from it
+        let (box_, shift) = match spec.chevron {
+            Chevron::None => (s * ICON_ONLY, 0.0),
+            Chevron::Forward => (s * ICON_ONLY * CHEVRON_ICON, -s * CHEVRON_SHIFT),
+            Chevron::Back => (s * ICON_ONLY * CHEVRON_ICON, s * CHEVRON_SHIFT),
+        };
         let icon_only = Area {
             x: (w as f32 - box_) / 2.0,
-            y: (h as f32 - box_) / 2.0,
+            y: (h as f32 - box_) / 2.0 + shift,
             w: box_,
             h: box_,
         };
@@ -765,8 +777,8 @@ impl Painter {
             self.draw_text(&mut img, text, area, spec.fg, font_size, text_max, bottom);
         }
         if job.span.is_none() {
-            if spec.chevron {
-                draw_chevron(&mut img);
+            if spec.chevron != Chevron::None {
+                draw_chevron(&mut img, spec.chevron);
             }
             if spec.flash {
                 draw_ring(&mut img);
@@ -1024,13 +1036,35 @@ fn segment_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     ((p.0 - a.0 - t * dx).powi(2) + (p.1 - a.1 - t * dy).powi(2)).sqrt()
 }
 
-/// A subtle "›" (about 12% of the key, semi-transparent white) in the top-right corner.
-fn draw_chevron(img: &mut RgbImage) {
+/// Navigation marker on a key, see [`RenderSpec::chevron`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Chevron {
+    #[default]
+    None,
+    /// "›" in the bottom-right corner: opens another page.
+    Forward,
+    /// "‹" in the top-left corner: goes back.
+    Back,
+}
+
+/// A subtle chevron (about 12% of the key, faint white): forward bottom right, back top left.
+fn draw_chevron(img: &mut RgbImage, kind: Chevron) {
     let s = img.width().min(img.height()) as f32;
     let h = s * 0.12;
-    let (x1, y0) = (img.width() as f32 - s * 0.07, s * 0.06);
-    let x0 = x1 - h * 0.5;
+    let y0 = match kind {
+        Chevron::Back => s * 0.06,
+        _ => img.height() as f32 - s * 0.06 - h,
+    };
+    // the chevron's open side (x0) and its tip (x1)
+    let (x0, x1) = match kind {
+        Chevron::Back => (s * 0.07 + h * 0.5, s * 0.07),
+        _ => {
+            let x1 = img.width() as f32 - s * 0.07;
+            (x1 - h * 0.5, x1)
+        }
+    };
     let (a, tip, b) = ((x0, y0), (x1, y0 + h / 2.0), (x0, y0 + h));
+    let (x0, x1) = (x0.min(x1), x0.max(x1));
     let half = (s * 0.025).max(0.8);
     let (xs, xe) = ((x0 - half - 1.0).max(0.0) as u32, (x1 + half + 1.0) as u32);
     let (ys, ye) = (
@@ -1043,7 +1077,11 @@ fn draw_chevron(img: &mut RgbImage) {
             let d = segment_dist(p, a, tip).min(segment_dist(p, tip, b));
             let cover = (half + 0.5 - d).clamp(0.0, 1.0);
             if cover > 0.0 {
-                blend(img.get_pixel_mut(x, y), [255, 255, 255], cover * 0.6);
+                blend(
+                    img.get_pixel_mut(x, y),
+                    [255, 255, 255],
+                    cover * CHEVRON_ALPHA,
+                );
             }
         }
     }
@@ -1738,8 +1776,13 @@ mod tests {
         (y0..y1).any(|y| (x0..x1).any(|x| img.get_pixel(x, y).0[0] > 100))
     }
 
+    /// Any pixel in the box noticeably above black (the chevron is faint by design).
+    fn faint(img: &RgbImage, x0: u32, y0: u32, x1: u32, y1: u32) -> bool {
+        (y0..y1).any(|y| (x0..x1).any(|x| img.get_pixel(x, y).0[0] > 40))
+    }
+
     #[test]
-    fn chevron_draws_in_the_top_right_corner_only() {
+    fn chevrons_draw_in_their_corner_only() {
         let mut r = Renderer::new(PathBuf::from("/nonexistent"));
         let plain = RenderSpec {
             bg: Color::BLACK,
@@ -1749,13 +1792,22 @@ mod tests {
         assert!(!lit(&img, 0, 0, 72, 72));
         let img = r.render_image(
             &RenderSpec {
-                chevron: true,
+                chevron: Chevron::Forward,
+                ..plain.clone()
+            },
+            72,
+        );
+        assert!(faint(&img, 56, 56, 70, 69), "forward chevron bottom right");
+        assert!(!faint(&img, 0, 0, 50, 72) && !faint(&img, 0, 0, 72, 52));
+        let img = r.render_image(
+            &RenderSpec {
+                chevron: Chevron::Back,
                 ..plain
             },
             72,
         );
-        assert!(lit(&img, 56, 3, 70, 16), "chevron in the corner");
-        assert!(!lit(&img, 0, 0, 50, 72) && !lit(&img, 0, 20, 72, 72));
+        assert!(faint(&img, 2, 3, 16, 16), "back chevron top left");
+        assert!(!faint(&img, 22, 0, 72, 72) && !faint(&img, 0, 20, 72, 72));
     }
 
     #[test]
