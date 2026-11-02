@@ -33,7 +33,7 @@ enum Command {
         /// Output directory
         #[arg(long, default_value = "preview")]
         out: PathBuf,
-        /// Page to render (default: the config's default page)
+        /// Page to render (default: the first device's home page)
         #[arg(long)]
         page: Option<String>,
         /// JSON file with a list of fake HA states ({entity_id, state, attributes}) to render with

@@ -42,7 +42,7 @@ sdc.page("home", {
   },
   false,                                   -- empty key
 })
-sdc.default_page("home")                   -- optional; default is the first page defined
+sdc.device("deck", { pages = { "home" } })  -- required: at least one device shows the pages (see Devices)
 ```
 
 `render` is a table, a string, or a function returning one. The fields:
@@ -103,14 +103,13 @@ end
 
 ```lua
 sdc.page("media", { ... })
-sdc.default_page("home")
 ```
 
 - Switch pages from a handler with `ctx.goto_page("media")`. Each deck has its own current page.
 - The server remembers each client's page by `client_id`, so a deck that reconnects (server redeploy, client
   update) returns to where it was, unless that page no longer exists.
-- `sdc.idle { home_after = 3600 }` sends a deck back to the default page after that many seconds without a press
-  (see [Idle](#idle-dimming-and-power)).
+- A device's `idle = { home_after = 3600 }` sends a deck back to the device's home page after that many seconds
+  without a press (see [Idle](#idle-dimming-and-power)).
 
 ## Spans
 
@@ -174,15 +173,20 @@ config are prefetched on every load.
 
 ## Idle, dimming and power
 
+Brightness and idle timers belong to a [device](#devices):
+
 ```lua
-sdc.brightness(60)                                    -- active brightness, 0-100
-sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }   -- seconds
+sdc.device("office", {
+  pages = { "home" },
+  brightness = 60,                                    -- active brightness, 0-100 (default 60)
+  idle = { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 },   -- seconds
+})
 ```
 
 - After `dim_after` seconds without a press the deck is dimmed to `dim_brightness` (default 10); after
-  `off_after` the backlight goes off (brightness 0). Both optional. Without `sdc.idle` a deck never idles.
+  `off_after` the backlight goes off (brightness 0). Both optional. A device without `idle` never idles.
 - The next press restores the brightness and is consumed: it only wakes the deck, its handlers do not run.
-- `home_after` returns the deck to the default page after that many seconds without a press, even while the
+- `home_after` returns the deck to the device's home page after that many seconds without a press, even while the
   display is off, so waking shows the home page.
 - The Pi client turns "backlight off" into a USB suspend, see [Raspberry Pi deck](pi.md#power-saving).
 
@@ -216,8 +220,9 @@ a page; it is export-only. Full details in [crates/server/README.md](../crates/s
 
 Pages are global. A *device* is a named set of them: it says which pages a deck can show, where it starts, and
 optionally its own brightness and idle settings. Use devices when several decks share one config, for example a
-Stream Deck Plus in the office that needs different pages than the Mk.2 in the living room. A config without
-`sdc.device` behaves exactly as described above: every deck sees every page.
+Stream Deck Plus in the office that needs different pages than the Mk.2 in the living room. A config must define at
+least one `sdc.device`; without one it fails to load. (`sdc.default_page`, `sdc.idle` and `sdc.brightness` no longer
+exist: calling them is an error, set the same things on the device. `sdc.key_gap` and `sdc.feedback` stay global.)
 
 ```lua
 local home  = sdc.page("home", { ... })   -- sdc.page and sdc.device return handles
@@ -226,8 +231,8 @@ local media = sdc.page("media", { ... })
 local living = sdc.device("living-room", {
   pages = { home, media },         -- handles or names; must exist; order does not matter
   home = home,                     -- start page, must be in pages (default: the first of pages)
-  brightness = 60,                 -- optional, like sdc.brightness
-  idle = { dim_after = 120, off_after = 600, home_after = 3600 },   -- optional, like sdc.idle
+  brightness = 60,                 -- optional, 0-100 (default 60)
+  idle = { dim_after = 120, off_after = 600, home_after = 3600 },   -- optional; absent: never idles
 })
 local office = sdc.device("office", { pages = { home } })
 
@@ -253,12 +258,10 @@ else.
 2. The `sdc.default_device` entry for the client's type.
 3. The `"*"` entry.
 4. The first `sdc.device` defined.
-5. With no devices defined at all, the legacy behaviour: every page, `sdc.default_page`, the global settings.
 
 Details:
 
-- A device's `brightness` and `idle` replace the global `sdc.brightness` and `sdc.idle` when set (the `idle` table as
-  a whole, not field by field). `sdc.default_page` is only used when there are no devices.
+- A device without `brightness` uses 60; one without `idle` never dims, switches off or goes home on its own.
 - `ctx.goto_page` to a page outside the client's device is logged and ignored.
 - The device's `home` is the start page, the target of `home_after`, and the fallback when a remembered page is not
   on the device (also after a config reload). A deck that reconnects and lands on a different device than before
@@ -266,7 +269,7 @@ Details:
 - A config reload re-resolves the device of every connected client. A mirror viewer uses the mirrored deck's device.
   Elgato plugin exports are not affected by devices.
 - These fail the load, keeping the previous config: an unknown page in `pages`, a `home` not in `pages`, duplicate
-  device names, or `sdc.default_device` naming an unknown device or type.
+  device names, a config without any `sdc.device`, or `sdc.default_device` naming an unknown device or type.
 
 ## Feedback & navigation markers
 
@@ -300,9 +303,6 @@ A small but complete config:
 ```lua
 local sdc = require("sdc")
 
-sdc.brightness(60)
-sdc.idle { dim_after = 120, off_after = 600, home_after = 3600 }
-
 sdc.page("home", {
   sdc.button {
     render = function()
@@ -312,6 +312,12 @@ sdc.page("home", {
     end,
     press = function() ha.call("light", "toggle", { entity_id = "light.office" }) end,
   },
+})
+
+sdc.device("office", {
+  pages = { "home" },
+  brightness = 60,
+  idle = { dim_after = 120, off_after = 600, home_after = 3600 },
 })
 ```
 

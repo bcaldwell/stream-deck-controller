@@ -139,52 +139,47 @@ pub struct SpanCell {
     pub error: Option<String>,
 }
 
-/// `sdc.idle{...}`: dim, then switch the display off, after this long without a key press;
-/// `home_after` returns the client to the default page. With none set a client never idles.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// A device's `idle = {...}`: dim, then switch the display off, after this long without a key
+/// press; `home_after` returns the client to the device's home page. With none set a client
+/// never idles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdleConfig {
     pub dim_after: Option<Duration>,
     /// Brightness while dimmed (percent).
     pub dim_brightness: u8,
     pub off_after: Option<Duration>,
-    /// Back to the default page after this long without a key press (also bounds how long a
+    /// Back to the home page after this long without a key press (also bounds how long a
     /// disconnected client's page is remembered).
     pub home_after: Option<Duration>,
 }
 
-/// Brightness restored on wake when the config has no `sdc.brightness`.
+impl Default for IdleConfig {
+    fn default() -> Self {
+        Self {
+            dim_after: None,
+            dim_brightness: DEFAULT_DIM_BRIGHTNESS,
+            off_after: None,
+            home_after: None,
+        }
+    }
+}
+
+/// Brightness of a device that sets no `brightness`.
 pub const DEFAULT_BRIGHTNESS: u8 = 60;
 const DEFAULT_DIM_BRIGHTNESS: u8 = 10;
 
-/// Device-wide settings from the config (`sdc.idle`, `sdc.brightness`).
+/// Config-wide settings (`sdc.key_gap`, `sdc.feedback`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
-    pub idle: IdleConfig,
-    /// `sdc.brightness`, if set; clients are told about it on connect and on wake.
-    pub brightness: Option<u8>,
     /// `sdc.key_gap`: default gap between keys for spans (px at 72 px keys).
     pub key_gap: Option<u32>,
     /// `sdc.feedback`: flash a key after its press handler ran (default true).
     pub feedback: bool,
 }
 
-impl Settings {
-    /// Brightness of an awake display.
-    pub fn active_brightness(&self) -> u8 {
-        self.brightness.unwrap_or(DEFAULT_BRIGHTNESS)
-    }
-}
-
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            idle: IdleConfig {
-                dim_after: None,
-                dim_brightness: DEFAULT_DIM_BRIGHTNESS,
-                off_after: None,
-                home_after: None,
-            },
-            brightness: None,
             key_gap: None,
             feedback: true,
         }
@@ -199,15 +194,15 @@ pub struct DeviceDef {
     pub pages: Vec<String>,
     /// Start/default page; one of `pages`.
     pub home: String,
-    pub brightness: Option<u8>,
-    /// Replaces the global `sdc.idle` for this device when set.
-    pub idle: Option<IdleConfig>,
+    /// Active brightness (percent); [`DEFAULT_BRIGHTNESS`] when the device sets none.
+    pub brightness: u8,
+    /// Dim/off/home timers; the default never idles.
+    pub idle: IdleConfig,
 }
 
 #[derive(Default)]
 struct Registry {
     pages: Vec<(String, Vec<Option<ButtonDef>>)>,
-    default: Option<String>,
     devices: Vec<DeviceDef>,
     /// `sdc.default_device`: device type (or `*`) -> device name.
     default_devices: Vec<(String, String)>,
@@ -238,6 +233,20 @@ pub struct RenderOutcome {
     pub error: Option<String>,
 }
 
+/// Test configs rarely care about devices: wraps `src` so that, unless it defines an
+/// `sdc.device` itself, one named "test" lists every page it defined (a config without pages gets an empty page `__none`). The prelude stays on
+/// the first line so error line numbers are unchanged.
+#[cfg(test)]
+pub(crate) fn test_config(src: &str) -> String {
+    format!(
+        "local __pages, __dev, __page, __device = {{}}, false, sdc.page, sdc.device; \
+         sdc.page = function(n, ...) __pages[#__pages + 1] = n; return __page(n, ...) end; \
+         sdc.device = function(...) __dev = true; return __device(...) end; {src}\n\
+         if not __dev then if #__pages == 0 then __page('__none', {{}}); __pages[1] = '__none' end; \
+         __device('test', {{ pages = __pages }}) end"
+    )
+}
+
 pub struct LuaRuntime {
     lua: Lua,
     host: Rc<Host>,
@@ -259,12 +268,20 @@ impl LuaRuntime {
         Ok(rt)
     }
 
-    /// Loads config source from a string (tests).
-    pub fn load_str(src: &str, host: Rc<Host>) -> Result<Self> {
+    /// Loads config source from a string, exactly as written (tests of the loader itself).
+    #[cfg(test)]
+    pub(crate) fn load_raw(src: &str, host: Rc<Host>) -> Result<Self> {
         let rt = Self::new(host, None)?;
         rt.lua.load(src).set_name("=config").exec().map_err(lerr)?;
         rt.validate_devices()?;
         Ok(rt)
+    }
+
+    /// Like [`LuaRuntime::load_raw`], but a config that defines no `sdc.device` gets one named
+    /// "test" showing every page it defined (see [`test_config`]).
+    #[cfg(test)]
+    pub(crate) fn load_str(src: &str, host: Rc<Host>) -> Result<Self> {
+        Self::load_raw(&test_config(src), host)
     }
 
     fn new(host: Rc<Host>, dir: Option<&Path>) -> Result<Self> {
@@ -278,13 +295,6 @@ impl LuaRuntime {
         })
     }
 
-    pub fn default_page(&self) -> Option<String> {
-        let r = self.registry.borrow();
-        r.default
-            .clone()
-            .or_else(|| r.pages.first().map(|(n, _)| n.clone()))
-    }
-
     pub fn settings(&self) -> Settings {
         self.registry.borrow().settings
     }
@@ -293,6 +303,9 @@ impl LuaRuntime {
     /// has run (pages may be defined after the devices that use them).
     fn validate_devices(&self) -> Result<()> {
         let r = self.registry.borrow();
+        if r.devices.is_empty() {
+            bail!("the config defines no sdc.device; add at least one (see docs/configuration.md#devices)");
+        }
         for d in &r.devices {
             for p in &d.pages {
                 if !r.pages.iter().any(|(n, _)| n == p) {
@@ -315,20 +328,14 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Whether the config defines any `sdc.device` (otherwise everything works as before devices).
-    pub fn has_devices(&self) -> bool {
-        !self.registry.borrow().devices.is_empty()
-    }
-
     /// The device a connecting client gets: the requested name if it exists, else
-    /// `sdc.default_device` for its `kind` then `*`, else the first `sdc.device`. `None` when
-    /// the config has no devices (legacy behaviour).
-    pub fn resolve_device(&self, requested: Option<&str>, kind: &str) -> Option<DeviceDef> {
+    /// `sdc.default_device` for its `kind` then `*`, else the first `sdc.device`.
+    pub fn resolve_device(&self, requested: Option<&str>, kind: &str) -> DeviceDef {
         let r = self.registry.borrow();
         let find = |name: &str| r.devices.iter().find(|d| d.name == name);
         if let Some(name) = requested {
             match find(name) {
-                Some(d) => return Some(d.clone()),
+                Some(d) => return d.clone(),
                 None => tracing::warn!("requested device '{name}' is not defined, using default"),
             }
         }
@@ -342,6 +349,7 @@ impl LuaRuntime {
             })
             .or_else(|| r.devices.first())
             .cloned()
+            .expect("validated: at least one device")
     }
 
     /// A defined device by name.
@@ -818,32 +826,16 @@ fn install(
         })?,
     )?;
 
-    let reg = registry.clone();
-    sdc.set(
-        "default_page",
-        lua.create_function(move |_, name: String| {
-            reg.borrow_mut().default = Some(name);
-            Ok(())
-        })?,
-    )?;
-
-    let reg = registry.clone();
-    sdc.set(
-        "brightness",
-        lua.create_function(move |_, percent: i64| {
-            reg.borrow_mut().settings.brightness = Some(percent_arg("sdc.brightness", percent)?);
-            Ok(())
-        })?,
-    )?;
-
-    let reg = registry.clone();
-    sdc.set(
-        "idle",
-        lua.create_function(move |_, t: Table| {
-            reg.borrow_mut().settings.idle = idle_arg("sdc.idle", &t)?;
-            Ok(())
-        })?,
-    )?;
+    for name in ["default_page", "idle", "brightness"] {
+        sdc.set(
+            name,
+            lua.create_function(move |_, _: mlua::MultiValue| -> mlua::Result<()> {
+                Err(mlua::Error::runtime(format!(
+                    "sdc.{name} was removed; set it on the sdc.device instead"
+                )))
+            })?,
+        )?;
+    }
 
     let reg = registry.clone();
     sdc.set(
@@ -860,8 +852,8 @@ fn install(
             }
             let mut pages: Vec<String> = Vec::new();
             let mut home = None;
-            let mut brightness = None;
-            let mut idle = None;
+            let mut brightness = DEFAULT_BRIGHTNESS;
+            let mut idle = IdleConfig::default();
             for pair in t.pairs::<String, Value>() {
                 let (k, v) = pair?;
                 match (k.as_str(), v) {
@@ -880,9 +872,9 @@ fn install(
                         home = Some(name_ref(&h, "page", &format!("{what}: 'home'"))?)
                     }
                     ("brightness", Value::Integer(i)) => {
-                        brightness = Some(percent_arg(&format!("{what}: 'brightness'"), i)?)
+                        brightness = percent_arg(&format!("{what}: 'brightness'"), i)?
                     }
-                    ("idle", Value::Table(i)) => idle = Some(idle_arg(&what, &i)?),
+                    ("idle", Value::Table(i)) => idle = idle_arg(&what, &i)?,
                     ("pages", _) => {
                         return Err(mlua::Error::runtime(format!(
                             "{what}: 'pages' must be a list of pages (handles or names)"
@@ -900,7 +892,7 @@ fn install(
                     }
                     ("idle", _) => {
                         return Err(mlua::Error::runtime(format!(
-                            "{what}: 'idle' must be a table like sdc.idle's"
+                            "{what}: 'idle' must be a table like {{ dim_after = 120, off_after = 600 }}"
                         )))
                     }
                     _ => {
@@ -1088,7 +1080,7 @@ fn percent_arg(what: &str, v: i64) -> mlua::Result<u8> {
         .ok_or_else(|| mlua::Error::runtime(format!("{what}: {v} is not a percentage (0-100)")))
 }
 
-/// Parses the table of `sdc.idle` (and a device's `idle`).
+/// Parses a device's `idle` table.
 fn idle_arg(what: &str, t: &Table) -> mlua::Result<IdleConfig> {
     let mut idle = IdleConfig {
         dim_brightness: DEFAULT_DIM_BRIGHTNESS,
@@ -1245,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn pages_and_defaults() {
+    fn pages_and_buttons() {
         let rt = LuaRuntime::load_str(
             r#"
             local sdc = require("sdc")
@@ -1255,18 +1247,11 @@ mod tests {
             Host::new(None),
         )
         .unwrap();
-        assert_eq!(rt.default_page().as_deref(), Some("a"));
         assert_eq!(rt.page_names(), ["a", "b"]);
         assert!(rt.button("a", 0).is_some());
         assert!(rt.button("a", 1).is_none());
         assert!(rt.button("a", 2).is_some());
         assert!(rt.button("a", 3).is_none());
-        let rt2 = LuaRuntime::load_str(
-            r#"sdc.page("x", {}) sdc.page("y", {}) sdc.default_page("y")"#,
-            Host::new(None),
-        )
-        .unwrap();
-        assert_eq!(rt2.default_page().as_deref(), Some("y"));
     }
 
     #[test]
@@ -1316,8 +1301,8 @@ mod tests {
             (d.pages.as_slice(), d.home.as_str()),
             (&["home".to_string(), "other".to_string()][..], "other")
         );
-        assert_eq!(rt.resolve_device(None, "mk2").unwrap().name, "deck");
-        assert_eq!(rt.resolve_device(None, "browser").unwrap().name, "web");
+        assert_eq!(rt.resolve_device(None, "mk2").name, "deck");
+        assert_eq!(rt.resolve_device(None, "browser").name, "web");
         let goto = |key| {
             rt.press(&rt.button("home", key).unwrap(), &info("home", key), true)
                 .unwrap()
@@ -1437,29 +1422,68 @@ mod tests {
     }
 
     #[test]
-    fn idle_and_brightness_settings() {
-        let rt = LuaRuntime::load_str("", Host::new(None)).unwrap();
-        assert_eq!(rt.settings(), Settings::default());
-        assert_eq!(rt.settings().active_brightness(), DEFAULT_BRIGHTNESS);
+    fn device_idle_and_brightness() {
         let rt = LuaRuntime::load_str(
-            "sdc.idle { dim_after = 120, off_after = 600.5, home_after = 3600 } sdc.brightness(40)",
+            r#"sdc.page("p", {})
+               sdc.device("a", { pages = { "p" }, brightness = 40,
+                                 idle = { dim_after = 120, off_after = 600.5, home_after = 3600 } })
+               sdc.device("b", { pages = { "p" } })"#,
             Host::new(None),
         )
         .unwrap();
-        let s = rt.settings();
-        assert_eq!(s.idle.dim_after, Some(Duration::from_secs(120)));
-        assert_eq!(s.idle.off_after, Some(Duration::from_millis(600_500)));
-        assert_eq!(s.idle.home_after, Some(Duration::from_secs(3600)));
-        assert_eq!(s.idle.dim_brightness, 10);
-        assert_eq!(s.active_brightness(), 40);
+        let a = rt.device("a").unwrap();
+        assert_eq!(a.brightness, 40);
+        assert_eq!(a.idle.dim_after, Some(Duration::from_secs(120)));
+        assert_eq!(a.idle.off_after, Some(Duration::from_millis(600_500)));
+        assert_eq!(a.idle.home_after, Some(Duration::from_secs(3600)));
+        assert_eq!(a.idle.dim_brightness, 10);
+        // nothing set: never idles, default brightness
+        let b = rt.device("b").unwrap();
+        assert_eq!(b.brightness, DEFAULT_BRIGHTNESS);
+        assert_eq!(b.idle, IdleConfig::default());
+        assert_eq!(rt.settings(), Settings::default());
         for bad in [
-            "sdc.brightness(101)",
-            "sdc.idle { dim_after = 0 }",
-            "sdc.idle { dim_brightness = 200 }",
-            "sdc.idle { dim_aftr = 5 }",
-            "sdc.idle { home_after = -1 }",
+            "brightness = 101",
+            "idle = { dim_after = 0 }",
+            "idle = { dim_brightness = 200 }",
+            "idle = { dim_aftr = 5 }",
+            "idle = { home_after = -1 }",
         ] {
-            assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
+            let src =
+                format!(r#"sdc.page("p", {{}}) sdc.device("d", {{ pages = {{ "p" }}, {bad} }})"#);
+            assert!(
+                LuaRuntime::load_str(&src, Host::new(None)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_device_is_a_load_error() {
+        for src in ["", r#"sdc.page("p", {})"#] {
+            let e = LuaRuntime::load_raw(src, Host::new(None)).err().unwrap();
+            assert!(
+                format!("{e:#}").contains("the config defines no sdc.device; add at least one"),
+                "{e:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_functions_are_errors() {
+        for f in ["default_page", "idle", "brightness"] {
+            for args in ["()", "('x')", "{ dim_after = 5 }", "(40)"] {
+                let src = format!(
+                    r#"sdc.page("p", {{}}) sdc.device("d", {{ pages = {{ "p" }} }}) sdc.{f}{args}"#
+                );
+                let e = LuaRuntime::load_raw(&src, Host::new(None)).err().unwrap();
+                assert!(
+                    format!("{e:#}").contains(&format!(
+                        "sdc.{f} was removed; set it on the sdc.device instead"
+                    )),
+                    "{src}: {e:#}"
+                );
+            }
         }
     }
 
@@ -1478,21 +1502,19 @@ mod tests {
         .unwrap();
         let a = rt.device("a").unwrap();
         assert_eq!(a.pages, ["p", "q"]);
-        assert_eq!((a.home.as_str(), a.brightness), ("q", Some(40)));
-        assert_eq!(a.idle.unwrap().dim_after, Some(Duration::from_secs(5)));
+        assert_eq!((a.home.as_str(), a.brightness), ("q", 40));
+        assert_eq!(a.idle.dim_after, Some(Duration::from_secs(5)));
         let b = rt.device("b").unwrap();
         assert_eq!(
             (b.home.as_str(), b.idle),
-            ("q", None),
+            ("q", IdleConfig::default()),
             "home defaults to the first page"
         );
-        let name = |req, kind| rt.resolve_device(req, kind).map(|d| d.name);
-        assert_eq!(name(Some("a"), "mk2").as_deref(), Some("a"));
-        assert_eq!(name(None, "mk2").as_deref(), Some("b"));
-        assert_eq!(name(None, "xl").as_deref(), Some("a"));
-        assert_eq!(name(Some("zzz"), "mk2").as_deref(), Some("b"));
-        let rt = LuaRuntime::load_str("sdc.page('p', {})", Host::new(None)).unwrap();
-        assert!(!rt.has_devices() && rt.resolve_device(Some("a"), "mk2").is_none());
+        let name = |req, kind| rt.resolve_device(req, kind).name;
+        assert_eq!(name(Some("a"), "mk2"), "a");
+        assert_eq!(name(None, "mk2"), "b");
+        assert_eq!(name(None, "xl"), "a");
+        assert_eq!(name(Some("zzz"), "mk2"), "b");
     }
 
     #[test]
