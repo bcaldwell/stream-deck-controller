@@ -311,6 +311,7 @@ async fn session(cfg: &Config, deck: &mut Deck, link: &mut Link, cache: &mut Cac
         device: deck.info.clone(),
         client_target: sdc_protocol::client_target().map(str::to_string),
         client_sha256: cfg.client_sha256.clone(),
+        mirror: None,
     };
     tx.send(Message::text(serde_json::to_string(&hello)?))
         .await?;
@@ -515,6 +516,7 @@ mod tests {
             device: crate::device::device_info(elgato_streamdeck::info::Kind::Original, None),
             client_target: Some("aarch64-linux".into()),
             client_sha256: None,
+            mirror: None,
         };
         let s = serde_json::to_string(&hello).unwrap();
         assert!(s.contains(r#""type":"hello""#) && s.contains(r#""key_size_px":72"#));

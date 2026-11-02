@@ -33,6 +33,21 @@ pub enum Out {
     Frame(Frame),
     /// Percent 0-100 (0 = display off).
     Brightness(u8),
+    /// The connection cannot be served (e.g. the deck to mirror does not exist); the engine
+    /// drops the connection's channel right after.
+    Error(String),
+}
+
+/// A connected deck, for the browser's device picker (`GET /deck/api/clients`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DeckInfo {
+    pub client_id: String,
+    pub model: String,
+    pub rows: u8,
+    pub cols: u8,
+    pub page: String,
+    /// A deck of its own in a browser (as opposed to a physical Stream Deck).
+    pub web: bool,
 }
 
 /// How often the engine checks clients for idleness.
@@ -48,12 +63,25 @@ enum Power {
 
 pub enum EngineEvent {
     ClientConnected {
+        /// A browser deck rather than a physical one (only shown differently in listings).
+        web: bool,
         id: ClientId,
         client_id: String,
         device: DeviceInfo,
         tx: UnboundedSender<Out>,
     },
+    /// A browser that mirrors the deck of client `mirror`: it gets that deck's page rendered at
+    /// its own key size, and its key events act on the mirrored deck. `device` supplies only the
+    /// key size; the grid is the mirrored deck's.
+    ViewerConnected {
+        id: ClientId,
+        mirror: String,
+        device: DeviceInfo,
+        tx: UnboundedSender<Out>,
+    },
     ClientDisconnected(ClientId),
+    /// The connected decks (not viewers), for the device picker.
+    ListClients(tokio::sync::oneshot::Sender<Vec<DeckInfo>>),
     KeyDown {
         id: ClientId,
         key: u8,
@@ -74,7 +102,12 @@ pub enum EngineEvent {
 }
 
 struct Client {
+    /// For a viewer, the id of the deck it mirrors.
     client_id: String,
+    web: bool,
+    /// Set for a viewer: it follows the page of the deck named `client_id`, has no power state
+    /// of its own and its key events are handled as the mirrored deck's.
+    mirror: bool,
     device: DeviceInfo,
     tx: UnboundedSender<Out>,
     page: String,
@@ -189,6 +222,7 @@ impl Engine {
     pub fn handle_at(&mut self, ev: EngineEvent, now: Instant) {
         match ev {
             EngineEvent::ClientConnected {
+                web,
                 id,
                 client_id,
                 device,
@@ -207,7 +241,7 @@ impl Engine {
                 let prev = self
                     .clients
                     .values()
-                    .find(|c| c.client_id == client_id)
+                    .find(|c| !c.mirror && c.client_id == client_id)
                     .map(|c| (c.page.clone(), c.last_press))
                     .or_else(|| self.remembered.remove(&client_id));
                 let (page, last_press) = match prev {
@@ -222,7 +256,9 @@ impl Engine {
                 self.clients.insert(
                     id,
                     Client {
-                        client_id,
+                        client_id: client_id.clone(),
+                        web,
+                        mirror: false,
                         device,
                         tx,
                         page,
@@ -237,13 +273,87 @@ impl Engine {
                     self.send_brightness(id);
                 }
                 self.render_client(id);
+                // Viewers left behind by a previous connection of this deck follow it again.
+                self.sync_viewers(&client_id);
+            }
+            EngineEvent::ViewerConnected {
+                id,
+                mirror,
+                mut device,
+                tx,
+            } => {
+                // The live deck, else the page it left behind.
+                let live = self.mirror_target(&mirror);
+                let page = match live {
+                    Some(t) => self
+                        .clients
+                        .get(&t)
+                        .map(|c| (c.page.clone(), c.device.clone())),
+                    None => self
+                        .remembered
+                        .get(&mirror)
+                        .map(|(p, _)| (p.clone(), device.clone())),
+                };
+                let Some((page, grid)) = page else {
+                    tracing::warn!("viewer asked to mirror unknown client {mirror}");
+                    let _ = tx.send(Out::Error(format!("no such deck: {mirror}")));
+                    return;
+                };
+                tracing::info!(
+                    "viewer connected, mirroring {mirror} @ {}px",
+                    device.key_size_px
+                );
+                device.rows = grid.rows;
+                device.cols = grid.cols;
+                let sent = vec![None; device.key_count() as usize];
+                self.clients.insert(
+                    id,
+                    Client {
+                        client_id: mirror,
+                        web: true,
+                        mirror: true,
+                        device,
+                        tx,
+                        page,
+                        last_activity: now,
+                        last_press: now,
+                        power: Power::Active,
+                        swallow_up: HashSet::new(),
+                        sent,
+                    },
+                );
+                self.render_client(id);
+            }
+            EngineEvent::ListClients(reply) => {
+                let _ = reply.send(
+                    self.clients
+                        .values()
+                        .filter(|c| !c.mirror)
+                        .map(|c| DeckInfo {
+                            client_id: c.client_id.clone(),
+                            model: c.device.model.clone(),
+                            rows: c.device.rows,
+                            cols: c.device.cols,
+                            page: c.page.clone(),
+                            web: c.web,
+                        })
+                        .collect(),
+                );
             }
             EngineEvent::ClientDisconnected(id) => {
                 if let Some(c) = self.clients.remove(&id) {
-                    tracing::info!("client {} disconnected", c.client_id);
-                    // A newer connection of the same client already took over its page.
-                    if !self.clients.values().any(|o| o.client_id == c.client_id) {
-                        self.remembered.insert(c.client_id, (c.page, c.last_press));
+                    if c.mirror {
+                        tracing::info!("viewer of {} disconnected", c.client_id);
+                    } else {
+                        tracing::info!("client {} disconnected", c.client_id);
+                        // A newer connection of the same client already took over its page.
+                        if !self
+                            .clients
+                            .values()
+                            .any(|o| !o.mirror && o.client_id == c.client_id)
+                        {
+                            self.remembered.insert(c.client_id, (c.page, c.last_press));
+                        }
                     }
                 }
                 self.drop_deps(|(cid, _)| *cid == id);
@@ -279,6 +389,42 @@ impl Engine {
         }
         if let Some(c) = self.clients.get_mut(&id) {
             c.page = page.to_string();
+            let client_id = (!c.mirror).then(|| c.client_id.clone());
+            self.render_client(id);
+            if let Some(client_id) = client_id {
+                self.sync_viewers(&client_id);
+            }
+        }
+    }
+
+    /// The live (non-viewer) connection of deck `client_id`.
+    fn mirror_target(&self, client_id: &str) -> Option<ClientId> {
+        self.clients
+            .iter()
+            .rev()
+            .find(|(_, c)| !c.mirror && c.client_id == client_id)
+            .map(|(id, _)| *id)
+    }
+
+    /// Makes the viewers of deck `client_id` show its current page.
+    fn sync_viewers(&mut self, client_id: &str) {
+        let Some(page) = self
+            .mirror_target(client_id)
+            .and_then(|t| self.clients.get(&t))
+            .map(|c| c.page.clone())
+        else {
+            return;
+        };
+        let stale: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.mirror && c.client_id == client_id && c.page != page)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some(v) = self.clients.get_mut(&id) {
+                v.page = page.clone();
+            }
             self.render_client(id);
         }
     }
@@ -340,7 +486,8 @@ impl Engine {
     /// Sends the brightness that matches the client's current power state.
     fn send_brightness(&mut self, id: ClientId) {
         let settings = self.settings();
-        if let Some(c) = self.clients.get_mut(&id) {
+        // Viewers never dim: the mirrored deck's power state is not theirs.
+        if let Some(c) = self.clients.get_mut(&id).filter(|c| !c.mirror) {
             let _ = c.tx.send(Out::Brightness(level(&settings, c.power)));
         }
     }
@@ -355,7 +502,9 @@ impl Engine {
         let home: Vec<_> = self
             .clients
             .iter()
-            .filter(|(_, c)| c.page != default && home_due(idle.home_after, c.last_press, now))
+            .filter(|(_, c)| {
+                !c.mirror && c.page != default && home_due(idle.home_after, c.last_press, now)
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in home {
@@ -364,7 +513,7 @@ impl Engine {
             self.goto_page(id, &default);
         }
         let mut changed = Vec::new();
-        for (id, c) in self.clients.iter_mut() {
+        for (id, c) in self.clients.iter_mut().filter(|(_, c)| !c.mirror) {
             let want = power_after(&idle, now.saturating_duration_since(c.last_activity));
             if want != c.power {
                 tracing::info!(client = %c.client_id, from = ?c.power, to = ?want, "power");
@@ -378,6 +527,11 @@ impl Engine {
     }
 
     fn key_event(&mut self, id: ClientId, key: u8, down: bool, now: Instant) {
+        // A viewer's presses are the mirrored deck's (its own page if that deck is gone).
+        let id = match self.clients.get(&id) {
+            Some(v) if v.mirror => self.mirror_target(&v.client_id).unwrap_or(id),
+            _ => id,
+        };
         let Some(c) = self.clients.get_mut(&id) else {
             return;
         };
@@ -762,7 +916,7 @@ mod tests {
             .into_iter()
             .filter_map(|o| match o {
                 Out::Frame(f) => Some(f),
-                Out::Brightness(_) => None,
+                Out::Brightness(_) | Out::Error(_) => None,
             })
             .collect()
     }
@@ -771,7 +925,7 @@ mod tests {
         outs.iter()
             .filter_map(|o| match o {
                 Out::Brightness(p) => Some(*p),
-                Out::Frame(_) => None,
+                Out::Frame(_) | Out::Error(_) => None,
             })
             .collect()
     }
@@ -791,6 +945,7 @@ mod tests {
         e.reload().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         e.handle(EngineEvent::ClientConnected {
+            web: false,
             id: 1,
             client_id: "c1".into(),
             device: device(),
@@ -941,6 +1096,7 @@ mod tests {
         let (tx, mut rx2) = mpsc::unbounded_channel();
         e.handle_at(
             EngineEvent::ClientConnected {
+                web: false,
                 id: 2,
                 client_id: "c2".into(),
                 device: device(),
@@ -1055,6 +1211,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         e.handle_at(
             EngineEvent::ClientConnected {
+                web: false,
                 id,
                 client_id: name.into(),
                 device: device(),
@@ -1216,6 +1373,7 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         e.handle(EngineEvent::ClientConnected {
+            web: false,
             id: 1,
             client_id: "c1".into(),
             device: device(),

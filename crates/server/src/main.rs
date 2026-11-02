@@ -109,9 +109,16 @@ async fn main() -> Result<()> {
              server can connect"
         );
     }
+    let deck_auth = http::DeckAuth::from_env();
+    if deck_auth == http::DeckAuth::None {
+        tracing::warn!(
+            "SDC_DECK_AUTH=none: /deck is unauthenticated, anyone who can reach the server can \
+             use the browser deck"
+        );
+    }
     tracing::info!("listening on ws://{}/ws", listener.local_addr()?);
     tokio::select! {
-        _ = http::serve(listener, engine_tx, binaries, token) => {}
+        _ = http::serve(listener, engine_tx, binaries, token, deck_auth) => {}
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
     }
     Ok(())

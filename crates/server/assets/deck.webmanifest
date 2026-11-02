@@ -1,0 +1,14 @@
+{
+  "name": "Stream Deck",
+  "short_name": "Deck",
+  "description": "Browser Stream Deck for the stream-deck-controller server",
+  "start_url": "/deck",
+  "scope": "/deck",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#0b0b0d",
+  "theme_color": "#0b0b0d",
+  "icons": [
+    { "src": "/deck/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

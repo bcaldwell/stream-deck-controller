@@ -22,6 +22,7 @@ states (or the fake ones from `--states`, a JSON list of `{entity_id, state, att
 | `HA_TOKEN`   | -                | Long-lived access token |
 | `SDC_LISTEN` | `0.0.0.0:7700`   | Client WebSocket listen address (path `/ws`) |
 | `SDC_CLIENT_DIR` | `/usr/local/share/sdc/clients` | Dir of `sdc-client-<target>` binaries to distribute; missing = feature off |
+| `SDC_DECK_AUTH` | (SSO header required) | `none` disables the `/deck` login check (local development only; logged as a warning) |
 | `SDC_CLIENT_TOKEN` | - | Shared secret: `/ws` and `/client/*` need `Authorization: Bearer <token>`. Unset = open (logged as a warning) |
 | `SDC_ASSETS_S3_ENDPOINT` | - | S3 endpoint for icon objects, e.g. `http://garage.garage.svc.cluster.local:3900` (in cluster) or `https://s3.example.com` |
 | `SDC_ASSETS_S3_BUCKET` | - | Bucket holding the images, e.g. `stream-deck-icons` |
@@ -43,6 +44,34 @@ server sends `Update { path, sha256 }` right after `Welcome` and the client repl
 `SDC_CLIENT_TOKEN` set, `/ws` and `/client/*` answer 401 unless the request has
 `Authorization: Bearer <token>` (compared in constant time); `/healthz` is always open. Install on a
 Pi with `task pi:install` from the repo (see `deploy/pi/README.md`).
+
+## Browser deck
+
+`GET /deck` serves a Stream Deck in the browser: dark MK.2 body, 3x5 glossy keys that depress on
+press, one self-contained page (no build step, no CDN) plus a web manifest (landscape, fullscreen,
+installable on a phone). It speaks the normal client protocol over `/deck/ws`.
+
+- **Own deck** (default): the browser is a client of its own (`client_id` `web-<random>`, kept in
+  localStorage) with its own page, idle state and brightness, rendered at 144 or 192 px per key
+  depending on `devicePixelRatio`.
+- **Mirror**: the dot on the bezel opens a device menu (`GET /deck/api/clients`: connected decks as
+  `[{client_id, model, rows, cols, page, web}]`; `web: true` marks other browsers' own decks, mirror
+  viewers are not listed). Picking a deck sends `Hello.mirror = <client_id>`: the browser then shows
+  that deck's page at its own key size and its presses act on the real deck (page changes, idle
+  wake). The real deck's brightness/idle messages are not sent to the viewer. If the deck is not
+  connected the server answers `Error` and the UI shows its own deck instead. The choice is kept in
+  localStorage.
+- Phones: a portrait viewport rotates the deck 90 degrees; the bezel has a fullscreen button
+  (locks landscape where supported). The LED shows the connection (green, or pulsing amber while
+  reconnecting with backoff).
+
+Auth: every `/deck` route needs the `X-Auth-Request-Email` header that the cluster's SSO (Traefik
+forwardAuth to oauth2-proxy) sets on authenticated requests, and answers 401 without it; the email
+is logged when a deck connects. The Traefik middleware must be the only way to reach these routes
+(the header is trusted). `SDC_DECK_AUTH=none` skips the check for local use. The bearer token of
+`/ws` and `/client/*` is unrelated: it neither opens `/deck/*` nor does the SSO header open `/ws`.
+`/deck/ws` also refuses cross-origin upgrades and forces browser ids to start with `web-`, so a
+browser cannot take over a physical deck's identity.
 
 ## Lua API
 

@@ -65,6 +65,7 @@ pub async fn run(
         key_size_px: KEY_PX,
     };
     engine.handle(EngineEvent::ClientConnected {
+        web: false,
         id: 1,
         client_id: "preview".into(),
         device,

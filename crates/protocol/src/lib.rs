@@ -15,6 +15,9 @@
 //! The client then downloads `path`, verifies `sha256`, replaces itself and restarts (the
 //! service manager brings it back). Both fields are optional so older clients/servers interoperate
 //! and the protocol version stays 1.
+//!
+//! Browser decks use the same messages on `/deck/ws` (behind the cluster's SSO instead of the
+//! client token). `Hello.mirror` makes such a connection a viewer of another client's deck.
 
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +89,10 @@ pub enum ClientMessage {
         /// Hex sha256 of the running client executable; absent from older clients.
         #[serde(default)]
         client_sha256: Option<String>,
+        /// Browser deck only (`/deck/ws`): the `client_id` of a connected deck to mirror instead
+        /// of being a deck of its own. Ignored on `/ws`; absent from older clients.
+        #[serde(default)]
+        mirror: Option<String>,
     },
     KeyDown {
         key: u8,
@@ -151,8 +158,9 @@ mod tests {
             ClientMessage::Hello {
                 client_target,
                 client_sha256,
+                mirror,
                 ..
-            } => assert!(client_target.is_none() && client_sha256.is_none()),
+            } => assert!(client_target.is_none() && client_sha256.is_none() && mirror.is_none()),
             _ => panic!("not hello"),
         }
     }

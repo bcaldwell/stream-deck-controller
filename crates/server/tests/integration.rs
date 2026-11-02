@@ -81,6 +81,16 @@ async fn start_server_full(
     binaries: ClientBinaries,
     token: Option<&str>,
 ) -> (UnboundedSender<EngineEvent>, String, TempDir) {
+    start_server_deck(tag, ha_tx, binaries, token, http::DeckAuth::Sso).await
+}
+
+async fn start_server_deck(
+    tag: &str,
+    ha_tx: UnboundedSender<HaCommand>,
+    binaries: ClientBinaries,
+    token: Option<&str>,
+    deck_auth: http::DeckAuth,
+) -> (UnboundedSender<EngineEvent>, String, TempDir) {
     let dir = TempDir::new(tag);
     let cfg = dir.0.join("config.lua");
     std::fs::write(&cfg, CONFIG).unwrap();
@@ -92,6 +102,7 @@ async fn start_server_full(
         engine_tx.clone(),
         Arc::new(binaries),
         token.map(Into::into),
+        deck_auth,
     ));
     (engine_tx, url, dir)
 }
@@ -108,6 +119,7 @@ async fn connect_as(url: &str, target: Option<&str>, sha256: Option<&str>) -> Cl
         device: device(),
         client_target: target.map(Into::into),
         client_sha256: sha256.map(Into::into),
+        mirror: None,
     };
     c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -232,6 +244,7 @@ async fn rejects_wrong_protocol_version() {
         device: device(),
         client_target: None,
         client_sha256: None,
+        mirror: None,
     };
     c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -335,6 +348,7 @@ async fn client_token_guards_ws_and_client_downloads() {
         device: device(),
         client_target: None,
         client_sha256: None,
+        mirror: None,
     };
     c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -545,4 +559,308 @@ async fn real_ha_client_against_mock_ha() {
     assert!(drain_frames(&mut c, Duration::from_millis(300))
         .await
         .is_empty());
+}
+
+// ---- browser deck (/deck) ----
+
+const DECK_CONFIG: &str = r##"
+sdc.page("home", {
+  sdc.button{ render = { text = "Next", bg = "#cc0000" }, press = function(ctx) ctx.goto_page("other") end },
+  sdc.button{ render = { text = "Home", bg = "#cc0000" } },
+})
+sdc.page("other", {
+  sdc.button{ render = { text = "Back", bg = "#0000cc" }, press = function(ctx) ctx.goto_page("home") end },
+  sdc.button{ render = { text = "Other", bg = "#0000cc" } },
+})
+"##;
+
+const EMAIL: &str = "X-Auth-Request-Email: me@example.com\r\n";
+
+/// Server with the two-page deck config; returns the `ws://.../ws` url (host:port source).
+async fn start_deck_server(
+    tag: &str,
+    token: Option<&str>,
+    deck_auth: http::DeckAuth,
+) -> (String, TempDir) {
+    let dir = TempDir::new(tag);
+    let cfg = dir.0.join("config.lua");
+    std::fs::write(&cfg, DECK_CONFIG).unwrap();
+    let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
+    let engine_tx = engine::spawn(cfg, Some(ha_tx));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+    tokio::spawn(http::serve(
+        listener,
+        engine_tx,
+        Arc::new(ClientBinaries::default()),
+        token.map(Into::into),
+        deck_auth,
+    ));
+    (url, dir)
+}
+
+fn deck_url(ws_url: &str) -> String {
+    ws_url.replace("/ws", "/deck/ws")
+}
+
+async fn http_get_raw(ws_url: &str, path: &str, headers: &str) -> (u16, Vec<u8>) {
+    let addr = ws_url
+        .strip_prefix("ws://")
+        .unwrap()
+        .strip_suffix("/ws")
+        .unwrap();
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\n{headers}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).await.unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    (
+        head.split(' ').nth(1).unwrap().parse().unwrap(),
+        raw[split..].to_vec(),
+    )
+}
+
+/// A browser (or, without `email`, an unauthenticated) websocket on `/deck/ws`.
+async fn deck_handshake(
+    ws_url: &str,
+    headers: &[(&str, &str)],
+) -> Result<Client, tokio_tungstenite::tungstenite::Error> {
+    let mut req = deck_url(ws_url).into_client_request().unwrap();
+    for (k, v) in headers {
+        req.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+            v.parse().unwrap(),
+        );
+    }
+    tokio_tungstenite::connect_async(req).await.map(|(c, _)| c)
+}
+
+/// Connects a browser deck and sends Hello; returns the socket (Welcome not yet read).
+async fn deck_connect(ws_url: &str, client_id: &str, mirror: Option<&str>, px: u32) -> Client {
+    let mut c = deck_handshake(ws_url, &[("x-auth-request-email", "me@example.com")])
+        .await
+        .unwrap();
+    let hello = ClientMessage::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client_id: client_id.into(),
+        device: DeviceInfo {
+            model: "Web Deck".into(),
+            serial: None,
+            rows: 3,
+            cols: 5,
+            key_size_px: px,
+        },
+        client_target: None,
+        client_sha256: None,
+        mirror: mirror.map(Into::into),
+    };
+    c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+        .await
+        .unwrap();
+    c
+}
+
+async fn expect_welcome(c: &mut Client) {
+    match next_msg(c).await {
+        Message::Text(t) => assert!(matches!(
+            serde_json::from_str(&t).unwrap(),
+            ServerMessage::Welcome { .. }
+        )),
+        other => panic!("expected welcome, got {other:?}"),
+    }
+}
+
+/// The 15 initial frames of a deck, by key.
+async fn initial_frames(c: &mut Client) -> Vec<Vec<u8>> {
+    let mut frames = vec![Vec::new(); 15];
+    for _ in 0..15 {
+        let (k, jpeg) = next_frame(c).await;
+        frames[k as usize] = jpeg;
+    }
+    frames
+}
+
+async fn deck_clients(ws_url: &str) -> Vec<Value> {
+    let (status, body) = http_get_raw(ws_url, "/deck/api/clients", EMAIL).await;
+    assert_eq!(status, 200);
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn deck_routes_require_sso_header() {
+    let (url, _dir) = start_deck_server("deck-auth", Some("s3cret"), http::DeckAuth::Sso).await;
+    for path in [
+        "/deck",
+        "/deck/",
+        "/deck/manifest.webmanifest",
+        "/deck/icon.svg",
+        "/deck/api/clients",
+    ] {
+        assert_eq!(http_get_raw(&url, path, "").await.0, 401, "{path}");
+        // the client bearer token is not an SSO login
+        let bearer = "Authorization: Bearer s3cret\r\n";
+        assert_eq!(http_get_raw(&url, path, bearer).await.0, 401, "{path}");
+        assert_eq!(http_get_raw(&url, path, EMAIL).await.0, 200, "{path}");
+    }
+    let (_, page) = http_get_raw(&url, "/deck", EMAIL).await;
+    assert!(String::from_utf8_lossy(&page).contains("<title>Stream Deck</title>"));
+    let (_, manifest) = http_get_raw(&url, "/deck/manifest.webmanifest", EMAIL).await;
+    let manifest: Value = serde_json::from_slice(&manifest).unwrap();
+    assert_eq!(manifest["orientation"], "landscape");
+    assert_eq!(manifest["display"], "fullscreen");
+
+    // websocket: SSO header needed, the bearer token is no substitute
+    let denied = |r: Result<Client, _>| match r {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+        other => panic!("expected http error, got {:?}", other.map(|_| ())),
+    };
+    assert_eq!(denied(deck_handshake(&url, &[]).await), 401);
+    assert_eq!(
+        denied(deck_handshake(&url, &[("authorization", "Bearer s3cret")]).await),
+        401
+    );
+    assert!(
+        deck_handshake(&url, &[("x-auth-request-email", "me@example.com")])
+            .await
+            .is_ok()
+    );
+    // ... and the SSO header does not open /ws
+    assert_eq!(ws_handshake_status(&url, None).await, 401);
+    // cross-site pages cannot drive the deck with the user's cookies
+    let foreign = deck_handshake(
+        &url,
+        &[
+            ("x-auth-request-email", "me@example.com"),
+            ("origin", "https://evil.example"),
+        ],
+    )
+    .await;
+    assert_eq!(denied(foreign), 403);
+    // health stays open
+    assert_eq!(http_get_raw(&url, "/healthz", "").await.0, 200);
+}
+
+#[tokio::test]
+async fn deck_auth_none_bypasses_sso_check() {
+    let (url, _dir) = start_deck_server("deck-open", None, http::DeckAuth::None).await;
+    assert_eq!(http_get_raw(&url, "/deck", "").await.0, 200);
+    assert_eq!(http_get_raw(&url, "/deck/api/clients", "").await.0, 200);
+    assert!(deck_handshake(&url, &[]).await.is_ok());
+}
+
+#[tokio::test]
+async fn api_lists_physical_and_browser_decks_but_not_viewers() {
+    let (url, _dir) = start_deck_server("deck-list", None, http::DeckAuth::Sso).await;
+    assert!(deck_clients(&url).await.is_empty());
+
+    let mut pi = connect_as(&url, None, None).await; // client_id "test", 72 px
+    initial_frames(&mut pi).await;
+    let mut own = deck_connect(&url, "web-own", None, 144).await;
+    expect_welcome(&mut own).await;
+    initial_frames(&mut own).await;
+    let mut viewer = deck_connect(&url, "web-view", Some("test"), 144).await;
+    expect_welcome(&mut viewer).await;
+    initial_frames(&mut viewer).await;
+
+    let list = deck_clients(&url).await;
+    assert_eq!(list.len(), 2, "{list:?}");
+    assert_eq!(
+        list[0],
+        json!({"client_id": "test", "model": "Test Deck", "rows": 3, "cols": 5, "page": "home", "web": false})
+    );
+    assert_eq!(list[1]["client_id"], "web-own");
+    assert_eq!(list[1]["web"], true);
+}
+
+#[tokio::test]
+async fn mirror_viewer_follows_and_drives_the_mirrored_deck() {
+    let (url, _dir) = start_deck_server("deck-mirror", None, http::DeckAuth::Sso).await;
+    let mut pi = connect_as(&url, None, None).await; // client_id "test", 72 px
+    let pi_home = initial_frames(&mut pi).await;
+    let mut own = deck_connect(&url, "web-own", None, 144).await;
+    expect_welcome(&mut own).await;
+    initial_frames(&mut own).await;
+
+    let mut viewer = deck_connect(&url, "web-view", Some("test"), 144).await;
+    expect_welcome(&mut viewer).await;
+    // frames of the mirrored deck's page, rendered at the viewer's own key size
+    let (k, jpeg) = {
+        let (k, j) = next_frame(&mut viewer).await;
+        (k, j)
+    };
+    assert_eq!(image::load_from_memory(&jpeg).unwrap().width(), 144);
+    let mut view_home = vec![Vec::new(); 15];
+    view_home[k as usize] = jpeg;
+    for _ in 1..15 {
+        let (k, j) = next_frame(&mut viewer).await;
+        view_home[k as usize] = j;
+    }
+    let red = image::load_from_memory(&view_home[1]).unwrap().to_rgb8();
+    assert!(red.get_pixel(5, 5)[0] > 150 && red.get_pixel(5, 5)[2] < 60);
+
+    // pressing on the viewer switches the real deck (and the viewer) to the other page
+    keydown(&mut viewer, 0).await;
+    let pi_other = drain_frames(&mut pi, Duration::from_millis(500)).await;
+    assert!(!pi_other.is_empty(), "mirrored deck did not change page");
+    assert_ne!(pi_other[0].1, pi_home[pi_other[0].0 as usize]);
+    let view_other = drain_frames(&mut viewer, Duration::from_millis(500)).await;
+    assert!(!view_other.is_empty(), "viewer did not change page");
+    let blue = image::load_from_memory(&view_other.iter().find(|f| f.0 == 1).unwrap().1)
+        .unwrap()
+        .to_rgb8();
+    assert!(blue.get_pixel(5, 5)[2] > 150);
+
+    // ... and a press on the real deck is visible on the viewer
+    keydown(&mut pi, 0).await;
+    let back = drain_frames(&mut viewer, Duration::from_millis(500)).await;
+    assert!(!back.is_empty(), "viewer did not follow the real deck");
+
+    // an own-deck browser is independent of all of it
+    drain_frames(&mut pi, Duration::from_millis(300)).await;
+    assert!(drain_frames(&mut own, Duration::from_millis(300))
+        .await
+        .is_empty());
+    keydown(&mut own, 0).await;
+    assert!(!drain_frames(&mut own, Duration::from_millis(500))
+        .await
+        .is_empty());
+    assert!(drain_frames(&mut pi, Duration::from_millis(300))
+        .await
+        .is_empty());
+    assert!(drain_frames(&mut viewer, Duration::from_millis(300))
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
+async fn mirroring_an_unknown_deck_is_an_error() {
+    let (url, _dir) = start_deck_server("deck-nomirror", None, http::DeckAuth::Sso).await;
+    let mut viewer = deck_connect(&url, "web-view", Some("ghost"), 144).await;
+    expect_welcome(&mut viewer).await;
+    match next_msg(&mut viewer).await {
+        Message::Text(t) => assert!(matches!(
+            serde_json::from_str(&t).unwrap(),
+            ServerMessage::Error { .. }
+        )),
+        other => panic!("expected error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn browser_cannot_impersonate_a_physical_deck() {
+    let (url, _dir) = start_deck_server("deck-impersonate", None, http::DeckAuth::Sso).await;
+    let mut pi = connect_as(&url, None, None).await; // "test"
+    initial_frames(&mut pi).await;
+    let mut b = deck_connect(&url, "test", None, 144).await;
+    expect_welcome(&mut b).await;
+    initial_frames(&mut b).await;
+    let ids: Vec<_> = deck_clients(&url)
+        .await
+        .iter()
+        .map(|d| d["client_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["test", "web-test"]);
 }

@@ -1,4 +1,4 @@
-//! WebSocket server for clients (`/ws`).
+//! WebSocket server for clients (`/ws`, bearer token) and browser decks (`/deck/ws`, SSO).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
-use axum::http::HeaderMap;
+use axum::extract::{Extension, State, WebSocketUpgrade};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use sdc_protocol::{ClientMessage, ImageFrame, ServerMessage, PROTOCOL_VERSION};
@@ -15,7 +16,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::clients::ClientBinaries;
 use crate::engine::{EngineEvent, Out};
-use crate::http;
+use crate::http::{self, DeckAuth, DeckUser};
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -26,6 +27,7 @@ pub struct WsState {
     pub binaries: Arc<ClientBinaries>,
     /// Shared client token; `None` accepts everyone.
     pub token: Option<Arc<str>>,
+    pub deck_auth: DeckAuth,
 }
 
 /// Upgrade handler for `/ws`.
@@ -39,13 +41,57 @@ pub async fn upgrade(
         return denied;
     }
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_conn(socket, state).await {
+        if let Err(e) = handle_conn(socket, state, None).await {
             tracing::warn!("connection ended: {e:#}");
         }
     })
 }
 
-async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
+/// Upgrade handler for `/deck/ws` (already past the SSO check). Never looks at the client token.
+pub async fn deck_upgrade(
+    State(state): State<WsState>,
+    Extension(user): Extension<DeckUser>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // Cookies authenticate this route, so refuse pages of other origins (cross-site hijacking).
+    if !same_origin(&headers) {
+        tracing::warn!("rejected deck websocket from {}: foreign origin", user.0);
+        return (StatusCode::FORBIDDEN, "cross-origin websocket refused\n").into_response();
+    }
+    ws.on_upgrade(move |socket| async move {
+        if let Err(e) = handle_conn(socket, state, Some(user.0)).await {
+            tracing::warn!("deck connection ended: {e:#}");
+        }
+    })
+}
+
+/// No `Origin` (not a browser) or one whose host is the request's `Host`.
+fn same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    let authority = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+    host.is_some_and(|h| h.eq_ignore_ascii_case(authority))
+}
+
+/// Browser deck ids are `web-...` so a browser can never take over a physical deck's identity.
+fn web_client_id(raw: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(48)
+        .collect();
+    if clean.starts_with("web-") {
+        clean
+    } else {
+        format!("web-{clean}")
+    }
+}
+
+/// `deck`: the SSO user of a browser connection (`/deck/ws`); `None` for a normal client.
+async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Result<()> {
     let WsState {
         engine, binaries, ..
     } = state;
@@ -73,6 +119,7 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
         device,
         client_target,
         client_sha256,
+        mirror,
     } = hello
     else {
         bail!("first message was not hello");
@@ -97,6 +144,21 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
             .await?;
         bail!("client {client_id} sent invalid device info");
     }
+    let client_id = if deck.is_some() {
+        web_client_id(&client_id)
+    } else {
+        client_id
+    };
+    let mirror = mirror.filter(|_| deck.is_some());
+    if let Some(email) = &deck {
+        tracing::info!(
+            "{email} opened browser deck {client_id}{}",
+            mirror
+                .as_deref()
+                .map(|m| format!(" mirroring {m}"))
+                .unwrap_or_default()
+        );
+    }
     let key_count = device.key_count();
 
     sink.send(Message::Text(
@@ -107,7 +169,11 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
     ))
     .await?;
 
-    if let Some(update) = binaries.update_for(client_target.as_deref(), client_sha256.as_deref()) {
+    let update = deck
+        .is_none()
+        .then(|| binaries.update_for(client_target.as_deref(), client_sha256.as_deref()))
+        .flatten();
+    if let Some(update) = update {
         tracing::info!(
             "client {client_id} ({}) runs a stale binary, telling it to update",
             client_target.as_deref().unwrap_or("?")
@@ -118,12 +184,21 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
 
     let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
-    let _ = engine.send(EngineEvent::ClientConnected {
-        id,
-        client_id,
-        device,
-        tx,
-    });
+    let _ = match mirror {
+        Some(mirror) => engine.send(EngineEvent::ViewerConnected {
+            id,
+            mirror,
+            device,
+            tx,
+        }),
+        None => engine.send(EngineEvent::ClientConnected {
+            web: deck.is_some(),
+            id,
+            client_id,
+            device,
+            tx,
+        }),
+    };
 
     let result: Result<()> = async {
         loop {
@@ -132,6 +207,10 @@ async fn handle_conn(ws: WebSocket, state: WsState) -> Result<()> {
                     Some(Out::Frame(f)) => sink.send(Message::Binary(ImageFrame::encode(f.key, &f.jpeg).into())).await?,
                     Some(Out::Brightness(percent)) => {
                         let msg = ServerMessage::Brightness { percent };
+                        sink.send(Message::Text(serde_json::to_string(&msg)?.into())).await?
+                    }
+                    Some(Out::Error(message)) => {
+                        let msg = ServerMessage::Error { message };
                         sink.send(Message::Text(serde_json::to_string(&msg)?.into())).await?
                     }
                     None => return Ok(()),
