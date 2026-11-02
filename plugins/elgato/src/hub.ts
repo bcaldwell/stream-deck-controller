@@ -8,6 +8,25 @@ import type { ClientMessage, DialFeedback, ExportItem, ServerMessage, SlotKind, 
 
 /** No built-in server: nothing connects until a server URL is set in the action settings. */
 export const DEFAULT_URL = "";
+
+/**
+ * The plugin endpoint for whatever was typed: a bare host, an https:// URL or the deck's `/ws` all
+ * mean `wss://host/plugin/ws`. Other paths are kept (e.g. a server behind a path prefix).
+ */
+export function pluginUrl(input: string): string {
+	if (!input) return input;
+	let u: URL;
+	try {
+		u = new URL(/^[a-z]+:\/\//i.test(input) ? input : `wss://${input}`);
+	} catch {
+		return input;
+	}
+	if (u.protocol === "https:") u.protocol = "wss:";
+	if (u.protocol === "http:") u.protocol = "ws:";
+	const path = u.pathname.replace(/\/+$/, "");
+	if (path === "" || path === "/ws") u.pathname = "/plugin/ws";
+	return u.toString();
+}
 const PROTOCOL_VERSION = 1;
 const MIN_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
@@ -72,7 +91,7 @@ export class Hub {
 
 	/** Sets the server and token and (re)connects if they changed; no URL = stay offline. */
 	configure({ url, token }: Connection): void {
-		const nextUrl = url?.trim() || DEFAULT_URL;
+		const nextUrl = pluginUrl(url?.trim() || DEFAULT_URL);
 		const nextToken = token?.trim() ?? "";
 		const changed = nextUrl !== this.#url || nextToken !== this.#token;
 		this.#url = nextUrl;
