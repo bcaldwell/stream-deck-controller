@@ -63,6 +63,7 @@ pub async fn run(
         rows: ROWS,
         cols: COLS,
         key_size_px: KEY_PX,
+        native: None,
     };
     engine.handle(EngineEvent::ClientConnected {
         web: false,

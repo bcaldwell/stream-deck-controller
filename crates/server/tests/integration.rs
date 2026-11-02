@@ -75,6 +75,7 @@ fn device() -> DeviceInfo {
         rows: 3,
         cols: 5,
         key_size_px: 72,
+        native: None,
     }
 }
 
@@ -130,11 +131,20 @@ async fn connect(url: &str) -> Client {
 }
 
 async fn connect_as(url: &str, target: Option<&str>, sha256: Option<&str>) -> Client {
+    connect_with(url, target, sha256, device()).await.0
+}
+
+async fn connect_with(
+    url: &str,
+    target: Option<&str>,
+    sha256: Option<&str>,
+    device: DeviceInfo,
+) -> (Client, bool) {
     let (mut c, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let hello = ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
         client_id: "test".into(),
-        device: device(),
+        device,
         client_target: target.map(Into::into),
         client_sha256: sha256.map(Into::into),
         mirror: None,
@@ -144,13 +154,12 @@ async fn connect_as(url: &str, target: Option<&str>, sha256: Option<&str>) -> Cl
         .await
         .unwrap();
     match next_msg(&mut c).await {
-        Message::Text(t) => assert!(matches!(
-            serde_json::from_str(&t).unwrap(),
-            ServerMessage::Welcome { .. }
-        )),
+        Message::Text(t) => match serde_json::from_str(&t).unwrap() {
+            ServerMessage::Welcome { native_frames, .. } => (c, native_frames),
+            other => panic!("expected welcome, got {other:?}"),
+        },
         other => panic!("expected welcome, got {other:?}"),
     }
-    c
 }
 
 async fn next_msg(c: &mut Client) -> Message {
@@ -697,6 +706,7 @@ async fn deck_connect_as(
             rows: 3,
             cols: 5,
             key_size_px: px,
+            native: None,
         },
         client_target: None,
         client_sha256: None,
@@ -1212,4 +1222,61 @@ async fn plugin_subscribe_render_dependencies_and_input() {
     assert!(!msgs
         .iter()
         .any(|m| matches!(m, PluginServerMessage::KeyImage { .. })));
+}
+
+#[tokio::test]
+async fn native_frames_are_rotated_once_and_confirmed() {
+    use sdc_protocol::{NativeImage, NativeMirror, NativeMode};
+    let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
+    let (_engine, url, _dir) = start_server("native", ha_tx).await;
+    let fmt = |size, mode| NativeImage {
+        mode,
+        size: (size, size),
+        rotation: 0,
+        mirror: NativeMirror::Both, // MK.2
+    };
+
+    // plain client: upright frames, no confirmation
+    let (mut plain, native_frames) = connect_with(&url, None, None, device()).await;
+    assert!(!native_frames);
+    let upright = initial_frames(&mut plain).await;
+
+    // MK.2-style client: confirmed, and every frame is the upright one rotated 180 degrees
+    let mut dev = device();
+    dev.native = Some(fmt(72, NativeMode::Jpeg));
+    let (mut mk2, native_frames) = connect_with(&url, None, None, dev).await;
+    assert!(native_frames);
+    let native = initial_frames(&mut mk2).await;
+    let mut differing = 0;
+    for (u, n) in upright.iter().zip(&native) {
+        let u = image::load_from_memory(u).unwrap().to_rgb8();
+        let n = image::load_from_memory(n).unwrap().to_rgb8();
+        assert_eq!(n.dimensions(), (72, 72));
+        let want = image::imageops::rotate180(&u);
+        let err: u64 = want
+            .pixels()
+            .zip(n.pixels())
+            .map(|(a, b)| {
+                a.0.iter()
+                    .zip(b.0)
+                    .map(|(x, y)| x.abs_diff(y) as u64)
+                    .sum::<u64>()
+            })
+            .sum();
+        assert!(
+            err / (72 * 72 * 3) < 6,
+            "native frame is the rotated render"
+        );
+        differing += (u != n) as usize;
+    }
+    assert!(differing > 0);
+
+    // a format the server cannot produce (BMP, or a size that is not the key size) is declined
+    for bad in [fmt(72, NativeMode::Bmp), fmt(80, NativeMode::Jpeg)] {
+        let mut dev = device();
+        dev.native = Some(bad);
+        let (mut c, native_frames) = connect_with(&url, None, None, dev).await;
+        assert!(!native_frames);
+        initial_frames(&mut c).await;
+    }
 }

@@ -12,10 +12,14 @@ use image::codecs::png::PngEncoder;
 use image::imageops::{self, FilterType};
 use image::{ExtendedColorType, ImageEncoder, Rgb, RgbImage, RgbaImage};
 
+use sdc_protocol::{NativeImage, NativeMirror};
+
 use crate::assets::{is_ha_key, redact, Assets, Fetcher, Source};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/OpenSans.ttf");
 
+/// Quality of every key JPEG. Native frames are encoded exactly once at this quality (the
+/// client writes them to the deck untouched), so there is no second lossy pass.
 const JPEG_QUALITY: u8 = 90;
 const PAD: f32 = 4.0;
 const MIN_FONT_PX: f32 = 9.0;
@@ -474,6 +478,20 @@ impl Renderer {
         encode_jpeg(&self.render_image(spec, size))
     }
 
+    /// Like [`Renderer::render`], in a deck's native format when given.
+    pub fn render_for(
+        &mut self,
+        spec: &RenderSpec,
+        size: u32,
+        native: Option<&NativeImage>,
+    ) -> Vec<u8> {
+        let img = self.render_image(spec, size);
+        match native {
+            Some(n) => encode_native(&img, n),
+            None => encode_jpeg(&img),
+        }
+    }
+
     /// Like [`Renderer::render`] as a PNG (plugins hand it to Elgato's `setImage`).
     pub fn render_png(&mut self, spec: &RenderSpec, size: u32) -> Vec<u8> {
         encode_png(&self.render_image(spec, size))
@@ -516,10 +534,18 @@ impl Renderer {
 
     /// Rasterizes and JPEG-encodes `jobs`, spread over the available cores. A job yields one
     /// JPEG, or for a span one per key (row-major); the results are concatenated in job order.
-    pub fn encode_all(&self, jobs: Vec<Job>) -> Vec<Vec<u8>> {
+    /// With `native`, each JPEG is in that device format (see [`encode_native`]).
+    pub fn encode_all(&self, jobs: Vec<Job>, native: Option<&NativeImage>) -> Vec<Vec<u8>> {
         let painter = &*self.painter;
         let run = |job: &Job| -> Vec<Vec<u8>> {
-            painter.paint_tiles(job).iter().map(encode_jpeg).collect()
+            painter
+                .paint_tiles(job)
+                .iter()
+                .map(|t| match native {
+                    Some(n) => encode_native(t, n),
+                    None => encode_jpeg(t),
+                })
+                .collect()
         };
         let workers = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
@@ -557,7 +583,7 @@ impl Renderer {
     /// Renders several keys at once (see [`Renderer::encode_all`]).
     pub fn render_many(&mut self, specs: &[RenderSpec], size: u32) -> Vec<Vec<u8>> {
         let jobs = specs.iter().map(|s| self.prepare(s, size)).collect();
-        self.encode_all(jobs)
+        self.encode_all(jobs, None)
     }
 
     fn resolve(&mut self, name: &str) -> Option<Source> {
@@ -1177,6 +1203,30 @@ fn encode_png(img: &RgbImage) -> Vec<u8> {
     buf
 }
 
+/// Applies a deck's native orientation to an upright key image: rotate clockwise, then mirror
+/// (the order `elgato-streamdeck` uses; the size already matches).
+pub fn orient_native(img: &RgbImage, n: &NativeImage) -> RgbImage {
+    use image::imageops::{flip_horizontal, flip_vertical, rotate180, rotate270, rotate90};
+    let r = match n.rotation {
+        90 => rotate90(img),
+        180 => rotate180(img),
+        270 => rotate270(img),
+        _ => img.clone(),
+    };
+    match n.mirror {
+        NativeMirror::None => r,
+        NativeMirror::X => flip_horizontal(&r),
+        NativeMirror::Y => flip_vertical(&r),
+        NativeMirror::Both => flip_vertical(&flip_horizontal(&r)),
+    }
+}
+
+/// The JPEG a deck with format `n` (see [`NativeImage::server_can_produce`]) takes as it is:
+/// oriented, encoded once.
+pub fn encode_native(img: &RgbImage, n: &NativeImage) -> Vec<u8> {
+    encode_jpeg(&orient_native(img, n))
+}
+
 fn encode_jpeg(img: &RgbImage) -> Vec<u8> {
     let mut buf = Vec::new();
     JpegEncoder::new_with_quality(&mut buf, JPEG_QUALITY)
@@ -1672,7 +1722,7 @@ mod tests {
         assert!(tiles[1].get_pixel(0, 0).0[0] > tiles[0].get_pixel(71, 0).0[0] + 15);
         // the JPEG path gives the same number of tiles
         let jobs = vec![r.prepare_span(&spec, geom), r.prepare(&spec, 72)];
-        assert_eq!(r.encode_all(jobs).len(), 5);
+        assert_eq!(r.encode_all(jobs, None).len(), 5);
     }
 
     #[test]
@@ -1901,5 +1951,172 @@ mod tests {
             "ring on the edge"
         );
         assert!(img.get_pixel(36, 36).0[0] < 10, "centre untouched");
+    }
+
+    fn corner_marked() -> RgbImage {
+        // red top-left 20x20 block on a blue key, 72x72
+        let mut img = RgbImage::from_pixel(72, 72, Rgb([0, 0, 255]));
+        for y in 0..20 {
+            for x in 0..20 {
+                img.put_pixel(x, y, Rgb([255, 0, 0]));
+            }
+        }
+        img
+    }
+
+    fn native(rotation: u16, mirror: NativeMirror) -> NativeImage {
+        NativeImage {
+            mode: sdc_protocol::NativeMode::Jpeg,
+            size: (72, 72),
+            rotation,
+            mirror,
+        }
+    }
+
+    #[test]
+    fn native_orientation_moves_the_corner() {
+        let img = corner_marked();
+        let red = [255, 0, 0];
+        // (rotation, mirror, where the top-left marker ends up)
+        for (rot, mirror, at) in [
+            (0, NativeMirror::None, (5, 5)),
+            // MK.2 / XL: Rot0 + mirror both = top-left to bottom-right
+            (0, NativeMirror::Both, (66, 66)),
+            (0, NativeMirror::X, (66, 5)),
+            (0, NativeMirror::Y, (5, 66)),
+            // clockwise quarter turn: top-left to top-right
+            (90, NativeMirror::None, (66, 5)),
+            (180, NativeMirror::None, (66, 66)),
+            // PlusXl: 270 clockwise: top-left to bottom-left
+            (270, NativeMirror::None, (5, 66)),
+            // Mini: rot90 then flip x: top-right to top-left
+            (90, NativeMirror::X, (5, 5)),
+        ] {
+            let out = orient_native(&img, &native(rot, mirror));
+            assert_eq!(out.get_pixel(at.0, at.1).0, red, "rot {rot} {mirror:?}");
+            let n = out.pixels().filter(|p| p.0 == red).count();
+            assert_eq!(n, 400, "rot {rot} {mirror:?}");
+        }
+    }
+
+    #[test]
+    fn native_jpeg_is_encoded_once_and_oriented() {
+        let img = corner_marked();
+        let n = native(0, NativeMirror::Both);
+        let jpeg = encode_native(&img, &n);
+        let back = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        assert_eq!(back.dimensions(), (72, 72));
+        assert!(near(back.get_pixel(66, 66).0, [255, 0, 0]));
+        assert!(near(back.get_pixel(5, 5).0, [0, 0, 255]));
+        // an upright request is unchanged by the native path with the identity format
+        assert_eq!(
+            encode_native(&img, &native(0, NativeMirror::None)),
+            encode_jpeg(&img)
+        );
+        // and the renderer path agrees with encoding the oriented render
+        let mut r = Renderer::new(PathBuf::from("."));
+        let spec = RenderSpec::default();
+        assert_eq!(
+            r.render_for(&spec, 72, Some(&n)),
+            encode_native(&r.render_image(&spec, 72), &n)
+        );
+        let jobs = vec![r.prepare(&spec, 72)];
+        assert_eq!(
+            r.encode_all(jobs, Some(&n)),
+            vec![r.render_for(&spec, 72, Some(&n))]
+        );
+    }
+
+    /// Old path (encode upright, client decodes, rotates, encodes again) against the single
+    /// encode, as mean absolute error per channel against the unencoded oriented render.
+    /// `cargo test -p sdc-server --lib jpeg_generations -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn jpeg_generations() {
+        let mut r = Renderer::new(PathBuf::from("."));
+        let n = native(0, NativeMirror::Both);
+        let mae = |a: &RgbImage, b: &RgbImage| -> f64 {
+            let sum: u64 = a
+                .pixels()
+                .zip(b.pixels())
+                .map(|(p, q)| {
+                    p.0.iter()
+                        .zip(q.0)
+                        .map(|(x, y)| x.abs_diff(y) as u64)
+                        .sum::<u64>()
+                })
+                .sum();
+            sum as f64 / (a.width() * a.height() * 3) as f64
+        };
+        let specs = [
+            (
+                "white 'Lights' on dark",
+                Color([20, 20, 30]),
+                Color([255, 255, 255]),
+                "Lights",
+            ),
+            (
+                "small red on black",
+                Color([0, 0, 0]),
+                Color([230, 40, 40]),
+                "Kitchen 21.5",
+            ),
+            (
+                "green on blue",
+                Color([10, 40, 120]),
+                Color([40, 230, 90]),
+                "ON",
+            ),
+            (
+                "yellow on red",
+                Color([160, 20, 20]),
+                Color([250, 220, 30]),
+                "Thermostat",
+            ),
+        ];
+        let (mut t_old, mut t_new) = (0.0, 0.0);
+        for (name, bg, fg, text) in specs {
+            let spec = RenderSpec {
+                bg,
+                fg,
+                text: Some(text.into()),
+                ..Default::default()
+            };
+            let img = r.render_image(&spec, 72);
+            let want = orient_native(&img, &n);
+            let once = image::load_from_memory(&encode_native(&img, &n))
+                .unwrap()
+                .to_rgb8();
+            let up = image::load_from_memory(&encode_jpeg(&img))
+                .unwrap()
+                .to_rgb8();
+            let twice = image::load_from_memory(&encode_jpeg(&orient_native(&up, &n)))
+                .unwrap()
+                .to_rgb8();
+            let (e1, e2) = (mae(&want, &once), mae(&want, &twice));
+            t_old += e2;
+            t_new += e1;
+            println!("{name:26} double {e2:.3}  single {e1:.3}");
+        }
+        // the client-side work the single encode removes: decode + orient + encode
+        let jpeg = encode_jpeg(&r.render_image(
+            &RenderSpec {
+                bg: Color([0, 0, 0]),
+                fg: Color([230, 40, 40]),
+                text: Some("Kitchen 21.5".into()),
+                ..Default::default()
+            },
+            72,
+        ));
+        let t = Instant::now();
+        for _ in 0..500 {
+            let up = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+            std::hint::black_box(encode_jpeg(&orient_native(&up, &n)));
+        }
+        println!(
+            "client decode+orient+encode: {:.3} ms/key (this machine)",
+            t.elapsed().as_secs_f64() * 2.0
+        );
+        println!("mean: double {:.3}  single {:.3}", t_old / 4.0, t_new / 4.0);
     }
 }

@@ -1,14 +1,17 @@
 //! Stream Deck device abstraction: a real HID deck or a fake one for testing.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use elgato_streamdeck::{
-    asynchronous::AsyncStreamDeck, info::Kind, list_devices, new_hidapi, DeviceStateUpdate,
+    asynchronous::AsyncStreamDeck,
+    info::{ImageMirroring, ImageMode, ImageRotation, Kind},
+    list_devices, new_hidapi, DeviceStateUpdate,
 };
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
-use sdc_protocol::DeviceInfo;
+use sdc_protocol::{DeviceInfo, NativeImage, NativeMirror, NativeMode};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -40,6 +43,9 @@ pub struct Deck {
     pub events: mpsc::Receiver<DeviceEvent>,
     reader: Option<JoinHandle<()>>,
     kind: Option<Kind>,
+    /// Frames from the server are in `info.native` format and go to the device as they are
+    /// (the server confirmed it in its welcome). Otherwise they are upright JPEGs.
+    native_frames: AtomicBool,
     /// sysfs `power/runtime_status` of the deck's USB device (Linux only).
     status_path: Option<PathBuf>,
 }
@@ -68,6 +74,32 @@ pub fn detect() -> Result<Vec<Detected>> {
         .collect())
 }
 
+/// The key image format of `kind`, in protocol terms. `None` for decks without key images.
+pub fn native_image(kind: Kind) -> Option<NativeImage> {
+    let f = kind.key_image_format();
+    let mode = match f.mode {
+        ImageMode::None => return None,
+        ImageMode::BMP => NativeMode::Bmp,
+        ImageMode::JPEG => NativeMode::Jpeg,
+    };
+    Some(NativeImage {
+        mode,
+        size: (f.size.0 as u32, f.size.1 as u32),
+        rotation: match f.rotation {
+            ImageRotation::Rot0 => 0,
+            ImageRotation::Rot90 => 90,
+            ImageRotation::Rot180 => 180,
+            ImageRotation::Rot270 => 270,
+        },
+        mirror: match f.mirror {
+            ImageMirroring::None => NativeMirror::None,
+            ImageMirroring::X => NativeMirror::X,
+            ImageMirroring::Y => NativeMirror::Y,
+            ImageMirroring::Both => NativeMirror::Both,
+        },
+    })
+}
+
 pub fn device_info(kind: Kind, serial: Option<String>) -> DeviceInfo {
     let (rows, cols) = kind.key_layout();
     DeviceInfo {
@@ -76,6 +108,7 @@ pub fn device_info(kind: Kind, serial: Option<String>) -> DeviceInfo {
         rows,
         cols,
         key_size_px: kind.key_image_format().size.0 as u32,
+        native: native_image(kind),
     }
 }
 
@@ -134,6 +167,7 @@ impl Deck {
             events: rx,
             reader: Some(reader),
             kind: Some(kind),
+            native_frames: AtomicBool::new(false),
             status_path: if cfg!(target_os = "linux") {
                 crate::sleep::find_status_path(info_serial.as_deref())
             } else {
@@ -163,12 +197,19 @@ impl Deck {
         let (Some(kind), Some(serial)) = (self.kind, self.info.serial.clone()) else {
             bail!("cannot reopen this device");
         };
+        let native = self.native_frames();
         *self = Self::open(kind, serial).await?;
+        self.set_native_frames(native);
         Ok(())
     }
 
     /// A pretend 3x5, 72px deck. Key events come from stdin lines (see [`parse_fake_command`]).
     pub fn fake(out_dir: Option<PathBuf>) -> Result<Deck> {
+        Self::fake_with(out_dir, None)
+    }
+
+    /// Like [`Deck::fake`] with a native image format to report (tests).
+    pub fn fake_with(out_dir: Option<PathBuf>, native: Option<NativeImage>) -> Result<Deck> {
         if let Some(d) = &out_dir {
             std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
         }
@@ -178,6 +219,7 @@ impl Deck {
             rows: 3,
             cols: 5,
             key_size_px: 72,
+            native,
         };
         let (tx, rx) = mpsc::channel(64);
         let key_count = info.key_count();
@@ -205,12 +247,77 @@ impl Deck {
             events: rx,
             reader: Some(reader),
             kind: None,
+            native_frames: AtomicBool::new(false),
             status_path: None,
         })
     }
 
     pub fn is_fake(&self) -> bool {
         matches!(self.backend, Backend::Fake { .. })
+    }
+
+    /// Whether frames can be written straight to this deck: it takes JPEGs, so a server that
+    /// makes them in its native format saves the decode and second encode.
+    pub fn can_passthrough(&self) -> bool {
+        self.info
+            .native
+            .is_some_and(|n| n.mode == NativeMode::Jpeg && n.size.0 == self.info.key_size_px)
+    }
+
+    /// Whether server frames are device-ready (see [`Deck::set_native_frames`]).
+    pub fn native_frames(&self) -> bool {
+        self.native_frames.load(Ordering::Relaxed)
+    }
+
+    /// Set once the server confirmed native frames for this connection; only honoured when
+    /// the deck can take them.
+    pub fn set_native_frames(&self, on: bool) {
+        self.native_frames
+            .store(on && self.can_passthrough(), Ordering::Relaxed);
+    }
+
+    /// Show a frame as the server sent it: written to the device untouched if native frames
+    /// were agreed, otherwise an upright JPEG (see [`Deck::set_image_jpeg`]).
+    pub async fn set_image_frame(&self, key: u8, bytes: &[u8]) -> Result<()> {
+        if !self.native_frames() {
+            return self.set_image_jpeg(key, bytes).await;
+        }
+        if key >= self.info.key_count() {
+            bail!(
+                "key {key} out of range (deck has {} keys)",
+                self.info.key_count()
+            );
+        }
+        if !bytes.starts_with(&[0xff, 0xd8]) {
+            bail!("bad JPEG: no SOI marker");
+        }
+        match &self.backend {
+            Backend::Real(dev) => {
+                dev.write_image(key, bytes).await?;
+                dev.flush().await?;
+            }
+            Backend::Released => bail!("device is released (asleep)"),
+            Backend::Fake { out_dir } => {
+                // the files are for looking at: store them upright
+                let img = self.decode_frame(bytes)?;
+                if let Some(dir) = out_dir {
+                    let mut jpeg = Vec::new();
+                    img.write_to(&mut std::io::Cursor::new(&mut jpeg), ImageFormat::Jpeg)?;
+                    write_fake_image(dir, key, &jpeg)?;
+                }
+                info!(key, bytes = bytes.len(), "fake: native image set");
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode a frame (native or upright, as agreed) into an upright image.
+    pub fn decode_frame(&self, bytes: &[u8]) -> Result<DynamicImage> {
+        let size = self.info.key_size_px;
+        match self.info.native.filter(|_| self.native_frames()) {
+            Some(n) => Ok(unorient(decode_key_image(bytes, size)?, &n)),
+            None => decode_key_image(bytes, size),
+        }
     }
 
     /// Decode a JPEG frame from the server and show it on `key`.
@@ -282,7 +389,7 @@ impl Deck {
     /// (just the bar on black when nothing is cached).
     pub async fn show_offline_key(&self, key: u8, cached: Option<&[u8]>) -> Result<()> {
         let size = self.info.key_size_px;
-        let base = cached.and_then(|j| decode_key_image(j, size).ok());
+        let base = cached.and_then(|j| self.decode_frame(j).ok());
         let mut jpeg = Vec::new();
         offline_key_tile(base.as_ref(), size)
             .write_to(&mut std::io::Cursor::new(&mut jpeg), ImageFormat::Jpeg)?;
@@ -292,7 +399,7 @@ impl Deck {
     /// Undo [`Deck::show_offline_key`]: redraw the cached image (black when nothing is cached).
     pub async fn restore_key(&self, key: u8, cached: Option<&[u8]>) -> Result<()> {
         match cached {
-            Some(jpeg) => self.set_image_jpeg(key, jpeg).await,
+            Some(frame) => self.set_image_frame(key, frame).await,
             None => {
                 let mut jpeg = Vec::new();
                 RgbImage::from_pixel(1, 1, Rgb([0, 0, 0]))
@@ -359,6 +466,22 @@ pub fn decode_key_image(jpeg: &[u8], size: u32) -> Result<DynamicImage> {
         return Ok(img.resize_exact(size, size, image::imageops::FilterType::Triangle));
     }
     Ok(img)
+}
+
+/// Undoes a deck's native orientation (rotate, then mirror) to get the upright image back.
+pub fn unorient(img: DynamicImage, n: &NativeImage) -> DynamicImage {
+    let img = match n.mirror {
+        NativeMirror::None => img,
+        NativeMirror::X => img.fliph(),
+        NativeMirror::Y => img.flipv(),
+        NativeMirror::Both => img.fliph().flipv(),
+    };
+    match n.rotation {
+        90 => img.rotate270(),
+        180 => img.rotate180(),
+        270 => img.rotate90(),
+        _ => img,
+    }
 }
 
 fn write_fake_image(dir: &Path, key: u8, jpeg: &[u8]) -> Result<()> {
@@ -463,6 +586,122 @@ mod tests {
         assert!(px.get_pixel(36, 68).0[0] > 150, "red bar at the bottom");
         deck.restore_key(3, Some(&jpeg(72))).await.unwrap();
         assert_eq!(std::fs::read(dir.join("key-3.jpg")).unwrap(), jpeg(72));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn mk2() -> NativeImage {
+        native_image(Kind::Mk2).unwrap()
+    }
+
+    /// A 72px JPEG with a red top-left block on blue.
+    fn marked_jpeg(orient: impl Fn(RgbImage) -> RgbImage) -> Vec<u8> {
+        let mut img = RgbImage::from_pixel(72, 72, Rgb([0, 0, 255]));
+        for y in 0..24 {
+            for x in 0..24 {
+                img.put_pixel(x, y, Rgb([255, 0, 0]));
+            }
+        }
+        let mut out = Vec::new();
+        DynamicImage::ImageRgb8(orient(img))
+            .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Jpeg)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn native_formats_follow_the_kinds() {
+        let m = mk2();
+        assert_eq!(
+            (m.mode, m.size, m.rotation, m.mirror),
+            (NativeMode::Jpeg, (72, 72), 0, NativeMirror::Both)
+        );
+        let o = native_image(Kind::Original).unwrap();
+        assert_eq!(o.mode, NativeMode::Bmp);
+        let mini = native_image(Kind::Mini).unwrap();
+        assert_eq!((mini.rotation, mini.mirror), (90, NativeMirror::X));
+        assert_eq!(native_image(Kind::PlusXl).unwrap().rotation, 270);
+        assert!(native_image(Kind::Pedal).is_none());
+        assert_eq!(device_info(Kind::Mk2, None).native, Some(m));
+    }
+
+    #[tokio::test]
+    async fn passthrough_only_for_jpeg_decks() {
+        let jpeg_deck = Deck::fake_with(None, Some(mk2())).unwrap();
+        assert!(jpeg_deck.can_passthrough());
+        jpeg_deck.set_native_frames(true);
+        assert!(jpeg_deck.native_frames());
+        // BMP decks, decks without a format and wrong sizes always take the decode path
+        let bmp = Deck::fake_with(None, native_image(Kind::Original)).unwrap();
+        assert!(!bmp.can_passthrough());
+        bmp.set_native_frames(true);
+        assert!(!bmp.native_frames());
+        let plain = Deck::fake(None).unwrap();
+        plain.set_native_frames(true);
+        assert!(!plain.native_frames());
+    }
+
+    #[test]
+    fn unorient_inverts_the_vendored_conversion() {
+        for kind in [Kind::Mk2, Kind::Plus, Kind::PlusXl, Kind::Xl] {
+            let n = native_image(kind).unwrap();
+            let size = n.size.0;
+            let mut img = RgbImage::from_pixel(size, size, Rgb([0, 0, 0]));
+            for y in 0..size / 4 {
+                for x in 0..size / 2 {
+                    img.put_pixel(x, y, Rgb([255, 255, 255]));
+                }
+            }
+            // what set_button_image would send for this upright image
+            let sent = elgato_streamdeck::images::convert_image_with_format(
+                kind.key_image_format(),
+                DynamicImage::ImageRgb8(img),
+            )
+            .unwrap();
+            let back = unorient(
+                image::load_from_memory_with_format(&sent, ImageFormat::Jpeg).unwrap(),
+                &n,
+            )
+            .to_rgb8();
+            assert!(back.get_pixel(size / 4, 2).0[0] > 200, "{kind:?} marker");
+            assert!(back.get_pixel(size * 3 / 4, 2).0[0] < 60, "{kind:?} rest");
+            assert!(back.get_pixel(2, size - 3).0[0] < 60, "{kind:?} bottom");
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_deck_stores_native_frames_upright() {
+        let dir = std::env::temp_dir().join(format!("sdc-fake-native-{}", std::process::id()));
+        let deck = Deck::fake_with(Some(dir.clone()), Some(mk2())).unwrap();
+        // not agreed yet: the frame is taken as upright and stored as is
+        let upright = marked_jpeg(|i| i);
+        deck.set_image_frame(1, &upright).await.unwrap();
+        assert_eq!(std::fs::read(dir.join("key-1.jpg")).unwrap(), upright);
+
+        deck.set_native_frames(true);
+        // MK.2 frame: the server rotated the marker to the bottom-right
+        let native = marked_jpeg(|i| image::imageops::rotate180(&i));
+        deck.set_image_frame(2, &native).await.unwrap();
+        let stored = image::open(dir.join("key-2.jpg")).unwrap().to_rgb8();
+        assert!(
+            stored.get_pixel(8, 8).0[0] > 200,
+            "marker upright, top-left"
+        );
+        assert!(stored.get_pixel(64, 64).0[2] > 200, "blue elsewhere");
+        // garbage is rejected rather than sent to the deck
+        assert!(deck.set_image_frame(2, b"nope").await.is_err());
+
+        // offline feedback decodes the native cache entry upright
+        deck.show_offline_key(3, Some(&native)).await.unwrap();
+        let shown = image::open(dir.join("key-3.jpg")).unwrap().to_rgb8();
+        assert!(
+            shown.get_pixel(8, 8).0[0] > 40,
+            "dimmed marker stays top-left"
+        );
+        assert!(shown.get_pixel(8, 8).0[0] < 120);
+        assert!(shown.get_pixel(36, 68).0[0] > 150, "red bar at the bottom");
+        deck.restore_key(3, Some(&native)).await.unwrap();
+        let back = image::open(dir.join("key-3.jpg")).unwrap().to_rgb8();
+        assert!(back.get_pixel(8, 8).0[0] > 200);
         std::fs::remove_dir_all(dir).ok();
     }
 }

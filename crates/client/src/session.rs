@@ -173,7 +173,7 @@ async fn resume(
         let Some(jpeg) = cache.get(&key) else {
             continue;
         };
-        if let Err(e) = deck.set_image_jpeg(key, jpeg).await {
+        if let Err(e) = deck.set_image_frame(key, jpeg).await {
             if is_device_error(deck, &e) {
                 return Err(format!("device error: {e:#}"));
             }
@@ -270,9 +270,19 @@ pub enum End {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     None,
+    /// The server accepted us; `native_frames`: its images are in the deck's native format.
+    Welcome {
+        native_frames: bool,
+    },
     Brightness(u8),
-    Image { key: u8, jpeg: Vec<u8> },
-    Update { path: String, sha256: String },
+    Image {
+        key: u8,
+        jpeg: Vec<u8>,
+    },
+    Update {
+        path: String,
+        sha256: String,
+    },
 }
 
 /// Pure decoding of a websocket frame into an [`Action`].
@@ -281,7 +291,10 @@ pub fn handle_message(msg: &Message) -> Result<Action> {
         Message::Text(t) => match serde_json::from_str::<ServerMessage>(t)
             .map_err(|e| anyhow!("bad server message {t:?}: {e}"))?
         {
-            ServerMessage::Welcome { protocol_version } => {
+            ServerMessage::Welcome {
+                protocol_version,
+                native_frames,
+            } => {
                 if protocol_version != PROTOCOL_VERSION {
                     warn!(
                         protocol_version,
@@ -289,7 +302,7 @@ pub fn handle_message(msg: &Message) -> Result<Action> {
                         "protocol version mismatch"
                     );
                 }
-                Ok(Action::None)
+                Ok(Action::Welcome { native_frames })
             }
             ServerMessage::Brightness { percent } => Ok(Action::Brightness(percent.min(100))),
             ServerMessage::Update { path, sha256 } => Ok(Action::Update { path, sha256 }),
@@ -473,6 +486,16 @@ async fn session(
                 }
                 match handle_message(&m) {
                     Ok(Action::None) => {}
+                    Ok(Action::Welcome { native_frames }) => {
+                        // Cached frames are in the old mode's format: drop them rather than
+                        // draw them wrong (the server re-sends every image anyway).
+                        let on = native_frames && deck.can_passthrough();
+                        if on != deck.native_frames() {
+                            cache.clear();
+                            deck.set_native_frames(on);
+                        }
+                        info!(native_frames = on, "single-encode frames");
+                    }
                     Ok(Action::Brightness(p)) => {
                         info!(percent = p, "brightness");
                         if sleeper.brightness(p, Instant::now()) {
@@ -514,7 +537,7 @@ async fn session(
                         cache.insert(key, jpeg.clone());
                         // while asleep the device is closed: drawn when it wakes
                         if !sleeper.image(key, changed) {
-                            if let Err(e) = deck.set_image_jpeg(key, &jpeg).await {
+                            if let Err(e) = deck.set_image_frame(key, &jpeg).await {
                                 if is_device_error(deck, &e) {
                                     return Ok(End::Device(format!("device error: {e:#}")));
                                 }
@@ -547,7 +570,19 @@ mod tests {
         let m = Message::text(r#"{"type":"brightness","percent":150}"#);
         assert_eq!(handle_message(&m).unwrap(), Action::Brightness(100));
         let m = Message::text(r#"{"type":"welcome","protocol_version":1}"#);
-        assert_eq!(handle_message(&m).unwrap(), Action::None);
+        assert_eq!(
+            handle_message(&m).unwrap(),
+            Action::Welcome {
+                native_frames: false
+            }
+        );
+        let m = Message::text(r#"{"type":"welcome","protocol_version":1,"native_frames":true}"#);
+        assert_eq!(
+            handle_message(&m).unwrap(),
+            Action::Welcome {
+                native_frames: true
+            }
+        );
         let m = Message::text(r#"{"type":"update","path":"/client/x","sha256":"ab"}"#);
         assert_eq!(
             handle_message(&m).unwrap(),

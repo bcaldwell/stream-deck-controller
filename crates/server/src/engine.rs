@@ -852,9 +852,11 @@ impl Engine {
                     info.page,
                     if down { "press" } else { "release" }
                 );
-                let jpeg = self
-                    .renderer
-                    .render(&RenderSpec::error(), c.device.key_size_px);
+                let jpeg = self.renderer.render_for(
+                    &RenderSpec::error(),
+                    c.device.key_size_px,
+                    c.device.native.as_ref(),
+                );
                 self.send_if_changed(id, key, jpeg);
             }
         }
@@ -1025,7 +1027,10 @@ impl Engine {
             groups.push((vec![key], deps));
         }
         let page = c.page.clone();
-        let mut jpegs = self.renderer.encode_all(jobs).into_iter();
+        let mut jpegs = self
+            .renderer
+            .encode_all(jobs, c.device.native.as_ref())
+            .into_iter();
         tracing::debug!(
             client = id,
             page,
@@ -1227,6 +1232,7 @@ mod tests {
             rows: 3,
             cols: 5,
             key_size_px: 72,
+            native: None,
         }
     }
 

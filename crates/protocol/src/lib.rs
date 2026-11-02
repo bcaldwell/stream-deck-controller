@@ -95,6 +95,53 @@ pub struct DeviceInfo {
     pub cols: u8,
     /// Square key image size in pixels the server should render at.
     pub key_size_px: u32,
+    /// The deck's native key image format. When present the server may send device-ready
+    /// frames (see [`ServerMessage::Welcome::native_frames`]); absent from older clients and
+    /// browser decks, which get upright JPEGs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeImage>,
+}
+
+/// Encoding of a deck's native key images (mirrors `elgato-streamdeck`'s `ImageMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeMode {
+    Jpeg,
+    Bmp,
+    /// Anything a newer peer sends that this one does not know.
+    #[serde(other)]
+    Other,
+}
+
+/// Mirroring a deck wants applied after rotation (mirrors `ImageMirroring`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeMirror {
+    None,
+    X,
+    Y,
+    Both,
+}
+
+/// The image format a deck takes on its keys: the upright image is rotated clockwise by
+/// `rotation` degrees, resized to `size`, mirrored, then encoded as `mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeImage {
+    pub mode: NativeMode,
+    pub size: (u32, u32),
+    /// 0, 90, 180 or 270 degrees clockwise.
+    pub rotation: u16,
+    pub mirror: NativeMirror,
+}
+
+impl NativeImage {
+    /// Whether the server can produce these frames for a square `key_size_px` key: JPEG,
+    /// a size equal to the key size and a right-angle rotation.
+    pub fn server_can_produce(&self, key_size_px: u32) -> bool {
+        self.mode == NativeMode::Jpeg
+            && self.size == (key_size_px, key_size_px)
+            && matches!(self.rotation, 0 | 90 | 180 | 270)
+    }
 }
 
 impl DeviceInfo {
@@ -143,6 +190,11 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     Welcome {
         protocol_version: u32,
+        /// Binary frames are device-ready JPEGs in the `DeviceInfo::native` format the client
+        /// sent (rotated, mirrored, encoded once), to be written to the deck as they are.
+        /// Absent/false: upright JPEGs the client converts itself.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        native_frames: bool,
     },
     /// Set brightness 0-100.
     Brightness {
@@ -258,8 +310,9 @@ pub enum PluginServerMessage {
 }
 
 /// Binary frame layout (server -> client): `[key: u8][image bytes...]`.
-/// Image bytes are a JPEG already rendered at `key_size_px`, upright; the client
-/// is responsible for any device-specific rotation/flip.
+/// Image bytes are a JPEG already rendered at `key_size_px`. Normally upright, and the client
+/// is responsible for any device-specific rotation/flip; if `Welcome.native_frames` is set they
+/// are already in the client's native format.
 pub struct ImageFrame<'a> {
     pub key: u8,
     pub image: &'a [u8],
@@ -302,6 +355,65 @@ mod tests {
             ),
             _ => panic!("not hello"),
         }
+    }
+
+    #[test]
+    fn old_welcome_and_device_parse_and_native_roundtrips() {
+        let w: ServerMessage =
+            serde_json::from_str(r#"{"type":"welcome","protocol_version":1}"#).unwrap();
+        assert!(matches!(
+            w,
+            ServerMessage::Welcome {
+                native_frames: false,
+                ..
+            }
+        ));
+        let w = ServerMessage::Welcome {
+            protocol_version: 1,
+            native_frames: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&w).unwrap(),
+            r#"{"type":"welcome","protocol_version":1}"#
+        );
+        let w: ServerMessage =
+            serde_json::from_str(r#"{"type":"welcome","protocol_version":1,"native_frames":true}"#)
+                .unwrap();
+        assert!(matches!(
+            w,
+            ServerMessage::Welcome {
+                native_frames: true,
+                ..
+            }
+        ));
+        let d = DeviceInfo {
+            model: "m".into(),
+            serial: None,
+            rows: 3,
+            cols: 5,
+            key_size_px: 72,
+            native: Some(NativeImage {
+                mode: NativeMode::Jpeg,
+                size: (72, 72),
+                rotation: 180,
+                mirror: NativeMirror::None,
+            }),
+        };
+        let j = serde_json::to_string(&d).unwrap();
+        assert!(
+            j.contains(r#""native":{"mode":"jpeg","size":[72,72],"rotation":180,"mirror":"none"}"#)
+        );
+        assert_eq!(serde_json::from_str::<DeviceInfo>(&j).unwrap(), d);
+        let mut old = d.clone();
+        old.native = None;
+        assert!(!serde_json::to_string(&old).unwrap().contains("native"));
+        let unknown: NativeImage =
+            serde_json::from_str(r#"{"mode":"png","size":[1,1],"rotation":0,"mirror":"x"}"#)
+                .unwrap();
+        assert_eq!(unknown.mode, NativeMode::Other);
+        assert!(d.native.unwrap().server_can_produce(72));
+        assert!(!d.native.unwrap().server_can_produce(96));
+        assert!(!unknown.server_can_produce(1));
     }
 
     #[test]

@@ -139,7 +139,7 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
     let ClientMessage::Hello {
         protocol_version,
         client_id,
-        device,
+        mut device,
         client_target,
         client_sha256,
         mirror,
@@ -184,10 +184,22 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
         );
     }
     let key_count = device.key_count();
+    // Device-ready frames only for a physical deck whose format we can produce; everyone else
+    // keeps getting upright JPEGs.
+    if deck.is_some()
+        || mirror.is_some()
+        || !device
+            .native
+            .is_some_and(|n| n.server_can_produce(device.key_size_px))
+    {
+        device.native = None;
+    }
+    let native_frames = device.native.is_some();
 
     sink.send(Message::Text(
         serde_json::to_string(&ServerMessage::Welcome {
             protocol_version: PROTOCOL_VERSION,
+            native_frames,
         })?
         .into(),
     ))
