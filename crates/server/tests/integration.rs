@@ -44,12 +44,14 @@ sdc.export("lamp", sdc.button{
   press = function() ha.call("light", "toggle", { entity_id = "light.office" }) end,
 })
 sdc.export("static", sdc.button{ render = { text = "Static" } })
+local dial_mode = {}
 sdc.export("dimmer", sdc.dial{
-  render = function()
+  render = function(ctx)
     local l = ha.state("light.dial")
-    return { title = "Dimmer", value = l and l.state or "?", indicator = 40 }
+    return { title = dial_mode[ctx.slot] or "Dimmer", value = l and l.state or "?", indicator = 40 }
   end,
   rotate = function(ctx, ticks) ha.call("light", "turn_on", { entity_id = "light.dial", step = ticks }) end,
+  press = function(ctx) dial_mode[ctx.slot] = "Warmth" end,
 })
 "##;
 
@@ -1174,6 +1176,13 @@ async fn plugin_subscribe_render_dependencies_and_input() {
     assert_eq!(
         cmd,
         expect_call(json!({"entity_id": "light.dial", "step": -4}), "turn_on")
+    );
+    // a press that only changes Lua state still redraws the dial
+    plugin_send(&mut c, PluginClientMessage::DialDown { slot: "d1".into() }).await;
+    let msgs = plugin_drain(&mut c, Duration::from_millis(300)).await;
+    assert!(
+        matches!(msgs.as_slice(), [PluginServerMessage::DialFeedback { slot, title, .. }] if slot == "d1" && title == "Warmth"),
+        "{msgs:?}"
     );
 
     // unsubscribed slots stop updating

@@ -417,5 +417,7 @@ impl Engine {
         if let Err(e) = rt.dial_input(&def, &info, input) {
             tracing::error!("export dial {slot} {input:?}: {e:#}");
         }
+        // Handlers may change Lua state that `render` reads (a dial's mode, say); unchanged output is not resent.
+        self.render_slot(id, slot);
     }
 }

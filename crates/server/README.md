@@ -198,6 +198,8 @@ sdc.export("living_dimmer", sdc.dial {
 - Every subscribed slot has its own render, dependencies and "changed" check, so a state change re-renders and
   sends only the slots that read that entity, and only if the image actually changed. A config reload re-resolves
   every slot by export id: a removed export (or one that changed kind) gives that slot a `SlotError`.
+- A dial slot is also re-rendered after each of its handlers runs, so a dial can keep its own state in Lua (keyed by
+  `ctx.slot`, e.g. a mode that `press` cycles) and show it right away.
 
 ## Plugin websocket (`/plugin/ws`)
 
