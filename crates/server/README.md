@@ -179,7 +179,8 @@ red ERR tile until its next render. A connection may hold 256 slots; `size_px` m
 ## Icons and images
 
 - `icon`: a picture fitted inside the key (with padding, aspect ratio kept) over `bg`; with `text`, the
-  picture takes the top half and the text the bottom half. Transparent PNGs show `bg` through.
+  picture takes the top ~58% of the key and the text sits in a band along the bottom edge (a label that
+  wraps onto two lines gets a taller band, so the icon shrinks a little). Transparent PNGs show `bg` through.
 - `image`: a full-bleed picture, scaled to cover the whole key (center-cropped). `text` is drawn on top
   along the bottom, over a subtle dark gradient and shadow so it stays legible. `icon` can still be
   combined with it.

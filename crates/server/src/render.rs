@@ -20,6 +20,14 @@ const JPEG_QUALITY: u8 = 90;
 const PAD: f32 = 4.0;
 const MIN_FONT_PX: f32 = 9.0;
 const LINE: f32 = 1.15;
+/// Layout of a key with an `icon` and `text` (fractions of the canvas's shorter side): the icon
+/// starts `ICON_TOP` from the top; the text sits in a band `TEXT_BAND` tall, `TEXT_MARGIN` above
+/// the bottom edge, with its last line on the band's bottom.
+const ICON_TOP: f32 = 0.04;
+const TEXT_MARGIN: f32 = 0.04;
+const TEXT_BAND: f32 = 0.33;
+/// Taller band for text that wraps onto several lines.
+const TEXT_BAND_MULTI: f32 = 0.42;
 /// How long a failed download is remembered before it is tried again.
 const FAIL_TTL: Duration = Duration::from_secs(60);
 pub const ERR_BG: Color = Color([0xb0, 0x00, 0x20]);
@@ -615,6 +623,13 @@ impl Painter {
             w: w as f32 - 2.0 * pad,
             h: h as f32 - 2.0 * pad,
         };
+        let ipad = pad * 0.75;
+        let icon_only = Area {
+            x: ipad,
+            y: ipad,
+            w: w as f32 - 2.0 * ipad,
+            h: h as f32 - 2.0 * ipad,
+        };
         let full = Area {
             x: 0.0,
             y: 0.0,
@@ -625,19 +640,36 @@ impl Painter {
         let text = spec.text.as_deref().filter(|t| !t.is_empty());
 
         let (icon_area, text_area, text_max) = match (icon.is_some(), text) {
-            (true, Some(_)) => {
-                let ih = (inner.h * 0.5).round();
+            // big icon on top, the label in a band hugging the bottom edge
+            (true, Some(t)) => {
+                // a second line of text takes room from the icon, so it stays readable
+                let lines = wrap(&self.font, s * 0.22, t, inner.w).0.len();
+                let band = if lines > 1 {
+                    TEXT_BAND_MULTI
+                } else {
+                    TEXT_BAND
+                };
+                let top = (s * ICON_TOP).round();
+                let margin = (s * TEXT_MARGIN).round();
+                let band = (s * band).round();
+                let text_y = h as f32 - margin - band;
                 (
-                    Some(Area { h: ih, ..inner }),
                     Some(Area {
-                        y: inner.y + ih,
-                        h: inner.h - ih,
-                        ..inner
+                        x: pad,
+                        y: top,
+                        w: inner.w,
+                        h: text_y - top,
+                    }),
+                    Some(Area {
+                        x: pad,
+                        y: text_y,
+                        w: inner.w,
+                        h: band,
                     }),
                     s * 0.22,
                 )
             }
-            (true, None) => (Some(inner), None, 0.0),
+            (true, None) => (Some(icon_only), None, 0.0),
             // label along the bottom of a full-bleed picture
             (false, Some(_)) if image.is_some() => (
                 None,
@@ -689,9 +721,19 @@ impl Painter {
                     Color::BLACK,
                     spec.font_size,
                     text_max,
+                    false,
                 );
             }
-            self.draw_text(&mut img, text, area, spec.fg, spec.font_size, text_max);
+            let bottom = icon.is_some() && image.is_none();
+            self.draw_text(
+                &mut img,
+                text,
+                area,
+                spec.fg,
+                spec.font_size,
+                text_max,
+                bottom,
+            );
         }
         img
     }
@@ -728,9 +770,11 @@ impl Painter {
             Color::WHITE,
             None,
             (label.h * 0.6).min(img.width() as f32 * 0.32),
+            false,
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_text(
         &self,
         img: &mut RgbImage,
@@ -739,6 +783,7 @@ impl Painter {
         fg: Color,
         font_size: Option<f32>,
         auto_max: f32,
+        bottom: bool,
     ) {
         let (px, lines) = match font_size {
             Some(px) => (px, wrap(&self.font, px, text, area.w).0),
@@ -747,7 +792,11 @@ impl Painter {
         let sf = self.font.as_scaled(PxScale::from(px));
         let line_h = px * LINE;
         let total_h = line_h * lines.len() as f32;
-        let mut top = area.y + (area.h - total_h) / 2.0;
+        let mut top = if bottom {
+            area.y + area.h - total_h
+        } else {
+            area.y + (area.h - total_h) / 2.0
+        };
         for line in &lines {
             let w = text_width(&self.font, px, line);
             let x = area.x + (area.w - w) / 2.0;
@@ -1427,5 +1476,64 @@ mod tests {
         assert!(!ink(&tiles[0], 0..20, 0..20));
         assert!(!ink(&tiles[3], 52..72, 52..72));
         assert_eq!(gap_px(18, 96), 24);
+    }
+
+    /// Bounding box (y range) of pixels matching `f`.
+    fn y_extent(img: &RgbImage, f: impl Fn(&Rgb<u8>) -> bool) -> Option<(u32, u32)> {
+        let ys: Vec<u32> = img
+            .enumerate_pixels()
+            .filter(|(_, _, p)| f(p))
+            .map(|(_, y, _)| y)
+            .collect();
+        Some((*ys.iter().min()?, *ys.iter().max()?))
+    }
+
+    #[test]
+    fn icon_with_text_is_big_and_the_text_hugs_the_bottom() {
+        let green = RgbaImage::from_pixel(64, 64, image::Rgba([0, 200, 0, 255]));
+        let dir = png_dir("layout", &[("sq.png", green)]);
+        for size in [72u32, 144] {
+            let mut r = Renderer::new(dir.clone());
+            let img = r.render_image(
+                &RenderSpec {
+                    icon: Some("sq.png".into()),
+                    text: Some("80%".into()),
+                    ..Default::default()
+                },
+                size,
+            );
+            let s = size as f32;
+            let is_icon = |p: &Rgb<u8>| p.0[1] > 150 && p.0[0] < 60;
+            let (top, bottom) = y_extent(&img, is_icon).unwrap();
+            let icon_h = (bottom - top + 1) as f32;
+            // before: the icon was at most half of the inner area (~0.44 of the key)
+            assert!(icon_h >= 0.52 * s, "icon {icon_h}px of {size}");
+            assert!(top as f32 <= 0.08 * s);
+            let (t_top, t_bottom) = y_extent(&img, |p| p.0[0] > 150 && p.0[1] > 150).unwrap();
+            assert!(t_top > bottom, "text below the icon");
+            assert!(t_bottom as f32 >= 0.84 * s, "text baseline low: {t_bottom}");
+            assert!(
+                t_bottom as f32 <= s - 0.03 * s,
+                "text keeps a margin: {t_bottom}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_line_icon_text_fits_below_the_icon() {
+        let green = RgbaImage::from_pixel(64, 64, image::Rgba([0, 200, 0, 255]));
+        let dir = png_dir("layout2", &[("sq.png", green)]);
+        let mut r = Renderer::new(dir);
+        let img = r.render_image(
+            &RenderSpec {
+                icon: Some("sq.png".into()),
+                text: Some("Office\n100%".into()),
+                ..Default::default()
+            },
+            72,
+        );
+        let (_, bottom) = y_extent(&img, |p| p.0[1] > 150 && p.0[0] < 60).unwrap();
+        let (t_top, t_bottom) = y_extent(&img, |p| p.0[0] > 150 && p.0[1] > 150).unwrap();
+        assert!(t_top > bottom && t_bottom < 72);
     }
 }
