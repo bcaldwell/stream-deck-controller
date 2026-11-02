@@ -29,7 +29,7 @@ const ICON_TOP: f32 = 0.06;
 const ICON_GAP: f32 = 0.03;
 const TEXT_MARGIN: f32 = 0.05;
 const TEXT_FONT: f32 = 0.2;
-const TEXT_FONT_MULTI: f32 = 0.15;
+const TEXT_FONT_MULTI: f32 = 0.18;
 /// Box (fraction of the shorter side, centered) for a key with only an icon.
 const ICON_ONLY: f32 = 0.66;
 /// Alpha at or below this counts as empty when trimming an icon's transparent border.
