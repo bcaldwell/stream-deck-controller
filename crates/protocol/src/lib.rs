@@ -16,6 +16,12 @@
 //! service manager brings it back). Both fields are optional so older clients/servers interoperate
 //! and the protocol version stays 1.
 //!
+//! Elgato plugin: the Stream Deck plugin (`plugins/elgato`) is a different kind of client on its
+//! own route, `/plugin/ws` (same bearer token). Instead of a deck with pages it subscribes
+//! *slots* (Elgato action instances) to buttons and dials the Lua config exported with
+//! `sdc.export`, see [`PluginClientMessage`] / [`PluginServerMessage`]. All messages are JSON text
+//! frames; images are base64 PNGs because the Elgato SDK takes data URLs.
+//!
 //! Browser decks use the same messages on `/deck/ws` (behind the cluster's SSO instead of the
 //! client token). `Hello.mirror` makes such a connection a viewer of another client's deck.
 
@@ -124,6 +130,103 @@ pub enum ServerMessage {
     },
 }
 
+/// What an export is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotKind {
+    /// A button (`sdc.button` / `sdc.span`), shown as an image on a key.
+    Key,
+    /// An `sdc.dial`, shown as feedback on a Stream Deck + dial.
+    Dial,
+}
+
+/// One entry of the server's export list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportItem {
+    pub id: String,
+    pub kind: SlotKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Plugin -> server (`/plugin/ws`). `slot` is the Elgato action context id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginClientMessage {
+    PluginHello {
+        protocol_version: u32,
+        client_id: String,
+    },
+    /// Show export `export` in `slot`. Keys are rendered at `size_px` square. Subscribing an
+    /// already subscribed slot replaces it.
+    Subscribe {
+        slot: String,
+        export: String,
+        kind: SlotKind,
+        size_px: u32,
+    },
+    Unsubscribe {
+        slot: String,
+    },
+    SlotDown {
+        slot: String,
+    },
+    SlotUp {
+        slot: String,
+    },
+    /// Net rotation since the last message (negative = counter-clockwise); the plugin batches.
+    DialRotate {
+        slot: String,
+        ticks: i32,
+    },
+    DialDown {
+        slot: String,
+    },
+    DialUp {
+        slot: String,
+    },
+    TouchTap {
+        slot: String,
+    },
+    /// Ask for [`PluginServerMessage::Exports`] again.
+    ListExports,
+}
+
+/// Server -> plugin (`/plugin/ws`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginServerMessage {
+    PluginWelcome {
+        protocol_version: u32,
+    },
+    /// All exports; sent after the welcome, on `ListExports` and whenever the config reloads.
+    Exports {
+        items: Vec<ExportItem>,
+    },
+    /// A key's image (PNG), sent only when it changed.
+    KeyImage {
+        slot: String,
+        png_base64: String,
+    },
+    /// A dial's content, sent only when it changed. `indicator` is 0-100.
+    DialFeedback {
+        slot: String,
+        title: String,
+        value: String,
+        indicator: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_png_base64: Option<String>,
+    },
+    /// The slot cannot show its export (unknown, removed, wrong kind, bad size).
+    SlotError {
+        slot: String,
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
 /// Binary frame layout (server -> client): `[key: u8][image bytes...]`.
 /// Image bytes are a JPEG already rendered at `key_size_px`, upright; the client
 /// is responsible for any device-specific rotation/flip.
@@ -163,6 +266,38 @@ mod tests {
             } => assert!(client_target.is_none() && client_sha256.is_none() && mirror.is_none()),
             _ => panic!("not hello"),
         }
+    }
+
+    #[test]
+    fn plugin_messages_roundtrip() {
+        let m = PluginClientMessage::Subscribe {
+            slot: "s".into(),
+            export: "e".into(),
+            kind: SlotKind::Dial,
+            size_px: 144,
+        };
+        let j = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            j,
+            r#"{"type":"subscribe","slot":"s","export":"e","kind":"dial","size_px":144}"#
+        );
+        assert_eq!(serde_json::from_str::<PluginClientMessage>(&j).unwrap(), m);
+        let j = r#"{"type":"list_exports"}"#;
+        assert_eq!(
+            serde_json::from_str::<PluginClientMessage>(j).unwrap(),
+            PluginClientMessage::ListExports
+        );
+        let e = PluginServerMessage::Exports {
+            items: vec![ExportItem {
+                id: "a".into(),
+                kind: SlotKind::Key,
+                label: None,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"type":"exports","items":[{"id":"a","kind":"key"}]}"#
+        );
     }
 
     #[test]

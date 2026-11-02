@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use image::RgbaImage;
-use sdc_protocol::DeviceInfo;
+use sdc_protocol::{DeviceInfo, PluginClientMessage};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
@@ -17,6 +17,11 @@ use crate::assets::{Assets, Fetcher, HaApi, S3Config};
 use crate::ha::{HaCommand, HaEvent};
 use crate::lua_api::{Cell, CtxInfo, Host, IdleConfig, LuaRuntime, Settings, SpanCell};
 use crate::render::{gap_px, Color, RenderSpec, Renderer, SpanGeom, DEFAULT_GAP};
+
+mod plugin;
+
+pub use plugin::PluginOut;
+use plugin::{Plugin, SlotDeps};
 
 pub type ClientId = u64;
 
@@ -80,6 +85,18 @@ pub enum EngineEvent {
         tx: UnboundedSender<Out>,
     },
     ClientDisconnected(ClientId),
+    /// An Elgato plugin connected on `/plugin/ws`; it gets the export list right away.
+    PluginConnected {
+        id: ClientId,
+        client_id: String,
+        tx: UnboundedSender<PluginOut>,
+    },
+    PluginDisconnected(ClientId),
+    /// A message from a connected plugin (anything but its hello).
+    Plugin {
+        id: ClientId,
+        msg: PluginClientMessage,
+    },
     /// The connected decks (not viewers), for the device picker.
     ListClients(tokio::sync::oneshot::Sender<Vec<DeckInfo>>),
     KeyDown {
@@ -135,6 +152,10 @@ pub struct Engine {
     /// dependency -> keys whose last render read it: an entity id, or `img:<cache key>` for a
     /// remote image (so keys re-render when their download completes)
     rev_deps: HashMap<String, HashSet<(ClientId, u8)>>,
+    /// Elgato plugin connections and the slots they subscribed.
+    plugins: BTreeMap<ClientId, Plugin>,
+    /// The same dependency tracking as `key_deps`/`rev_deps`, for plugin slots.
+    slot_deps: SlotDeps,
 }
 
 impl Engine {
@@ -154,6 +175,8 @@ impl Engine {
             remembered: HashMap::new(),
             key_deps: HashMap::new(),
             rev_deps: HashMap::new(),
+            plugins: BTreeMap::new(),
+            slot_deps: SlotDeps::default(),
         }
     }
 
@@ -188,6 +211,7 @@ impl Engine {
         self.renderer.clear_icon_cache();
         self.key_deps.clear();
         self.rev_deps.clear();
+        self.slot_deps.clear();
         let default = self.default_page();
         let rt = self.runtime.as_ref().expect("just set");
         for name in rt.static_image_names() {
@@ -198,6 +222,7 @@ impl Engine {
                 c.page = default.clone();
             }
         }
+        self.push_exports();
         self.render_all_clients();
         // Tell clients about brightness the new config changed; a client is not woken or put
         // to sleep here (the next tick does that if the idle settings now say so).
@@ -324,6 +349,11 @@ impl Engine {
                 );
                 self.render_client(id);
             }
+            EngineEvent::PluginConnected { id, client_id, tx } => {
+                self.plugin_connected(id, client_id, tx)
+            }
+            EngineEvent::PluginDisconnected(id) => self.plugin_disconnected(id),
+            EngineEvent::Plugin { id, msg } => self.plugin_message(id, msg),
             EngineEvent::ListClients(reply) => {
                 let _ = reply.send(
                     self.clients
@@ -474,6 +504,7 @@ impl Engine {
             let ids: Vec<u8> = chunk.iter().map(|(_, k)| *k).collect();
             self.render_keys(chunk[0].0, &ids);
         }
+        self.slots_depending_on(entity);
     }
 
     fn settings(&self) -> Settings {
@@ -590,6 +621,7 @@ impl Engine {
         for id in ids {
             self.render_client(id);
         }
+        self.render_all_slots();
     }
 
     fn render_client(&mut self, id: ClientId) {
@@ -810,6 +842,7 @@ fn ctx_info(c: &Client, key: u8) -> CtxInfo {
         cols: c.device.cols,
         span: None,
         span_index: None,
+        slot: None,
     }
 }
 

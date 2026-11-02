@@ -3,8 +3,9 @@
 //! - `GET /client/<target>`         client binary (404 if the server has none for the target)
 //! - `GET /client/<target>.sha256`  its hex sha256
 //! - `GET /healthz`                 readiness probe
+//! - `GET /plugin/ws`               websocket for the Elgato plugin (same token as `/ws`)
 //!
-//! With a client token configured, `/ws` and `/client/*` need `Authorization: Bearer <token>`.
+//! With a client token configured, `/ws`, `/plugin/ws` and `/client/*` need `Authorization: Bearer <token>`.
 //!
 //! The browser deck lives under `/deck` and is authenticated differently: the cluster's SSO
 //! (Traefik forwardAuth -> oauth2-proxy) puts the user in `X-Auth-Request-Email`, which every
@@ -74,6 +75,7 @@ pub fn router(
         .route_layer(middleware::from_fn_with_state(deck_auth, deck_guard));
     Router::new()
         .route("/ws", get(ws::upgrade))
+        .route("/plugin/ws", get(ws::plugin_upgrade))
         .route("/client/{file}", get(client_file))
         .route("/healthz", get(|| async { "ok" }))
         .merge(deck)

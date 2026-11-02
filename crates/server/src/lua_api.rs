@@ -10,6 +10,8 @@ use anyhow::{anyhow, Context, Result};
 use mlua::{serde::SerializeOptions, Function, Lua, LuaSerdeExt, Table, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
+use sdc_protocol::{ExportItem, SlotKind};
+
 use crate::ha::{EntityState, HaCommand};
 use crate::render::{Color, RenderSpec};
 
@@ -42,6 +44,62 @@ pub struct ButtonDef {
     release: Option<Function>,
     /// Set for `sdc.span{...}`: the button covers a rectangle of keys.
     pub span: Option<SpanDef>,
+}
+
+/// `sdc.dial{...}`: a Stream Deck + dial (plugin only, see [`Export`]).
+#[derive(Clone)]
+pub struct DialDef {
+    render: Value,
+    rotate: Option<Function>,
+    press: Option<Function>,
+    release: Option<Function>,
+    touch: Option<Function>,
+}
+
+/// What `sdc.export` registered: a button or span (shown as an image) or a dial.
+#[derive(Clone)]
+pub enum Export {
+    Button(ButtonDef),
+    Dial(DialDef),
+}
+
+/// The input a dial handler is called for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialInput {
+    Rotate(i32),
+    Press,
+    Release,
+    Touch,
+}
+
+/// What a dial's `render` produces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DialSpec {
+    pub title: String,
+    pub value: String,
+    /// 0-100
+    pub indicator: u8,
+    pub icon: Option<String>,
+    /// Behind the icon.
+    pub bg: Color,
+}
+
+impl Default for DialSpec {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            value: String::new(),
+            indicator: 0,
+            icon: None,
+            bg: Color::BLACK,
+        }
+    }
+}
+
+pub struct DialOutcome {
+    pub spec: DialSpec,
+    pub deps: HashSet<String>,
+    pub error: Option<String>,
 }
 
 /// Size of an `sdc.span`, and its own gap between keys (px at 72 px keys) if it sets one.
@@ -126,6 +184,7 @@ struct Registry {
     pages: Vec<(String, Vec<Option<ButtonDef>>)>,
     default: Option<String>,
     settings: Settings,
+    exports: Vec<(String, Export, Option<String>)>,
 }
 
 /// Per-call context handed to Lua as `ctx`.
@@ -139,6 +198,9 @@ pub struct CtxInfo {
     /// Set when the call is for a span: its size and (for presses) the pressed key's position.
     pub span: Option<(u8, u8)>,
     pub span_index: Option<u8>,
+    /// Set when the call is for an Elgato plugin slot: `ctx` then has `slot` (and no `key`,
+    /// `page`, `rows`, `cols`).
+    pub slot: Option<String>,
 }
 
 pub struct RenderOutcome {
@@ -335,13 +397,94 @@ impl LuaRuntime {
         Ok(self.host.pending_goto.borrow_mut().take())
     }
 
+    /// The exports plugins can see, in definition order.
+    pub fn exports(&self) -> Vec<ExportItem> {
+        self.registry
+            .borrow()
+            .exports
+            .iter()
+            .map(|(id, e, label)| ExportItem {
+                id: id.clone(),
+                kind: match e {
+                    Export::Button(_) => SlotKind::Key,
+                    Export::Dial(_) => SlotKind::Dial,
+                },
+                label: label.clone(),
+            })
+            .collect()
+    }
+
+    pub fn export(&self, id: &str) -> Option<Export> {
+        let r = self.registry.borrow();
+        r.exports
+            .iter()
+            .find(|(i, ..)| i == id)
+            .map(|(_, e, _)| e.clone())
+    }
+
+    /// Runs a dial's render, recording the entities it reads (like [`LuaRuntime::render`]).
+    pub fn render_dial(&self, dial: &DialDef, info: &CtxInfo) -> DialOutcome {
+        *self.host.tracking.borrow_mut() = Some(HashSet::new());
+        let res = (|| {
+            let v = match &dial.render {
+                Value::Function(f) => f.call::<Value>(self.make_ctx(info)?)?,
+                other => other.clone(),
+            };
+            parse_dial_spec(&v)
+        })();
+        let deps = self.host.tracking.borrow_mut().take().unwrap_or_default();
+        match res {
+            Ok(spec) => DialOutcome {
+                spec,
+                deps,
+                error: None,
+            },
+            Err(e) => DialOutcome {
+                spec: DialSpec {
+                    title: "ERR".into(),
+                    bg: crate::render::ERR_BG,
+                    ..DialSpec::default()
+                },
+                deps,
+                error: Some(e.to_string()),
+            },
+        }
+    }
+
+    /// Runs the dial handler for `input` (none set = nothing happens). A `goto_page` is dropped:
+    /// plugins have no pages.
+    pub fn dial_input(&self, dial: &DialDef, info: &CtxInfo, input: DialInput) -> Result<()> {
+        let f = match input {
+            DialInput::Rotate(_) => &dial.rotate,
+            DialInput::Press => &dial.press,
+            DialInput::Release => &dial.release,
+            DialInput::Touch => &dial.touch,
+        };
+        let Some(f) = f else { return Ok(()) };
+        *self.host.pending_goto.borrow_mut() = None;
+        let ctx = self.make_ctx(info).map_err(lerr)?;
+        match input {
+            DialInput::Rotate(ticks) => f.call::<()>((ctx, ticks)),
+            _ => f.call::<()>(ctx),
+        }
+        .map_err(lerr)?;
+        if let Some(page) = self.host.pending_goto.borrow_mut().take() {
+            tracing::debug!("goto_page({page}) from a plugin dial ignored");
+        }
+        Ok(())
+    }
+
     fn make_ctx(&self, info: &CtxInfo) -> mlua::Result<Table> {
         let t = self.lua.create_table()?;
         t.set("client_id", info.client_id.as_str())?;
-        t.set("key", info.key)?;
-        t.set("page", info.page.as_str())?;
-        t.set("rows", info.rows)?;
-        t.set("cols", info.cols)?;
+        if let Some(slot) = &info.slot {
+            t.set("slot", slot.as_str())?;
+        } else {
+            t.set("key", info.key)?;
+            t.set("page", info.page.as_str())?;
+            t.set("rows", info.rows)?;
+            t.set("cols", info.cols)?;
+        }
         if let Some((cols, rows)) = info.span {
             t.set("span_cols", cols)?;
             t.set("span_rows", rows)?;
@@ -402,6 +545,72 @@ fn install(
         })?,
     )?;
 
+    sdc.set(
+        "dial",
+        lua.create_function(|_, t: Table| {
+            for field in ["rotate", "press", "release", "touch"] {
+                let v: Value = t.get(field)?;
+                if !matches!(v, Value::Nil | Value::Function(_)) {
+                    return Err(mlua::Error::runtime(format!(
+                        "sdc.dial: '{field}' must be a function"
+                    )));
+                }
+            }
+            let r: Value = t.get("render")?;
+            if !matches!(r, Value::Function(_) | Value::Table(_)) {
+                return Err(mlua::Error::runtime(
+                    "sdc.dial: 'render' (a function or a table) is required",
+                ));
+            }
+            t.set("__sdc", "dial")?;
+            Ok(t)
+        })?,
+    )?;
+
+    let reg = registry.clone();
+    sdc.set(
+        "export",
+        lua.create_function(move |_, (id, item): (String, Table)| {
+            if id.is_empty()
+                || id.len() > 64
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            {
+                return Err(mlua::Error::runtime(format!(
+                    "sdc.export: invalid id {id:?} (1-64 characters of A-Z a-z 0-9 _ - .)"
+                )));
+            }
+            let export = match item.get::<Option<String>>("__sdc")?.as_deref() {
+                Some("button" | "span") => Export::Button(button_def(&item)?),
+                Some("dial") => Export::Dial(DialDef {
+                    render: item.get("render")?,
+                    rotate: item.get("rotate")?,
+                    press: item.get("press")?,
+                    release: item.get("release")?,
+                    touch: item.get("touch")?,
+                }),
+                _ => {
+                    return Err(mlua::Error::runtime(format!(
+                        "sdc.export('{id}'): second argument is not an sdc.button, sdc.span or sdc.dial"
+                    )))
+                }
+            };
+            let label = match item.get::<Value>("label")? {
+                Value::String(s) => Some(s.to_str()?.to_string()),
+                _ => None,
+            };
+            let mut r = reg.borrow_mut();
+            if r.exports.iter().any(|(i, ..)| *i == id) {
+                return Err(mlua::Error::runtime(format!(
+                    "sdc.export: duplicate id '{id}'"
+                )));
+            }
+            r.exports.push((id, export, label));
+            Ok(item)
+        })?,
+    )?;
+
     let reg = registry.clone();
     sdc.set(
         "key_gap",
@@ -427,22 +636,12 @@ fn install(
                 };
                 let def = match v {
                     Value::Nil | Value::Boolean(false) => None,
-                    Value::Table(t) if matches!(t.get::<Option<String>>("__sdc")?.as_deref(), Some("button" | "span")) => {
-                        let is_span = t.get::<String>("__sdc")? == "span";
-                        Some(ButtonDef {
-                            render: t.get("render")?,
-                            press: t.get("press")?,
-                            release: t.get("release")?,
-                            span: is_span
-                                .then(|| -> mlua::Result<SpanDef> {
-                                    Ok(SpanDef {
-                                        cols: t.get("cols")?,
-                                        rows: t.get("rows")?,
-                                        gap: t.get("gap")?,
-                                    })
-                                })
-                                .transpose()?,
-                        })
+                    Value::Table(t) if matches!(t.get::<Option<String>>("__sdc")?.as_deref(), Some("button" | "span")) => Some(button_def(&t)?),
+                    Value::Table(t) if t.get::<Option<String>>("__sdc")?.as_deref() == Some("dial") => {
+                        return Err(mlua::Error::runtime(format!(
+                            "page '{name}': item {} is an sdc.dial, which only works as an export for the Elgato plugin (sdc.export)",
+                            idx + 1
+                        )))
                     }
                     _ => {
                         return Err(mlua::Error::runtime(format!(
@@ -583,6 +782,67 @@ fn install(
     Ok(())
 }
 
+/// The definition behind a table made by `sdc.button` or `sdc.span`.
+fn button_def(t: &Table) -> mlua::Result<ButtonDef> {
+    let is_span = t.get::<String>("__sdc")? == "span";
+    Ok(ButtonDef {
+        render: t.get("render")?,
+        press: t.get("press")?,
+        release: t.get("release")?,
+        span: is_span
+            .then(|| -> mlua::Result<SpanDef> {
+                Ok(SpanDef {
+                    cols: t.get("cols")?,
+                    rows: t.get("rows")?,
+                    gap: t.get("gap")?,
+                })
+            })
+            .transpose()?,
+    })
+}
+
+fn parse_dial_spec(v: &Value) -> mlua::Result<DialSpec> {
+    let mut spec = DialSpec::default();
+    let Value::Table(t) = v else {
+        return Err(mlua::Error::runtime(format!(
+            "dial render must return a table, got {}",
+            v.type_name()
+        )));
+    };
+    let text = |v: Value, what: &str| -> mlua::Result<String> {
+        match v {
+            Value::Nil => Ok(String::new()),
+            Value::String(s) => Ok(s.to_str()?.to_string()),
+            Value::Integer(i) => Ok(i.to_string()),
+            Value::Number(n) => Ok(n.to_string()),
+            other => Err(mlua::Error::runtime(format!(
+                "'{what}' must be a string, got {}",
+                other.type_name()
+            ))),
+        }
+    };
+    spec.title = text(t.get("title")?, "title")?;
+    spec.value = text(t.get("value")?, "value")?;
+    spec.indicator = match t.get::<Value>("indicator")? {
+        Value::Nil => 0,
+        Value::Integer(i) => i.clamp(0, 100) as u8,
+        Value::Number(n) if n.is_finite() => n.round().clamp(0.0, 100.0) as u8,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "'indicator' must be a number 0-100, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    spec.icon = t.get("icon")?;
+    if let Some(s) = t.get::<Option<String>>("bg")? {
+        spec.bg = Color::parse(&s).ok_or_else(|| {
+            mlua::Error::runtime(format!("'bg': invalid color '{s}' (use #rrggbb)"))
+        })?;
+    }
+    Ok(spec)
+}
+
 fn percent_arg(what: &str, v: i64) -> mlua::Result<u8> {
     u8::try_from(v)
         .ok()
@@ -681,6 +941,7 @@ mod tests {
             cols: 5,
             span: None,
             span_index: None,
+            slot: None,
         }
     }
 
@@ -917,5 +1178,151 @@ mod tests {
         ] {
             assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
         }
+    }
+
+    fn slot_info(slot: &str) -> CtxInfo {
+        CtxInfo {
+            slot: Some(slot.into()),
+            ..info("", 0)
+        }
+    }
+
+    #[test]
+    fn export_registers_and_returns_the_button() {
+        let rt = LuaRuntime::load_str(
+            r##"
+            local b = sdc.export("living", sdc.button{ label = "Living", render = { text = "L" } })
+            sdc.page("p", { b })                       -- same button in a page
+            sdc.export("dim", sdc.dial{ render = function() return { title = "T" } end })
+            sdc.export("wide", sdc.span{ cols = 2, rows = 2, render = { text = "S" } })
+            "##,
+            Host::new(None),
+        )
+        .unwrap();
+        assert!(rt.button("p", 0).is_some());
+        let items: Vec<_> = rt
+            .exports()
+            .into_iter()
+            .map(|e| (e.id, e.kind, e.label))
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("living".into(), SlotKind::Key, Some("Living".into())),
+                ("dim".into(), SlotKind::Dial, None),
+                ("wide".into(), SlotKind::Key, None),
+            ]
+        );
+        assert!(rt.export("nope").is_none());
+        // an exported span renders as a plain key: no span size in ctx
+        let Some(Export::Button(def)) = rt.export("wide") else {
+            panic!("not a button")
+        };
+        let o = rt.render(&def, &slot_info("s"));
+        assert_eq!(o.spec.text.as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn export_rejects_duplicates_bad_ids_and_non_buttons() {
+        for bad in [
+            r#"sdc.export("a", sdc.button{}) sdc.export("a", sdc.button{})"#,
+            r#"sdc.export("", sdc.button{})"#,
+            r#"sdc.export("has space", sdc.button{})"#,
+            r#"sdc.export("a/b", sdc.button{})"#,
+            r#"sdc.export("a", {})"#,
+            r#"sdc.dial{}"#,
+            r#"sdc.dial{ render = function() end, rotate = 1 }"#,
+            r#"sdc.page("p", { sdc.dial{ render = function() end } })"#,
+        ] {
+            assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn dial_render_and_inputs() {
+        let host = Host::new(None);
+        host.states
+            .borrow_mut()
+            .insert("light.a".into(), state("light.a", "on"));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = Rc::new(Host {
+            ha_tx: Some(tx),
+            states: host.states.clone(),
+            ..Default::default()
+        });
+        let rt = LuaRuntime::load_str(
+            r##"
+            sdc.export("d", sdc.dial {
+              render = function(ctx)
+                local l = ha.state("light.a")
+                return { title = ctx.slot, value = 42, indicator = 250, icon = "i.png", bg = "#102030" }
+              end,
+              rotate = function(ctx, t) ha.call("light", "turn_on", { entity_id = "light.a", step = t }) end,
+              press = function(ctx) ha.call("light", "toggle", { entity_id = "light.a" }); ctx.goto_page("x") end,
+            })
+            "##,
+            host,
+        )
+        .unwrap();
+        let Some(Export::Dial(d)) = rt.export("d") else {
+            panic!("not a dial")
+        };
+        let o = rt.render_dial(&d, &slot_info("slot-1"));
+        assert!(o.error.is_none());
+        assert_eq!(o.spec.title, "slot-1");
+        assert_eq!(o.spec.value, "42");
+        assert_eq!(o.spec.indicator, 100);
+        assert_eq!(o.spec.icon.as_deref(), Some("i.png"));
+        assert_eq!(o.spec.bg, Color([0x10, 0x20, 0x30]));
+        assert_eq!(o.deps, HashSet::from(["light.a".to_string()]));
+        rt.dial_input(&d, &slot_info("slot-1"), DialInput::Rotate(-3))
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            HaCommand::CallService {
+                domain: "light".into(),
+                service: "turn_on".into(),
+                data: json!({"entity_id": "light.a", "step": -3})
+            }
+        );
+        // press runs (goto_page is dropped); release/touch have no handler
+        rt.dial_input(&d, &slot_info("slot-1"), DialInput::Press)
+            .unwrap();
+        assert!(rx.try_recv().is_ok());
+        rt.dial_input(&d, &slot_info("slot-1"), DialInput::Touch)
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn plugin_goto_page_is_a_noop() {
+        let rt = LuaRuntime::load_str(
+            r#"sdc.export("b", sdc.button{ press = function(ctx) ctx.goto_page("other") end })"#,
+            Host::new(None),
+        )
+        .unwrap();
+        let Some(Export::Button(b)) = rt.export("b") else {
+            panic!("not a button")
+        };
+        // the runtime reports the request; the engine drops it for plugin slots
+        assert_eq!(
+            rt.press(&b, &slot_info("s"), true).unwrap().as_deref(),
+            Some("other")
+        );
+    }
+
+    #[test]
+    fn dial_render_error_gives_error_dial() {
+        let rt = LuaRuntime::load_str(
+            r#"sdc.export("d", sdc.dial{ render = function() error("boom") end })"#,
+            Host::new(None),
+        )
+        .unwrap();
+        let Some(Export::Dial(d)) = rt.export("d") else {
+            panic!()
+        };
+        let o = rt.render_dial(&d, &slot_info("s"));
+        assert_eq!(o.spec.title, "ERR");
+        assert!(o.error.unwrap().contains("boom"));
     }
 }

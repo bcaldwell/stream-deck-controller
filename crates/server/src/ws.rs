@@ -1,4 +1,5 @@
-//! WebSocket server for clients (`/ws`, bearer token) and browser decks (`/deck/ws`, SSO).
+//! WebSocket server for clients (`/ws`, bearer token), the Elgato plugin (`/plugin/ws`, same
+//! token) and browser decks (`/deck/ws`, SSO).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -10,12 +11,17 @@ use axum::extract::{Extension, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::response::Response;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
-use sdc_protocol::{ClientMessage, ImageFrame, ServerMessage, PROTOCOL_VERSION};
+use sdc_protocol::{
+    ClientMessage, ImageFrame, PluginClientMessage, PluginServerMessage, ServerMessage,
+    PROTOCOL_VERSION,
+};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::clients::ClientBinaries;
-use crate::engine::{EngineEvent, Out};
+use crate::engine::{EngineEvent, Out, PluginOut};
 use crate::http::{self, DeckAuth, DeckUser};
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
@@ -43,6 +49,23 @@ pub async fn upgrade(
     ws.on_upgrade(move |socket| async move {
         if let Err(e) = handle_conn(socket, state, None).await {
             tracing::warn!("connection ended: {e:#}");
+        }
+    })
+}
+
+/// Upgrade handler for `/plugin/ws`: the Elgato plugin, authenticated like `/ws`.
+pub async fn plugin_upgrade(
+    State(state): State<WsState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(denied) = http::authorize(state.token.as_deref(), &headers) {
+        tracing::warn!("rejected plugin websocket connection: missing or invalid client token");
+        return denied;
+    }
+    ws.on_upgrade(move |socket| async move {
+        if let Err(e) = handle_plugin(socket, state.engine).await {
+            tracing::warn!("plugin connection ended: {e:#}");
         }
     })
 }
@@ -236,5 +259,102 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
     .await;
 
     let _ = engine.send(EngineEvent::ClientDisconnected(id));
+    result
+}
+
+fn plugin_json(out: PluginOut) -> serde_json::Result<String> {
+    let b64 = |png: Vec<u8>| BASE64.encode(png);
+    serde_json::to_string(&match out {
+        PluginOut::Exports(items) => PluginServerMessage::Exports { items },
+        PluginOut::KeyImage { slot, png } => PluginServerMessage::KeyImage {
+            slot,
+            png_base64: b64(png),
+        },
+        PluginOut::DialFeedback {
+            slot,
+            title,
+            value,
+            indicator,
+            icon_png,
+        } => PluginServerMessage::DialFeedback {
+            slot,
+            title,
+            value,
+            indicator,
+            icon_png_base64: icon_png.map(b64),
+        },
+        PluginOut::SlotError { slot, message } => PluginServerMessage::SlotError { slot, message },
+    })
+}
+
+async fn handle_plugin(ws: WebSocket, engine: UnboundedSender<EngineEvent>) -> Result<()> {
+    let (mut sink, mut stream) = ws.split();
+    let send = |m: &PluginServerMessage| serde_json::to_string(m).map(|j| Message::Text(j.into()));
+
+    let hello = tokio::time::timeout(HELLO_TIMEOUT, async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(t))) => {
+                    return Ok(serde_json::from_str::<PluginClientMessage>(&t)?)
+                }
+                Some(Ok(Message::Close(_))) | None => bail!("closed before hello"),
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(e.into()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("timed out waiting for hello"))??;
+    let PluginClientMessage::PluginHello {
+        protocol_version,
+        client_id,
+    } = hello
+    else {
+        bail!("first message was not plugin_hello");
+    };
+    if protocol_version != PROTOCOL_VERSION {
+        let msg = PluginServerMessage::Error {
+            message: format!(
+                "unsupported protocol version {protocol_version}, server speaks {PROTOCOL_VERSION}"
+            ),
+        };
+        sink.send(send(&msg)?).await?;
+        let _ = sink.close().await;
+        bail!("plugin {client_id} protocol version {protocol_version} unsupported");
+    }
+    sink.send(send(&PluginServerMessage::PluginWelcome {
+        protocol_version: PROTOCOL_VERSION,
+    })?)
+    .await?;
+
+    let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
+    let (tx, mut rx) = mpsc::unbounded_channel::<PluginOut>();
+    let _ = engine.send(EngineEvent::PluginConnected { id, client_id, tx });
+
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                out = rx.recv() => match out {
+                    Some(out) => sink.send(Message::Text(plugin_json(out)?.into())).await?,
+                    None => return Ok(()),
+                },
+                msg = stream.next() => match msg {
+                    None | Some(Ok(Message::Close(_))) => return Ok(()),
+                    Some(Err(e)) => return Err(e.into()),
+                    Some(Ok(Message::Text(t))) => match serde_json::from_str::<PluginClientMessage>(&t) {
+                        Ok(PluginClientMessage::PluginHello { .. }) => {}
+                        Ok(msg) => {
+                            let _ = engine.send(EngineEvent::Plugin { id, msg });
+                        }
+                        Err(e) => tracing::warn!("bad plugin message: {e}"),
+                    },
+                    Some(Ok(_)) => {}
+                },
+            }
+        }
+    }
+    .await;
+
+    let _ = engine.send(EngineEvent::PluginDisconnected(id));
     result
 }

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
 use image::codecs::jpeg::JpegEncoder;
+use image::codecs::png::PngEncoder;
 use image::imageops::{self, FilterType};
 use image::{ExtendedColorType, ImageEncoder, Rgb, RgbImage, RgbaImage};
 
@@ -21,7 +22,7 @@ const MIN_FONT_PX: f32 = 9.0;
 const LINE: f32 = 1.15;
 /// How long a failed download is remembered before it is tried again.
 const FAIL_TTL: Duration = Duration::from_secs(60);
-const ERR_BG: Color = Color([0xb0, 0x00, 0x20]);
+pub const ERR_BG: Color = Color([0xb0, 0x00, 0x20]);
 /// Decoded pictures are shrunk until their shorter side is at most this (keys are <= 120px, so
 /// this keeps 2x headroom while a 1024px icon costs 16x less memory and resize time).
 const MAX_SRC_SHORT: u32 = 256;
@@ -425,6 +426,11 @@ impl Renderer {
 
     pub fn render(&mut self, spec: &RenderSpec, size: u32) -> Vec<u8> {
         encode_jpeg(&self.render_image(spec, size))
+    }
+
+    /// Like [`Renderer::render`] as a PNG (plugins hand it to Elgato's `setImage`).
+    pub fn render_png(&mut self, spec: &RenderSpec, size: u32) -> Vec<u8> {
+        encode_png(&self.render_image(spec, size))
     }
 
     pub fn render_image(&mut self, spec: &RenderSpec, size: u32) -> RgbImage {
@@ -933,6 +939,19 @@ fn darken_bottom(img: &mut RgbImage) {
             blend(img.get_pixel_mut(x, y), [0, 0, 0], 0.7 * t);
         }
     }
+}
+
+fn encode_png(img: &RgbImage) -> Vec<u8> {
+    let mut buf = Vec::new();
+    PngEncoder::new(&mut buf)
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            ExtendedColorType::Rgb8,
+        )
+        .expect("png encoding of an in-memory image cannot fail");
+    buf
 }
 
 fn encode_jpeg(img: &RgbImage) -> Vec<u8> {

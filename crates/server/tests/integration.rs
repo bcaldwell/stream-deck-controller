@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use sdc_protocol::{
-    sha256_hex, ClientMessage, DeviceInfo, ImageFrame, ServerMessage, PROTOCOL_VERSION,
+    sha256_hex, ClientMessage, DeviceInfo, ImageFrame, PluginClientMessage, PluginServerMessage,
+    ServerMessage, SlotKind, PROTOCOL_VERSION,
 };
 use sdc_server::clients::ClientBinaries;
 use sdc_server::engine::{self, EngineEvent};
@@ -31,6 +32,23 @@ sdc.page("home", {
     press = function() ha.call("light", "toggle", { entity_id = "light.office" }) end,
   },
   sdc.button{ render = { text = "Static" } },
+})
+
+sdc.export("lamp", sdc.button{
+  label = "Lamp",
+  render = function()
+    local l = ha.state("light.office")
+    return { text = "Lamp", bg = (l and l.state == "on") and "#f5b400" or "#222222" }
+  end,
+  press = function() ha.call("light", "toggle", { entity_id = "light.office" }) end,
+})
+sdc.export("static", sdc.button{ render = { text = "Static" } })
+sdc.export("dimmer", sdc.dial{
+  render = function()
+    local l = ha.state("light.dial")
+    return { title = "Dimmer", value = l and l.state or "?", indicator = 40 }
+  end,
+  rotate = function(ctx, ticks) ha.call("light", "turn_on", { entity_id = "light.dial", step = ticks }) end,
 })
 "##;
 
@@ -863,4 +881,266 @@ async fn browser_cannot_impersonate_a_physical_deck() {
         .map(|d| d["client_id"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(ids, ["test", "web-test"]);
+}
+
+// ---- Elgato plugin (/plugin/ws) ---------------------------------------------
+
+fn plugin_url(ws_url: &str) -> String {
+    ws_url.replace("/ws", "/plugin/ws")
+}
+
+async fn plugin_send(c: &mut Client, m: PluginClientMessage) {
+    c.send(Message::Text(serde_json::to_string(&m).unwrap().into()))
+        .await
+        .unwrap();
+}
+
+async fn plugin_next(c: &mut Client) -> PluginServerMessage {
+    match next_msg(c).await {
+        Message::Text(t) => serde_json::from_str(&t).unwrap(),
+        other => panic!("expected text, got {other:?}"),
+    }
+}
+
+/// Messages that arrive within `quiet` of each other.
+async fn plugin_drain(c: &mut Client, quiet: Duration) -> Vec<PluginServerMessage> {
+    let mut out = Vec::new();
+    while let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(quiet, c.next()).await {
+        out.push(serde_json::from_str(&t).unwrap());
+    }
+    out
+}
+
+/// Connects, says hello, returns after the welcome and the export list.
+async fn plugin_connect(url: &str) -> (Client, Vec<sdc_protocol::ExportItem>) {
+    let (mut c, _) = tokio_tungstenite::connect_async(plugin_url(url))
+        .await
+        .unwrap();
+    plugin_send(
+        &mut c,
+        PluginClientMessage::PluginHello {
+            protocol_version: PROTOCOL_VERSION,
+            client_id: "test-plugin".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        plugin_next(&mut c).await,
+        PluginServerMessage::PluginWelcome { .. }
+    ));
+    let PluginServerMessage::Exports { items } = plugin_next(&mut c).await else {
+        panic!("expected exports")
+    };
+    (c, items)
+}
+
+fn subscribe(slot: &str, export: &str, kind: SlotKind) -> PluginClientMessage {
+    PluginClientMessage::Subscribe {
+        slot: slot.into(),
+        export: export.into(),
+        kind,
+        size_px: 144,
+    }
+}
+
+fn png_size(b64: &str) -> (u32, u32) {
+    use base64::Engine as _;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap();
+    let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+    (img.width(), img.height())
+}
+
+#[tokio::test]
+async fn plugin_ws_uses_the_client_token() {
+    let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
+    let (_e, url, _dir) = start_server_full(
+        "plugin-token",
+        ha_tx,
+        ClientBinaries::default(),
+        Some("s3cret"),
+    )
+    .await;
+    let url = plugin_url(&url);
+    assert_eq!(ws_handshake_status(&url, None).await, 401);
+    assert_eq!(ws_handshake_status(&url, Some("Bearer nope")).await, 401);
+    assert_eq!(ws_handshake_status(&url, Some("Bearer s3cret")).await, 101);
+    // the SSO header does not open it
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("X-Auth-Request-Email", "me@example.com".parse().unwrap());
+    assert!(tokio_tungstenite::connect_async(req).await.is_err());
+}
+
+#[tokio::test]
+async fn plugin_subscribe_render_dependencies_and_input() {
+    let (ha_tx, mut ha_rx) = mpsc::unbounded_channel();
+    let (engine_tx, url, dir) = start_server("plugin-flow", ha_tx).await;
+    let (mut c, items) = plugin_connect(&url).await;
+    assert_eq!(
+        items
+            .iter()
+            .map(|i| (i.id.as_str(), i.kind, i.label.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("lamp", SlotKind::Key, Some("Lamp")),
+            ("static", SlotKind::Key, None),
+            ("dimmer", SlotKind::Dial, None),
+        ]
+    );
+
+    plugin_send(&mut c, subscribe("k1", "lamp", SlotKind::Key)).await;
+    plugin_send(&mut c, subscribe("k2", "static", SlotKind::Key)).await;
+    plugin_send(&mut c, subscribe("d1", "dimmer", SlotKind::Dial)).await;
+    plugin_send(&mut c, subscribe("bad", "nope", SlotKind::Key)).await;
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        got.push(plugin_next(&mut c).await);
+    }
+    for m in &got {
+        match m {
+            PluginServerMessage::KeyImage { png_base64, .. } => {
+                assert_eq!(png_size(png_base64), (144, 144))
+            }
+            PluginServerMessage::DialFeedback {
+                slot,
+                title,
+                value,
+                indicator,
+                icon_png_base64,
+            } => {
+                assert_eq!(
+                    (slot.as_str(), title.as_str(), value.as_str(), *indicator),
+                    ("d1", "Dimmer", "?", 40)
+                );
+                assert!(icon_png_base64.is_none());
+            }
+            PluginServerMessage::SlotError { slot, message } => {
+                assert_eq!(slot, "bad");
+                assert!(message.contains("no export"), "{message}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(
+        got.iter()
+            .filter(|m| matches!(m, PluginServerMessage::KeyImage { .. }))
+            .count(),
+        2
+    );
+
+    // HA change: only the dependent key slot gets a new image
+    engine_tx
+        .send(EngineEvent::Ha(HaEvent::Changed(on("light.office"))))
+        .unwrap();
+    let msgs = plugin_drain(&mut c, Duration::from_millis(400)).await;
+    assert!(
+        matches!(msgs.as_slice(), [PluginServerMessage::KeyImage { slot, .. }] if slot == "k1"),
+        "{msgs:?}"
+    );
+    // an unrelated change and an identical one: nothing
+    engine_tx
+        .send(EngineEvent::Ha(HaEvent::Changed(on("light.office"))))
+        .unwrap();
+    engine_tx
+        .send(EngineEvent::Ha(HaEvent::Changed(on("light.other"))))
+        .unwrap();
+    assert!(plugin_drain(&mut c, Duration::from_millis(300))
+        .await
+        .is_empty());
+    // the dial's dependency: new feedback for the dial only
+    engine_tx
+        .send(EngineEvent::Ha(HaEvent::Changed(on("light.dial"))))
+        .unwrap();
+    let msgs = plugin_drain(&mut c, Duration::from_millis(400)).await;
+    assert!(
+        matches!(msgs.as_slice(), [PluginServerMessage::DialFeedback { slot, value, .. }] if slot == "d1" && value == "on"),
+        "{msgs:?}"
+    );
+
+    // input
+    let expect_call = |data: Value, service: &'static str| HaCommand::CallService {
+        domain: "light".into(),
+        service: service.into(),
+        data,
+    };
+    plugin_send(&mut c, PluginClientMessage::SlotDown { slot: "k1".into() }).await;
+    let cmd = tokio::time::timeout(Duration::from_secs(5), ha_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cmd,
+        expect_call(json!({"entity_id": "light.office"}), "toggle")
+    );
+    plugin_send(
+        &mut c,
+        PluginClientMessage::DialRotate {
+            slot: "d1".into(),
+            ticks: -4,
+        },
+    )
+    .await;
+    let cmd = tokio::time::timeout(Duration::from_secs(5), ha_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cmd,
+        expect_call(json!({"entity_id": "light.dial", "step": -4}), "turn_on")
+    );
+
+    // unsubscribed slots stop updating
+    plugin_send(
+        &mut c,
+        PluginClientMessage::Unsubscribe { slot: "k1".into() },
+    )
+    .await;
+    // the websocket and the HA event reach the engine on different paths
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    engine_tx
+        .send(EngineEvent::Ha(HaEvent::Changed(EntityState {
+            entity_id: "light.office".into(),
+            state: "off".into(),
+            attributes: json!({}),
+        })))
+        .unwrap();
+    assert!(plugin_drain(&mut c, Duration::from_millis(300))
+        .await
+        .is_empty());
+
+    // reload without the export: its slot gets a SlotError, the list is pushed again
+    plugin_send(&mut c, subscribe("k1", "lamp", SlotKind::Key)).await;
+    assert!(matches!(
+        plugin_next(&mut c).await,
+        PluginServerMessage::KeyImage { .. }
+    ));
+    std::fs::write(
+        dir.0.join("config.lua"),
+        r#"sdc.page("home", {})
+           sdc.export("static", sdc.button{ render = { text = "Static" } })"#,
+    )
+    .unwrap();
+    engine_tx.send(EngineEvent::Reload).unwrap();
+    let msgs = plugin_drain(&mut c, Duration::from_millis(400)).await;
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, PluginServerMessage::Exports { items } if items.len() == 1)),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, PluginServerMessage::SlotError { slot, .. } if slot == "k1")),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, PluginServerMessage::SlotError { slot, .. } if slot == "d1")),
+        "{msgs:?}"
+    );
+    // k2 still exists and is unchanged: no image resent
+    assert!(!msgs
+        .iter()
+        .any(|m| matches!(m, PluginServerMessage::KeyImage { .. })));
 }
