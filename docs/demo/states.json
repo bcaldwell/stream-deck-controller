@@ -1,0 +1,11 @@
+[
+  {"entity_id": "light.office", "state": "on", "attributes": {"brightness": 255}},
+  {"entity_id": "light.desk", "state": "on", "attributes": {"brightness": 128}},
+  {"entity_id": "light.keylight", "state": "off", "attributes": {}},
+  {"entity_id": "switch.desk_plug", "state": "on", "attributes": {}},
+  {"entity_id": "light.living_room", "state": "on", "attributes": {"brightness": 191}},
+  {"entity_id": "light.bedroom", "state": "off", "attributes": {}},
+  {"entity_id": "light.entryway", "state": "on", "attributes": {"brightness": 77}},
+  {"entity_id": "light.house", "state": "on", "attributes": {"brightness": 204}},
+  {"entity_id": "media_player.living_room", "state": "playing", "attributes": {"media_title": "Sunrise Over Water", "media_artist": "The Examples"}}
+]
