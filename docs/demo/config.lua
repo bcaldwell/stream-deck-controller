@@ -38,7 +38,7 @@ sdc.page("home", {
   light("light.keylight", "Keylight"),
   light("switch.desk_plug", "Desk Plug"),
   sdc.button {
-    render = { text = "Media", icon = "../../icons/play.png", bg = "#3b2f6b" },
+    render = { text = "Media", icon = "../../icons/play.png", bg = "#3b2f6b", chevron = true },
     press = function(ctx) ctx.goto_page("media") end,
   },
 
@@ -57,7 +57,7 @@ sdc.page("home", {
 
 sdc.page("media", {
   sdc.button {
-    render = { text = "Back", icon = "../../icons/back.png", bg = "#444444" },
+    render = { text = "Back", icon = "../../icons/back.png", bg = "#444444", chevron = true },
     press = function(ctx) ctx.goto_page("home") end,
   },
   sdc.button {
@@ -97,4 +97,5 @@ sdc.page("media", {
   false, false, false, false, false, false,
 })
 
+sdc.device("living-room", { pages = { "home", "media" }, home = "home" })
 sdc.default_page("home")

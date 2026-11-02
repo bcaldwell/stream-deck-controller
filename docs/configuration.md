@@ -213,12 +213,74 @@ a page; it is export-only. Full details in [crates/server/README.md](../crates/s
 
 ## Devices
 
-> TODO: documented separately (named devices, `sdc.device`, `sdc.default_device`, `--device` / `SDC_DEVICE`, and the
-> browser device picker).
+Pages are global. A *device* is a named set of them: it says which pages a deck can show, where it starts, and
+optionally its own brightness and idle settings. Use devices when several decks share one config, for example a
+Stream Deck Plus in the office that needs different pages than the Mk.2 in the living room. A config without
+`sdc.device` behaves exactly as described above: every deck sees every page.
+
+```lua
+sdc.device("living-room", {
+  pages = { "home", "media" },     -- page names, which must exist; order does not matter
+  home = "home",                   -- start page, must be in pages (default: the first of pages)
+  brightness = 60,                 -- optional, like sdc.brightness
+  idle = { dim_after = 120, off_after = 600, home_after = 3600 },   -- optional, like sdc.idle
+})
+sdc.device("office", { pages = { "home" } })
+
+sdc.default_device { mk2 = "living-room", plus = "office", ["*"] = "living-room" }
+```
+
+`sdc.default_device` maps a device type to a device name. The types, derived from the model name a client reports,
+are `original` (Original and OriginalV2), `mk2` (including its scissor and module variants), `mini`, `xl`, `plus`,
+`plus-xl`, `neo` and `pedal`, plus `browser` for [browser decks](browser.md). `"*"` is the fallback for anything
+else.
+
+**Which device a client gets**, in order:
+
+1. The device it asked for by name: `sdc-client --device <name>` or `SDC_DEVICE` on the Pi (see
+   [Raspberry Pi deck](pi.md#configuring-the-client)), or the Layout picker in the [browser deck](browser.md) menu. An unknown
+   name is logged as a warning and skipped.
+2. The `sdc.default_device` entry for the client's type.
+3. The `"*"` entry.
+4. The first `sdc.device` defined.
+5. With no devices defined at all, the legacy behaviour: every page, `sdc.default_page`, the global settings.
+
+Details:
+
+- A device's `brightness` and `idle` replace the global `sdc.brightness` and `sdc.idle` when set (the `idle` table as
+  a whole, not field by field). `sdc.default_page` is only used when there are no devices.
+- `ctx.goto_page` to a page outside the client's device is logged and ignored.
+- The device's `home` is the start page, the target of `home_after`, and the fallback when a remembered page is not
+  on the device (also after a config reload). A deck that reconnects and lands on a different device than before
+  starts at the new device's home.
+- A config reload re-resolves the device of every connected client. A mirror viewer uses the mirrored deck's device.
+  Elgato plugin exports are not affected by devices.
+- These fail the load, keeping the previous config: an unknown page in `pages`, a `home` not in `pages`, duplicate
+  device names, or `sdc.default_device` naming an unknown device or type.
 
 ## Feedback & navigation markers
 
-> TODO: documented separately (press feedback `sdc.feedback` and the `chevron` render field).
+**Press feedback.** After a `press` handler finishes without a Lua error, the key briefly shows a white ring (400 ms)
+on physical decks, browser decks and Elgato plugin keys, so you can tell a press was accepted before Home Assistant
+answers. It is on by default and can be turned off globally or per button:
+
+```lua
+sdc.feedback(false)                                   -- off everywhere
+sdc.button { render = { text = "Quiet" }, feedback = false, press = function() end }   -- off for this button
+```
+
+It does not flash for a press that only woke the display, a press that called `ctx.goto_page` (the page change is the
+feedback), a button without `press`, or a span.
+
+**Navigation chevron.** `chevron = true` in a render descriptor draws a small, subtle "›" in the top-right corner to
+mark a key that changes page. It does not affect the layout of the label or icon.
+
+```lua
+sdc.button {
+  render = { text = "Media", icon = "icons/play.png", bg = "#3b2f6b", chevron = true },
+  press  = function(ctx) ctx.goto_page("media") end,
+}
+```
 
 ## Putting it together
 

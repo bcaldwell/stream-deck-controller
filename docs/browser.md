@@ -17,10 +17,13 @@ same protocol as the Pi client over `/deck/ws`.
   the browser falls back to its own deck. The choice is remembered in `localStorage`.
 
 ![The device menu lists the connected decks](images/deck-menu.png)
+- **Layout**. When the config defines [devices](configuration.md#devices), the menu also has a Layout section listing
+  "Default" and each device name. Picking one makes this browser's own deck use that device's pages, home page,
+  brightness and idle settings; the choice is remembered in `localStorage` and the deck reconnects.
 
 The menu is fed by `GET /deck/api/clients`, which returns the connected decks as
 `[{client_id, model, rows, cols, page, web}]`. Other browsers' own decks appear with `web: true`; mirror viewers are
-not listed.
+not listed. The Layout section is fed by `GET /deck/api/devices` (`[{name, pages, home}]`, empty without devices).
 
 ## Phones
 

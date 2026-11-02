@@ -45,6 +45,7 @@ On the Pi, settings are in `/etc/sdc-client.env` (root-only, read by systemd). A
 | `SDC_SERVER` | Server websocket URL, e.g. `wss://your-server/ws` |
 | `SDC_CLIENT_TOKEN` | Shared secret matching the server |
 | `SDC_CLIENT_ID` | Name the server knows this deck by (default: hostname). Pages are remembered per id |
+| `SDC_DEVICE` | Name of an `sdc.device` this deck should use (also `sdc-client --device <name>`). Unset: the server picks by deck model, see [Devices](configuration.md#devices) |
 | `SDC_BRIGHTNESS` | Fallback brightness (60); the server's `sdc.brightness` overrides it |
 | `SDC_OFFLINE_AFTER` | Seconds without a server connection before the deck shows its dimmed offline screen (1800). Until then it keeps the last images and a press flashes a red-barred "offline" on the key |
 | `SDC_USB_SUSPEND` | `false` disables USB suspend (see below) |
