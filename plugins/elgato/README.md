@@ -23,7 +23,8 @@ Needs Elgato's Stream Deck app 7.1 or newer (macOS 12+, Windows 10+).
    or build it (below).
 2. Double-click it; the Stream Deck app installs it.
 3. Drag "SDC Button" or "SDC Dial" onto a key or dial. In its settings:
-   - **Server URL** (shared by all actions): default `wss://your-server/plugin/ws`.
+   - **Server URL** (shared by all actions): your server's `/plugin/ws`, e.g. `wss://your-server/plugin/ws`.
+     Nothing connects until it is set.
    - **Token** (shared): the server's `SDC_CLIENT_TOKEN`. Stream Deck stores plugin global settings in its
      preferences as plain text, so treat the laptop like any other place you keep that token. Leave empty if the
      server has no token.

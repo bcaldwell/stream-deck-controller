@@ -31,5 +31,9 @@
   "type": "module",
   "engines": {
     "node": ">=20.5.1"
+  },
+  "overrides": {
+    "zod": "^4.6.6",
+    "minimatch": "^11.0.1"
   }
 }

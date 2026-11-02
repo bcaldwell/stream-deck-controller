@@ -110,11 +110,9 @@ if [ -f "$BOOTCFG" ]; then
   cat >> "$BOOTCFG" <<'EOF'
 # sdc power trims >>>
 [all]
-# No Bluetooth (frees the UART too), activity LED off. The CPU clock is left
-# alone: ondemand already idles at 600 MHz, and capping it slows page renders.
+# No Bluetooth (frees the UART too). The activity LED stays on (it shows the
+# Pi is running) and the CPU clock is left alone (ondemand idles at 600 MHz).
 dtoverlay=disable-bt
-dtparam=act_led_trigger=none
-dtparam=act_led_activelow=on
 # sdc power trims <<<
 EOF
   [ "$(cksum < "$BOOTCFG")" = "$before" ] || echo "==> $BOOTCFG changed: reboot to apply the power trims"

@@ -6,7 +6,8 @@ import WebSocket from "ws";
 
 import type { ClientMessage, DialFeedback, ExportItem, ServerMessage, SlotKind, Subscribe } from "./protocol";
 
-export const DEFAULT_URL = "wss://your-server/plugin/ws";
+/** No built-in server: nothing connects until a server URL is set in the action settings. */
+export const DEFAULT_URL = "";
 const PROTOCOL_VERSION = 1;
 const MIN_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
@@ -69,7 +70,7 @@ export class Hub {
 		return this.#exports;
 	}
 
-	/** Sets the server and token (empty = defaults) and (re)connects if they changed. */
+	/** Sets the server and token and (re)connects if they changed; no URL = stay offline. */
 	configure({ url, token }: Connection): void {
 		const nextUrl = url?.trim() || DEFAULT_URL;
 		const nextToken = token?.trim() ?? "";
@@ -164,7 +165,7 @@ export class Hub {
 	}
 
 	#connect(): void {
-		if (!this.#started) return;
+		if (!this.#started || !this.#url) return;
 		const headers: Record<string, string> = {};
 		if (this.#token) headers["Authorization"] = `Bearer ${this.#token}`;
 		let ws: WebSocket;

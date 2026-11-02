@@ -16,7 +16,7 @@ the network, and it never needs internet access. The install is pushed to it fro
    task pi:install HOST=pi@sdc-pi.local SERVER=wss://your-server/ws
    ```
 
-   `HOST` and `SERVER` default to those values. The task builds the static aarch64 client, copies it
+   `HOST` and `SERVER` can instead live in the gitignored `.env` as `SDC_PI_HOST` and `SDC_SERVER`. The task builds the static aarch64 client, copies it
    with `install.sh`, `50-streamdeck.rules` and `sdc-client.service` to a temp dir on the Pi, and runs
    `sudo sh install.sh ...` over one interactive ssh session (one sudo password prompt). The token is
    sent over ssh stdin into a 0600 file that the script deletes, so it never shows up in `ps`.

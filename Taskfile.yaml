@@ -99,11 +99,13 @@ tasks:
       - npm run link
 
   pi:install:
-    desc: Build the Pi client, push it + the installer from this Mac and install it over ssh (HOST, SERVER; token from env SDC_CLIENT_TOKEN)
+    desc: Build the Pi client, push it + the installer from this Mac and install it over ssh (HOST/SDC_PI_HOST, SERVER/SDC_SERVER, token SDC_CLIENT_TOKEN; all can live in .env)
     deps: [build-pi]
     vars:
-      HOST: '{{.HOST | default "pi@sdc-pi.local"}}'
-      SERVER: '{{.SERVER | default "wss://your-server/ws"}}'
+      HOST: '{{.HOST | default .SDC_PI_HOST}}'
+      SERVER: '{{.SERVER | default .SDC_SERVER}}'
+    requires:
+      vars: [HOST, SERVER]
     cmds:
       # One ssh session runs the install under sudo, so there is a single password prompt.
       # The token goes over ssh stdin into a 0600 file in a private temp dir (never on a

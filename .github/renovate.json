@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
-  "description": "Every merge to main deploys to the cluster, so batch updates weekly instead of a deploy per crate.",
+  "description": "Every merge to main deploys the server, so batch updates weekly instead of a deploy per crate.",
   "schedule": ["before 6am on monday"],
   "packageRules": [
     {
