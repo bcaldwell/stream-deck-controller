@@ -86,6 +86,9 @@ checks, builds, pushes the multi-arch server image (including both client binari
 publishes a GitHub Release with `sdc-{server,client}-{aarch64,x86_64}-linux` and the Elgato plugin
 (`ca.bcaldwell.sdc.streamDeckPlugin`, also a build artifact of every run).
 
+To release: bump `version` in the root `Cargo.toml`, merge, then `git tag vX.Y.Z && git push origin vX.Y.Z`. CI stamps
+the tag's version into the plugin manifest, so the Stream Deck app sees each release as a new version.
+
 ## Deploying
 
 - Client on a Raspberry Pi Zero 2 W: [deploy/pi/README.md](deploy/pi/README.md)

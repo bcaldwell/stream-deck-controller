@@ -78,6 +78,19 @@ jobs:
           cache-dependency-path: plugins/elgato/package-lock.json
       - run: npm ci
       - run: npm run typecheck
+      # on a v* tag, stamp the tag's version into the plugin (Elgato wants 4 parts)
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          node -e '
+            const fs = require("fs"), v = process.argv[1];
+            const m = "ca.bcaldwell.sdc.sdPlugin/manifest.json";
+            const j = JSON.parse(fs.readFileSync(m));
+            j.Version = (v.split(/[-+]/)[0] + ".0.0.0").split(".").slice(0, 4).join(".");
+            fs.writeFileSync(m, JSON.stringify(j, null, "\t") + "\n");
+          ' "$v"
+          npm version --no-git-tag-version --allow-same-version "$v"
       # builds, validates the manifest and packs ca.bcaldwell.sdc.streamDeckPlugin
       - run: npm run pack
       - uses: actions/upload-artifact@v7
