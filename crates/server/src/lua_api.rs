@@ -1147,6 +1147,11 @@ fn parse_spec(v: &Value) -> mlua::Result<RenderSpec> {
         }
     }
     spec.icon = t.get("icon")?;
+    if let Some(s) = t.get::<Option<String>>("tint")? {
+        spec.tint = Some(Color::parse(&s).ok_or_else(|| {
+            mlua::Error::runtime(format!("'tint': invalid color '{s}' (use #rrggbb)"))
+        })?);
+    }
     spec.image = t.get("image")?;
     spec.font_size = t.get("font_size")?;
     spec.chevron = match t.get::<Value>("chevron")? {

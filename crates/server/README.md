@@ -102,7 +102,7 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3
 ```
 
 - Render descriptor: `text` (`\n` allowed; wraps and auto-shrinks), `bg`/`fg` (`#rgb`, `#rrggbb`),
-  `icon` and `image` (see [Icons and images](#icons-and-images)), `font_size` (px at a 72 px key, scaled with the key's size; auto-fit when absent),
+  `icon` and `image` (see [Icons and images](#icons-and-images)), `tint` (`#rrggbb`, recolours the icon), `font_size` (px at a 72 px key, scaled with the key's size; auto-fit when absent),
   `chevron = true | "forward" | "back"` (a faint "›" in the bottom-right corner for a key that opens another page, or "‹" in the top-left for one that goes back; on an icon-only key the icon shrinks slightly and moves away from it).
 - Press feedback: after a `press` handler finishes without a Lua error, the key shows a white ring for 400 ms (physical, browser and
   Elgato plugin keys). Not shown for presses that only wake the display, that call `ctx.goto_page`, for buttons without `press`, for
@@ -219,7 +219,8 @@ red ERR tile until its next render. A connection may hold 256 slots; `size_px` m
 
 - `icon`: a picture fitted inside the key (with padding, aspect ratio kept) over `bg`; with `text`, the
   picture takes the top ~58% of the key and the text sits in a band along the bottom edge (a label that
-  wraps onto two lines gets a taller band, so the icon shrinks a little). Transparent PNGs show `bg` through.
+  wraps onto two lines gets a taller band, so the icon shrinks a little). Transparent PNGs show `bg` through. `tint = "#rrggbb"` recolours the icon's visible pixels to that colour,
+  keeping their alpha (an icon without transparency uses its luminance as alpha); it never affects `image`.
 - `image`: a full-bleed picture, scaled to cover the whole key (center-cropped). `text` is drawn on top
   along the bottom, over a subtle dark gradient and shadow so it stays legible. `icon` can still be
   combined with it.

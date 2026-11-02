@@ -52,6 +52,7 @@ sdc.default_page("home")                   -- optional; default is the first pag
 | `text` | Label. `\n` allowed; wraps and shrinks to fit |
 | `bg`, `fg` | Background and text colour, `#rgb` or `#rrggbb` |
 | `icon` | A picture fitted inside the key over `bg`, with padding. With `text`, the icon takes the top part and the label sits along the bottom |
+| `tint` | `#rrggbb`: recolours the `icon`'s visible pixels to this colour, keeping their alpha (an icon with no transparency uses its luminance as alpha). Icons only, never `image` |
 | `image` | A full-bleed picture, scaled to cover the key (center-cropped). `text` is drawn over a dark gradient at the bottom |
 | `font_size` | Pixels at a 72 px key, scaled with the real key size. Auto-fit when absent |
 
