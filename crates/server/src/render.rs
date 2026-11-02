@@ -119,8 +119,8 @@ impl Loaded {
 /// How a picture is scaled for a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Fit {
-    /// Cover a square of this size, center-cropped.
-    Cover(u32),
+    /// Cover a `w` x `h` rectangle, center-cropped.
+    Cover(u32, u32),
     /// Exactly this size (the aspect ratio is already right).
     Exact(u32, u32),
 }
@@ -149,7 +149,7 @@ impl Scaled {
         slot.get_or_init(|| {
             self.computed.fetch_add(1, Ordering::Relaxed);
             Arc::new(match fit {
-                Fit::Cover(size) => cover(&src.img, size),
+                Fit::Cover(w, h) => cover(&src.img, w, h),
                 Fit::Exact(w, h) => resize_premul(&src.img, w, h, true),
             })
         })
@@ -264,7 +264,11 @@ enum Img {
 /// caches). Turning it into pixels needs no renderer state, so jobs can run in parallel.
 pub struct Job {
     spec: RenderSpec,
-    size: u32,
+    /// Canvas size; one key's size, or a span's virtual size including the gaps.
+    w: u32,
+    h: u32,
+    /// Set for a span: how the canvas is cut into key tiles.
+    span: Option<SpanGeom>,
     image: Option<Img>,
     icon: Option<Img>,
 }
@@ -276,6 +280,37 @@ impl Job {
         self.image = keep(self.image);
         self.icon = keep(self.icon);
         self
+    }
+}
+
+/// A rectangle of keys that shows one picture: `cols` x `rows` keys of `key` px with `gap` px
+/// between neighbours (the space between the physical keys, which the picture continues over).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpanGeom {
+    pub cols: u32,
+    pub rows: u32,
+    pub key: u32,
+    pub gap: u32,
+}
+
+/// Default gap between keys in px at 72 px keys (Stream Deck MK.2 pitch is ~0.25 of a key).
+pub const DEFAULT_GAP: u32 = 18;
+
+/// A configured gap (px at 72 px keys) scaled to `key` px keys.
+pub fn gap_px(gap72: u32, key: u32) -> u32 {
+    (gap72 as f32 * key as f32 / 72.0).round() as u32
+}
+
+impl SpanGeom {
+    /// Size of the virtual canvas.
+    pub fn canvas(&self) -> (u32, u32) {
+        let len = |n: u32| n * self.key + n.saturating_sub(1) * self.gap;
+        (len(self.cols), len(self.rows))
+    }
+
+    /// Top-left of tile (`c`, `r`) in the canvas.
+    pub fn tile_origin(&self, c: u32, r: u32) -> (u32, u32) {
+        (c * (self.key + self.gap), r * (self.key + self.gap))
     }
 }
 
@@ -397,27 +432,48 @@ impl Renderer {
 
     /// Looks up the pictures `spec` needs (decoding local files, starting downloads).
     pub fn prepare(&mut self, spec: &RenderSpec, size: u32) -> Job {
+        self.prepare_sized(spec, size, size, None)
+    }
+
+    /// Like [`Renderer::prepare`] for a span: the picture is laid out on the whole canvas.
+    pub fn prepare_span(&mut self, spec: &RenderSpec, geom: SpanGeom) -> Job {
+        let (w, h) = geom.canvas();
+        self.prepare_sized(spec, w, h, Some(geom))
+    }
+
+    fn prepare_sized(&mut self, spec: &RenderSpec, w: u32, h: u32, span: Option<SpanGeom>) -> Job {
         Job {
             spec: spec.clone(),
-            size,
+            w,
+            h,
+            span,
             image: spec.image.as_deref().map(|n| self.lookup(n)),
             icon: spec.icon.as_deref().map(|n| self.lookup(n)),
         }
         .without_missing()
     }
 
-    /// Rasterizes and JPEG-encodes `jobs`, spread over the available cores.
+    /// Rasterizes `span` and cuts it into its key tiles (row-major), before JPEG encoding.
+    pub fn render_span_images(&mut self, spec: &RenderSpec, geom: SpanGeom) -> Vec<RgbImage> {
+        let job = self.prepare_span(spec, geom);
+        self.painter.paint_tiles(&job)
+    }
+
+    /// Rasterizes and JPEG-encodes `jobs`, spread over the available cores. A job yields one
+    /// JPEG, or for a span one per key (row-major); the results are concatenated in job order.
     pub fn encode_all(&self, jobs: Vec<Job>) -> Vec<Vec<u8>> {
         let painter = &*self.painter;
-        let run = |job: &Job| encode_jpeg(&painter.paint(job));
+        let run = |job: &Job| -> Vec<Vec<u8>> {
+            painter.paint_tiles(job).iter().map(encode_jpeg).collect()
+        };
         let workers = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .min(jobs.len());
         if workers <= 1 {
-            return jobs.iter().map(run).collect();
+            return jobs.iter().flat_map(run).collect();
         }
         let next = AtomicUsize::new(0);
-        let mut out: Vec<Option<Vec<u8>>> = vec![None; jobs.len()];
+        let mut out: Vec<Option<Vec<Vec<u8>>>> = vec![None; jobs.len()];
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..workers)
                 .map(|_| {
@@ -438,7 +494,9 @@ impl Renderer {
                 }
             }
         });
-        out.into_iter().map(|j| j.expect("every job ran")).collect()
+        out.into_iter()
+            .flat_map(|j| j.expect("every job ran"))
+            .collect()
     }
 
     /// Renders several keys at once (see [`Renderer::encode_all`]).
@@ -521,22 +579,39 @@ impl Renderer {
 }
 
 impl Painter {
+    /// The job's picture, cut into key tiles for a span (a single tile otherwise).
+    fn paint_tiles(&self, job: &Job) -> Vec<RgbImage> {
+        let img = self.paint(job);
+        let Some(g) = job.span else {
+            return vec![img];
+        };
+        (0..g.rows)
+            .flat_map(|r| (0..g.cols).map(move |c| (c, r)))
+            .map(|(c, r)| {
+                let (x, y) = g.tile_origin(c, r);
+                imageops::crop_imm(&img, x, y, g.key, g.key).to_image()
+            })
+            .collect()
+    }
+
     fn paint(&self, job: &Job) -> RgbImage {
-        let (spec, size) = (&job.spec, job.size);
-        let mut img = RgbImage::from_pixel(size, size, Rgb(spec.bg.0));
-        let s = size as f32;
+        let spec = &job.spec;
+        let (w, h) = (job.w, job.h);
+        let mut img = RgbImage::from_pixel(w, h, Rgb(spec.bg.0));
+        // sizes of padding, text and shadow follow the shorter side of the canvas
+        let s = w.min(h) as f32;
         let pad = PAD * s / 72.0;
         let inner = Area {
             x: pad,
             y: pad,
-            w: s - 2.0 * pad,
-            h: s - 2.0 * pad,
+            w: w as f32 - 2.0 * pad,
+            h: h as f32 - 2.0 * pad,
         };
         let full = Area {
             x: 0.0,
             y: 0.0,
-            w: s,
-            h: s,
+            w: w as f32,
+            h: h as f32,
         };
         let (image, icon) = (&job.image, &job.icon);
         let text = spec.text.as_deref().filter(|t| !t.is_empty());
@@ -571,13 +646,16 @@ impl Painter {
 
         match image {
             Some(Img::Ready(im)) => {
-                composite(&mut img, &self.scaled.get(im, Fit::Cover(size)), 0, 0);
+                composite(&mut img, &self.scaled.get(im, Fit::Cover(w, h)), 0, 0);
                 if text.is_some() {
                     darken_bottom(&mut img);
                 }
             }
             Some(Img::Failed) => {
-                let top = Area { h: s / 2.0, ..full };
+                let top = Area {
+                    h: full.h / 2.0,
+                    ..full
+                };
                 self.draw_err(&mut img, full, top);
             }
             Some(Img::Loading | Img::Missing) | None => {}
@@ -784,14 +862,13 @@ fn blend(dst: &mut Rgb<u8>, src: [u8; 3], a: f32) {
     }
 }
 
-/// Scales `src` (premultiplied) to cover a `size` x `size` square and center-crops the overflow.
-pub fn cover(src: &RgbaImage, size: u32) -> RgbaImage {
-    let k = (size as f32 / src.width() as f32).max(size as f32 / src.height() as f32);
-    let w = ((src.width() as f32 * k).round() as u32).max(size);
-    let h = ((src.height() as f32 * k).round() as u32).max(size);
-    let scaled = resize_premul(src, w, h, false);
-    let mut out =
-        imageops::crop_imm(&scaled, (w - size) / 2, (h - size) / 2, size, size).to_image();
+/// Scales `src` (premultiplied) to cover a `w` x `h` rectangle and center-crops the overflow.
+pub fn cover(src: &RgbaImage, w: u32, h: u32) -> RgbaImage {
+    let k = (w as f32 / src.width() as f32).max(h as f32 / src.height() as f32);
+    let sw = ((src.width() as f32 * k).round() as u32).max(w);
+    let sh = ((src.height() as f32 * k).round() as u32).max(h);
+    let scaled = resize_premul(src, sw, sh, false);
+    let mut out = imageops::crop_imm(&scaled, (sw - w) / 2, (sh - h) / 2, w, h).to_image();
     unpremultiply(&mut out);
     out
 }
@@ -980,13 +1057,13 @@ mod tests {
             };
         }
         for size in [72u32, 96] {
-            let out = cover(&src, size);
+            let out = cover(&src, size, size);
             assert_eq!((out.width(), out.height()), (size, size));
             assert_eq!(out.get_pixel(2, size / 2).0, [255, 0, 0, 255]);
             assert_eq!(out.get_pixel(size - 3, size / 2).0, [0, 0, 255, 255]);
         }
         // tall pictures too
-        let out = cover(&RgbaImage::new(30, 300), 72);
+        let out = cover(&RgbaImage::new(30, 300), 72, 72);
         assert_eq!((out.width(), out.height()), (72, 72));
     }
 
@@ -1257,5 +1334,77 @@ mod tests {
             assert_eq!(serial, many);
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn span_tiles_are_crops_of_one_canvas_skipping_the_gaps() {
+        // a picture whose red is x and green is y over the 162x162 canvas of a 2x2 span
+        let geom = SpanGeom {
+            cols: 2,
+            rows: 2,
+            key: 72,
+            gap: 18,
+        };
+        assert_eq!(geom.canvas(), (162, 162));
+        let mut src = RgbaImage::new(162, 162);
+        for (x, y, p) in src.enumerate_pixels_mut() {
+            *p = image::Rgba([x as u8, y as u8, 0, 255]);
+        }
+        let dir = png_dir("span", &[("grad.png", src)]);
+        let mut r = Renderer::new(dir);
+        let spec = RenderSpec {
+            image: Some("grad.png".into()),
+            ..Default::default()
+        };
+        let tiles = r.render_span_images(&spec, geom);
+        assert_eq!(tiles.len(), 4);
+        for t in &tiles {
+            assert_eq!((t.width(), t.height()), (72, 72));
+        }
+        for (i, t) in tiles.iter().enumerate() {
+            let (c, row) = (i as u32 % 2, i as u32 / 2);
+            let (ox, oy) = (c * 90, row * 90);
+            for (x, y) in [(0, 0), (71, 0), (0, 71), (71, 71), (30, 40)] {
+                let p = t.get_pixel(x, y).0;
+                let want = [(ox + x) as u8, (oy + y) as u8, 0];
+                assert!(
+                    p[0].abs_diff(want[0]) <= 2 && p[1].abs_diff(want[1]) <= 2,
+                    "tile {i} ({x},{y}): {p:?} vs {want:?}"
+                );
+            }
+        }
+        // the edge of the left tile and the start of the right one skip the 18 px gap
+        assert!(tiles[1].get_pixel(0, 0).0[0] > tiles[0].get_pixel(71, 0).0[0] + 15);
+        // the JPEG path gives the same number of tiles
+        let jobs = vec![r.prepare_span(&spec, geom), r.prepare(&spec, 72)];
+        assert_eq!(r.encode_all(jobs).len(), 5);
+    }
+
+    #[test]
+    fn span_text_is_laid_out_on_the_whole_canvas() {
+        let geom = SpanGeom {
+            cols: 2,
+            rows: 2,
+            key: 72,
+            gap: 18,
+        };
+        let mut r = Renderer::new(PathBuf::from("."));
+        let spec = RenderSpec {
+            text: Some("W".into()),
+            ..Default::default()
+        };
+        let tiles = r.render_span_images(&spec, geom);
+        let bg = spec.bg.0;
+        // one big glyph centred on the canvas straddles the gaps: every tile shows a part of
+        // it near the canvas centre and nothing near its own outer corner
+        let ink = |t: &RgbImage, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>| {
+            xs.flat_map(|x| ys.clone().map(move |y| (x, y)))
+                .any(|(x, y)| t.get_pixel(x, y).0 != bg)
+        };
+        assert!(ink(&tiles[0], 50..72, 50..72));
+        assert!(ink(&tiles[3], 0..22, 0..22));
+        assert!(!ink(&tiles[0], 0..20, 0..20));
+        assert!(!ink(&tiles[3], 52..72, 52..72));
+        assert_eq!(gap_px(18, 96), 24);
     }
 }

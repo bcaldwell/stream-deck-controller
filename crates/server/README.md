@@ -64,12 +64,14 @@ sdc.page("home", {                -- list index = key index, row-major, key 1 (L
 })
 sdc.default_page("home")          -- optional; default is the first page defined
 sdc.brightness(60)                -- optional; active brightness 0-100 (sent on connect and on wake)
+sdc.key_gap(18)                   -- optional; default gap between keys for spans (px at 72 px keys, default 18)
 sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }   -- optional, seconds
 ```
 
 - Render descriptor: `text` (`\n` allowed; wraps and auto-shrinks), `bg`/`fg` (`#rgb`, `#rrggbb`),
   `icon` and `image` (see [Icons and images](#icons-and-images)), `font_size` (px; auto-fit when absent).
-- `ctx`: `client_id`, `key` (0-based), `page`, `rows`, `cols`, `goto_page(name)`.
+- `ctx`: `client_id`, `key` (0-based), `page`, `rows`, `cols`, `goto_page(name)`; for spans also
+  `span_cols`, `span_rows` and, in `press`/`release`, `span_index` (see [Spans](#spans)).
 - `ha` (also `sdc.ha`): `ha.state(entity_id)` and fire-and-forget `ha.call(domain, service, data)`.
 - Dependency tracking is automatic: every entity passed to `ha.state` during a render is recorded
   for that (client, key). A `state_changed` re-renders only those keys, and a frame is sent only if
@@ -124,6 +126,41 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3
   only (icon area, or the top half of the key for `image`); it is retried after 60 s, or on a config reload.
   Static `icon`/`image` strings in the config are prefetched on every (re)load. `sdc-server render` waits
   for downloads before writing the PNGs.
+
+## Spans
+
+`sdc.span { cols, rows, render, press, release, gap }` is a button that covers a rectangle of keys and shows
+one picture or text across all of them, e.g. album art over 2x2 keys. The page list is row-major key slots: a
+span in slot k occupies k..k+cols-1 on that row and the same columns on the following rows, and the other
+slots it covers must be `false`/`nil`.
+```lua
+sdc.page("music", {
+  sdc.button { render = { text = "Back" } },       -- key 0
+  sdc.span { cols = 2, rows = 2,                   -- keys 1, 2, 6, 7
+    render = function(ctx)
+      local p = ha.state("media_player.living_room_2")
+      local art = p and p.attributes.entity_picture
+      return art and { image = art } or { text = "Nothing playing" }
+    end,
+    press = function(ctx) print(ctx.key, ctx.span_index) end },   -- pressed key; 0..n-1 row-major
+  false, false, false,                             -- keys 3, 4, 5
+  false, false, false,                             -- keys 8, 9, 10 (key 6, 7 are the span's second row)
+})
+```
+- The grid size is per client, so spans are placed when a client renders: a span that runs off the client's
+  rows/cols, or covers a slot holding a button or another span, is logged and shows the red `ERR` tile on its
+  keys (as does a Lua error in its `render`). Pressing an ERR span does nothing.
+- `render` returns the usual descriptor, laid out once on a canvas of `cols*key + (cols-1)*gap` by
+  `rows*key + (rows-1)*gap` px, which then is cut into one tile per key (tile (c, r) starts at
+  `(c*(key+gap), r*(key+gap))`), so the picture continues across the physical space between keys. `image`
+  covers the whole canvas (center-cropped to its aspect); `icon`/`text` are placed on the whole canvas, with
+  padding and text size following its shorter side.
+- `gap` (per span) or `sdc.key_gap(px)` (global) is in px at 72 px keys and scales with the client's key size;
+  the default is 18 (0.25 of a key, about the pitch of a Stream Deck MK.2).
+- Dependencies: entities read by a span's `render` and its image downloads re-render all of its keys. Each tile
+  is still only sent when its JPEG changed. Scaled pictures are cached per canvas size.
+- `ctx` in `render` has `key` = the span's top-left key; in `press`/`release`, `key` is the pressed key and
+  `span_index` its position in the span. Idle wake, `home_after` and page memory work as for buttons.
 
 ## Layout
 

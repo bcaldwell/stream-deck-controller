@@ -40,6 +40,36 @@ pub struct ButtonDef {
     render: Value,
     press: Option<Function>,
     release: Option<Function>,
+    /// Set for `sdc.span{...}`: the button covers a rectangle of keys.
+    pub span: Option<SpanDef>,
+}
+
+/// Size of an `sdc.span`, and its own gap between keys (px at 72 px keys) if it sets one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpanDef {
+    pub cols: u8,
+    pub rows: u8,
+    pub gap: Option<u32>,
+}
+
+/// What a physical key shows on a page of a given grid size (see [`LuaRuntime::layout`]).
+#[derive(Clone)]
+pub enum Cell {
+    Empty,
+    Button(ButtonDef),
+    /// One key of a span; `origin` is the span's top-left key.
+    Span(SpanCell),
+}
+
+#[derive(Clone)]
+pub struct SpanCell {
+    pub def: ButtonDef,
+    pub size: SpanDef,
+    pub origin: u8,
+    /// Row-major position of this key within the span.
+    pub index: u8,
+    /// Why the span cannot be shown (off the grid, overlapping); its keys show the ERR tile.
+    pub error: Option<String>,
 }
 
 /// `sdc.idle{...}`: dim, then switch the display off, after this long without a key press;
@@ -65,6 +95,8 @@ pub struct Settings {
     pub idle: IdleConfig,
     /// `sdc.brightness`, if set; clients are told about it on connect and on wake.
     pub brightness: Option<u8>,
+    /// `sdc.key_gap`: default gap between keys for spans (px at 72 px keys).
+    pub key_gap: Option<u32>,
 }
 
 impl Settings {
@@ -84,6 +116,7 @@ impl Default for Settings {
                 home_after: None,
             },
             brightness: None,
+            key_gap: None,
         }
     }
 }
@@ -103,6 +136,9 @@ pub struct CtxInfo {
     pub page: String,
     pub rows: u8,
     pub cols: u8,
+    /// Set when the call is for a span: its size and (for presses) the pressed key's position.
+    pub span: Option<(u8, u8)>,
+    pub span_index: Option<u8>,
 }
 
 pub struct RenderOutcome {
@@ -180,6 +216,69 @@ impl LuaRuntime {
         keys.get(key as usize)?.clone()
     }
 
+    /// What every key of `page` shows on a `rows` x `cols` grid. Spans are placed per grid
+    /// because the page list is row-major: a span at slot k covers k..k+cols-1 and the same
+    /// columns below, and those other slots must be empty.
+    pub fn layout(&self, page: &str, rows: u8, cols: u8) -> Vec<Cell> {
+        let r = self.registry.borrow();
+        let keys = r
+            .pages
+            .iter()
+            .find(|(n, _)| n == page)
+            .map(|(_, k)| k.as_slice())
+            .unwrap_or_default();
+        let count = rows as usize * cols as usize;
+        let mut cells: Vec<Option<Cell>> = vec![None; count];
+        for (k, def) in keys.iter().enumerate().take(count) {
+            let Some(def) = def else { continue };
+            let Some(size) = def.span else {
+                if cells[k].is_none() {
+                    cells[k] = Some(Cell::Button(def.clone()));
+                }
+                continue;
+            };
+            let (row, col) = (k / cols as usize, k % cols as usize);
+            let mut error = None;
+            if col + size.cols as usize > cols as usize || row + size.rows as usize > rows as usize
+            {
+                error = Some(format!(
+                    "span {}x{} at key {k} does not fit the {rows}x{cols} grid",
+                    size.cols, size.rows
+                ));
+            }
+            let mut members = Vec::new();
+            for dr in 0..size.rows as usize {
+                for dc in 0..size.cols as usize {
+                    let m = (row + dr) * cols as usize + col + dc;
+                    if row + dr >= rows as usize || col + dc >= cols as usize {
+                        continue;
+                    }
+                    if m != k && (keys.get(m).is_some_and(Option::is_some) || cells[m].is_some()) {
+                        error.get_or_insert_with(|| {
+                            format!("span at key {k} overlaps slot {m}, which must be false/nil")
+                        });
+                    }
+                    members.push((dr * size.cols as usize + dc, m));
+                }
+            }
+            for (index, m) in members {
+                if m == k || cells[m].is_none() {
+                    cells[m] = Some(Cell::Span(SpanCell {
+                        def: def.clone(),
+                        size,
+                        origin: k as u8,
+                        index: index as u8,
+                        error: error.clone(),
+                    }));
+                }
+            }
+        }
+        cells
+            .into_iter()
+            .map(|c| c.unwrap_or(Cell::Empty))
+            .collect()
+    }
+
     /// `icon`/`image` names used by buttons whose `render` is a static table or string (the
     /// ones that can be fetched ahead of time).
     pub fn static_image_names(&self) -> Vec<String> {
@@ -243,6 +342,13 @@ impl LuaRuntime {
         t.set("page", info.page.as_str())?;
         t.set("rows", info.rows)?;
         t.set("cols", info.cols)?;
+        if let Some((cols, rows)) = info.span {
+            t.set("span_cols", cols)?;
+            t.set("span_rows", rows)?;
+        }
+        if let Some(i) = info.span_index {
+            t.set("span_index", i)?;
+        }
         let host = self.host.clone();
         t.set(
             "goto_page",
@@ -267,9 +373,44 @@ fn install(
     sdc.set(
         "button",
         lua.create_function(|_, t: Table| {
-            check_button_table(&t)?;
+            check_button_table(&t, "sdc.button")?;
             t.set("__sdc", "button")?;
             Ok(t)
+        })?,
+    )?;
+
+    sdc.set(
+        "span",
+        lua.create_function(|_, t: Table| {
+            check_button_table(&t, "sdc.span")?;
+            for field in ["cols", "rows"] {
+                let v: Value = t.get(field)?;
+                if !matches!(v, Value::Integer(1..=32)) {
+                    return Err(mlua::Error::runtime(format!(
+                        "sdc.span: '{field}' must be an integer 1-32"
+                    )));
+                }
+            }
+            let gap: Value = t.get("gap")?;
+            if !matches!(gap, Value::Nil | Value::Integer(0..=72)) {
+                return Err(mlua::Error::runtime(
+                    "sdc.span: 'gap' must be an integer 0-72 (px at 72 px keys)",
+                ));
+            }
+            t.set("__sdc", "span")?;
+            Ok(t)
+        })?,
+    )?;
+
+    let reg = registry.clone();
+    sdc.set(
+        "key_gap",
+        lua.create_function(move |_, px: i64| {
+            let px = u32::try_from(px).ok().filter(|p| *p <= 72).ok_or_else(|| {
+                mlua::Error::runtime(format!("sdc.key_gap: {px} is not 0-72 (px at 72 px keys)"))
+            })?;
+            reg.borrow_mut().settings.key_gap = Some(px);
+            Ok(())
         })?,
     )?;
 
@@ -286,16 +427,26 @@ fn install(
                 };
                 let def = match v {
                     Value::Nil | Value::Boolean(false) => None,
-                    Value::Table(t) if t.get::<Option<String>>("__sdc")?.as_deref() == Some("button") => {
+                    Value::Table(t) if matches!(t.get::<Option<String>>("__sdc")?.as_deref(), Some("button" | "span")) => {
+                        let is_span = t.get::<String>("__sdc")? == "span";
                         Some(ButtonDef {
                             render: t.get("render")?,
                             press: t.get("press")?,
                             release: t.get("release")?,
+                            span: is_span
+                                .then(|| -> mlua::Result<SpanDef> {
+                                    Ok(SpanDef {
+                                        cols: t.get("cols")?,
+                                        rows: t.get("rows")?,
+                                        gap: t.get("gap")?,
+                                    })
+                                })
+                                .transpose()?,
                         })
                     }
                     _ => {
                         return Err(mlua::Error::runtime(format!(
-                            "page '{name}': item {} is not an sdc.button(...) (use false for an empty key)",
+                            "page '{name}': item {} is not an sdc.button(...) or sdc.span(...) (use false for an empty key)",
                             idx + 1
                         )))
                     }
@@ -454,12 +605,12 @@ fn seconds_arg(field: &str, v: &Value) -> mlua::Result<Duration> {
     }
 }
 
-fn check_button_table(t: &Table) -> mlua::Result<()> {
+fn check_button_table(t: &Table, what: &str) -> mlua::Result<()> {
     for field in ["press", "release"] {
         let v: Value = t.get(field)?;
         if !matches!(v, Value::Nil | Value::Function(_)) {
             return Err(mlua::Error::runtime(format!(
-                "sdc.button: '{field}' must be a function"
+                "{what}: '{field}' must be a function"
             )));
         }
     }
@@ -468,9 +619,9 @@ fn check_button_table(t: &Table) -> mlua::Result<()> {
         r,
         Value::Nil | Value::Function(_) | Value::Table(_) | Value::String(_)
     ) {
-        return Err(mlua::Error::runtime(
-            "sdc.button: 'render' must be a function or a table",
-        ));
+        return Err(mlua::Error::runtime(format!(
+            "{what}: 'render' must be a function or a table"
+        )));
     }
     Ok(())
 }
@@ -528,6 +679,8 @@ mod tests {
             page: page.into(),
             rows: 3,
             cols: 5,
+            span: None,
+            span_index: None,
         }
     }
 
@@ -699,6 +852,68 @@ mod tests {
             "sdc.idle { dim_brightness = 200 }",
             "sdc.idle { dim_aftr = 5 }",
             "sdc.idle { home_after = -1 }",
+        ] {
+            assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn span_layout_and_validation() {
+        let rt = LuaRuntime::load_str(
+            r#"
+            sdc.key_gap(10)
+            sdc.page("p", { false, sdc.span{ cols = 2, rows = 2, gap = 5, render = { text = "S" } },
+                            false, false, sdc.button{ render = { text = "B" } } })
+            "#,
+            Host::new(None),
+        )
+        .unwrap();
+        assert_eq!(rt.settings().key_gap, Some(10));
+        let cells = rt.layout("p", 3, 5);
+        assert_eq!(cells.len(), 15);
+        let spans: Vec<_> = cells
+            .iter()
+            .enumerate()
+            .filter_map(|(k, c)| match c {
+                Cell::Span(s) => Some((k, s.origin, s.index, s.error.is_some(), s.size.gap)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                (1, 1, 0, false, Some(5)),
+                (2, 1, 1, false, Some(5)),
+                (6, 1, 2, false, Some(5)),
+                (7, 1, 3, false, Some(5))
+            ]
+        );
+        assert!(matches!(cells[4], Cell::Button(_)));
+        // a 4 column grid: the button at slot 4 is outside the span's covered slots
+        let narrow = rt.layout("p", 3, 4);
+        assert!(matches!(&narrow[1], Cell::Span(s) if s.error.is_none()));
+        // 2 rows do not fit a 1 row grid
+        let short = rt.layout("p", 1, 5);
+        assert!(
+            matches!(&short[1], Cell::Span(s) if s.error.as_deref().is_some_and(|e| e.contains("does not fit")))
+        );
+        // a button in a slot the span covers
+        let rt = LuaRuntime::load_str(
+            r#"sdc.page("p", { sdc.span{ cols = 2, rows = 1, render = { text = "S" } }, sdc.button{} })"#,
+            Host::new(None),
+        )
+        .unwrap();
+        let cells = rt.layout("p", 3, 5);
+        assert!(
+            matches!(&cells[0], Cell::Span(s) if s.error.as_deref().is_some_and(|e| e.contains("overlaps")))
+        );
+        assert!(matches!(&cells[1], Cell::Span(_)));
+        for bad in [
+            "sdc.span{ rows = 2 }",
+            "sdc.span{ cols = 0, rows = 1 }",
+            "sdc.span{ cols = 1, rows = 1, gap = -1 }",
+            "sdc.span{ cols = 1, rows = 1, press = 1 }",
+            "sdc.key_gap(-3)",
         ] {
             assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
         }

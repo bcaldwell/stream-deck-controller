@@ -15,8 +15,8 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::assets::{Assets, Fetcher, HaApi, S3Config};
 use crate::ha::{HaCommand, HaEvent};
-use crate::lua_api::{CtxInfo, Host, IdleConfig, LuaRuntime, Settings};
-use crate::render::{Color, RenderSpec, Renderer};
+use crate::lua_api::{Cell, CtxInfo, Host, IdleConfig, LuaRuntime, Settings, SpanCell};
+use crate::render::{gap_px, Color, RenderSpec, Renderer, SpanGeom, DEFAULT_GAP};
 
 pub type ClientId = u64;
 
@@ -399,10 +399,20 @@ impl Engine {
             return;
         };
         let Some(rt) = &self.runtime else { return };
-        let Some(btn) = rt.button(&c.page, key) else {
-            return;
+        let (btn, info) = match rt
+            .layout(&c.page, c.device.rows, c.device.cols)
+            .into_iter()
+            .nth(key as usize)
+        {
+            Some(Cell::Button(b)) => (b, ctx_info(c, key)),
+            Some(Cell::Span(sp)) if sp.error.is_none() => {
+                let mut info = ctx_info(c, key);
+                info.span = Some((sp.size.cols, sp.size.rows));
+                info.span_index = Some(sp.index);
+                (sp.def, info)
+            }
+            _ => return,
         };
-        let info = ctx_info(c, key);
         tracing::debug!(client = %c.client_id, page = %c.page, key, down, "key event");
         match rt.press(&btn, &info, down) {
             Ok(Some(page)) => self.goto_page(id, &page),
@@ -437,49 +447,91 @@ impl Engine {
     }
 
     /// Renders `keys` of a client: Lua render functions run one after the other on this thread,
-    /// then the resulting descriptors are rasterized and encoded in parallel.
+    /// then the resulting descriptors are rasterized and encoded in parallel. A span is rendered
+    /// once for all of its keys, whichever of them was asked for.
     fn render_keys(&mut self, id: ClientId, keys: &[u8]) {
         let Some(c) = self.clients.get(&id) else {
             return;
         };
         let started = Instant::now();
         let size = c.device.key_size_px;
+        let cells = match &self.runtime {
+            Some(rt) => rt.layout(&c.page, c.device.rows, c.device.cols),
+            None => Vec::new(),
+        };
+        let key_gap = self.settings().key_gap;
+        // keys each job produces a tile for, in order, with the entities their render read
+        let mut groups: Vec<(Vec<u8>, HashSet<String>)> = Vec::with_capacity(keys.len());
         let mut jobs = Vec::with_capacity(keys.len());
-        let mut all_deps = Vec::with_capacity(keys.len());
+        let mut spans_done = HashSet::new();
+        let black = RenderSpec {
+            bg: Color::BLACK,
+            ..RenderSpec::default()
+        };
         for &key in keys {
-            let found = self
-                .runtime
-                .as_ref()
-                .and_then(|rt| rt.button(&c.page, key).map(|b| (rt, b)));
-            let (spec, deps) = match found {
-                Some((rt, btn)) => {
+            let rt = self.runtime.as_ref();
+            let cell = cells.get(key as usize).cloned().unwrap_or(Cell::Empty);
+            let (spec, deps) = match (&cell, rt) {
+                (Cell::Button(btn), Some(rt)) => {
                     let info = ctx_info(c, key);
-                    let out = rt.render(&btn, &info);
+                    let out = rt.render(btn, &info);
                     if let Some(e) = &out.error {
                         tracing::error!("render {} key {key} for {}: {e}", info.page, c.client_id);
                     }
-                    let mut deps = out.deps;
-                    deps.extend(
-                        self.renderer
-                            .remote_keys(&out.spec)
-                            .into_iter()
-                            .map(|k| format!("img:{k}")),
-                    );
-                    (out.spec, deps)
+                    (out.spec, out.deps)
                 }
-                None => (
-                    RenderSpec {
-                        bg: Color::BLACK,
-                        ..RenderSpec::default()
-                    },
-                    HashSet::new(),
-                ),
+                (Cell::Span(sp), Some(rt)) => {
+                    if !spans_done.insert(sp.origin) {
+                        continue;
+                    }
+                    let members: Vec<u8> = cells
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| matches!(c, Cell::Span(o) if o.origin == sp.origin))
+                        .map(|(k, _)| k as u8)
+                        .collect();
+                    let (spec, deps, failed) = self.render_span(rt, c, sp);
+                    let deps: HashSet<String> = deps
+                        .into_iter()
+                        .chain(
+                            self.renderer
+                                .remote_keys(&spec)
+                                .into_iter()
+                                .map(|k| format!("img:{k}")),
+                        )
+                        .collect();
+                    if failed {
+                        // the red ERR tile on every key of the span
+                        for k in members {
+                            jobs.push(self.renderer.prepare(&RenderSpec::error(), size));
+                            groups.push((vec![k], deps.clone()));
+                        }
+                    } else {
+                        let geom = SpanGeom {
+                            cols: sp.size.cols as u32,
+                            rows: sp.size.rows as u32,
+                            key: size,
+                            gap: gap_px(sp.size.gap.or(key_gap).unwrap_or(DEFAULT_GAP), size),
+                        };
+                        jobs.push(self.renderer.prepare_span(&spec, geom));
+                        groups.push((members, deps));
+                    }
+                    continue;
+                }
+                _ => (black.clone(), HashSet::new()),
             };
+            let mut deps = deps;
+            deps.extend(
+                self.renderer
+                    .remote_keys(&spec)
+                    .into_iter()
+                    .map(|k| format!("img:{k}")),
+            );
             jobs.push(self.renderer.prepare(&spec, size));
-            all_deps.push(deps);
+            groups.push((vec![key], deps));
         }
         let page = c.page.clone();
-        let jpegs = self.renderer.encode_all(jobs);
+        let mut jpegs = self.renderer.encode_all(jobs).into_iter();
         tracing::debug!(
             client = id,
             page,
@@ -487,10 +539,39 @@ impl Engine {
             ms = started.elapsed().as_secs_f64() * 1000.0,
             "rendered keys"
         );
-        for ((&key, deps), jpeg) in keys.iter().zip(all_deps).zip(jpegs) {
-            self.set_deps(id, key, deps);
-            self.send_if_changed(id, key, jpeg);
+        for (group, deps) in groups {
+            for key in group {
+                let Some(jpeg) = jpegs.next() else { return };
+                self.set_deps(id, key, deps.clone());
+                self.send_if_changed(id, key, jpeg);
+            }
         }
+    }
+
+    /// Runs a span's render. Returns the descriptor, the entities it read and whether the span
+    /// cannot be shown (layout problem or a Lua error), in which case its keys show ERR.
+    fn render_span(
+        &self,
+        rt: &LuaRuntime,
+        c: &Client,
+        sp: &SpanCell,
+    ) -> (RenderSpec, HashSet<String>, bool) {
+        if let Some(e) = &sp.error {
+            tracing::error!("render {} for {}: {e}", c.page, c.client_id);
+            return (RenderSpec::error(), HashSet::new(), true);
+        }
+        let mut info = ctx_info(c, sp.origin);
+        info.span = Some((sp.size.cols, sp.size.rows));
+        let out = rt.render(&sp.def, &info);
+        if let Some(e) = &out.error {
+            tracing::error!(
+                "render {} span at key {} for {}: {e}",
+                info.page,
+                sp.origin,
+                c.client_id
+            );
+        }
+        (out.spec, out.deps, out.error.is_some())
     }
 
     fn send_if_changed(&mut self, id: ClientId, key: u8, jpeg: Vec<u8>) {
@@ -573,6 +654,8 @@ fn ctx_info(c: &Client, key: u8) -> CtxInfo {
         page: c.page.clone(),
         rows: c.device.rows,
         cols: c.device.cols,
+        span: None,
+        span_index: None,
     }
 }
 
@@ -1169,5 +1252,95 @@ mod tests {
         assert_eq!(e.pending_fetches(), 1);
         let resent = drain(&mut rx);
         assert_eq!(resent.iter().map(|f| f.key).collect::<Vec<_>>(), [1]);
+    }
+
+    const SPAN_CONFIG: &str = r##"
+        sdc.page("music", {
+          false, sdc.span{ cols = 2, rows = 2,
+            render = function()
+              local l = ha.state("light.a")
+              return { text = "T", bg = (l and l.state == "on") and "#f5b400" or "#222222" }
+            end,
+            press = function(ctx)
+              ha.call("test", "press", { key = ctx.key, index = ctx.span_index })
+            end },
+          false, false, sdc.button{ render = { text = "X" } },
+          false, false, false, false, false,
+          sdc.button{ render = { text = "L" } },
+        })
+        -- 2 columns at the last column runs off the 5 column grid
+        sdc.page("off", { false, false, false, false, sdc.span{ cols = 2, rows = 1, render = { text = "T" } } })
+        -- the slot below the origin is not empty
+        sdc.page("clash", { sdc.span{ cols = 1, rows = 2, render = { text = "T" } }, false, false, false, false,
+                            sdc.button{ render = { text = "B" } } })
+    "##;
+
+    fn key_set(frames: &[Frame]) -> Vec<u8> {
+        let mut k: Vec<u8> = frames.iter().map(|f| f.key).collect();
+        k.sort_unstable();
+        k
+    }
+
+    #[test]
+    fn span_dependency_rerenders_every_key_of_the_span() {
+        let (mut e, mut rx, _ha, _d) = setup(SPAN_CONFIG);
+        e.goto_page(1, "music");
+        drain(&mut rx);
+        // a 2x2 span at slot 1 covers keys 1, 2, 6, 7
+        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
+        assert_eq!(key_set(&drain(&mut rx)), [1, 2, 6, 7]);
+        assert_eq!(e.dep_count("light.a"), 4);
+        // unchanged state -> nothing
+        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn press_on_any_span_key_reports_key_and_index() {
+        let (mut e, mut rx, mut ha, _d) = setup(SPAN_CONFIG);
+        e.goto_page(1, "music");
+        drain(&mut rx);
+        let mut got = Vec::new();
+        for key in [1u8, 2, 6, 7] {
+            e.handle(EngineEvent::KeyDown { id: 1, key });
+            match ha.try_recv().unwrap() {
+                HaCommand::CallService { data, .. } => got.push((
+                    data["key"].as_u64().unwrap(),
+                    data["index"].as_u64().unwrap(),
+                )),
+            }
+        }
+        assert_eq!(got, [(1, 0), (2, 1), (6, 2), (7, 3)]);
+        // outside the span nothing is called
+        e.handle(EngineEvent::KeyDown { id: 1, key: 0 });
+        assert!(ha.try_recv().is_err());
+    }
+
+    #[test]
+    fn span_off_grid_or_overlapping_shows_err_on_its_keys() {
+        let (mut e, mut rx, mut ha, _d) = setup(SPAN_CONFIG);
+        let err = e.renderer.render(&RenderSpec::error(), 72);
+        e.goto_page(1, "off");
+        let f = drain(&mut rx);
+        // only the key that is on the grid exists; it shows ERR, and pressing it does nothing
+        assert_eq!(f.iter().find(|f| f.key == 4).unwrap().jpeg, err);
+        e.handle(EngineEvent::KeyDown { id: 1, key: 4 });
+        assert!(ha.try_recv().is_err());
+        e.goto_page(1, "clash");
+        let f = drain(&mut rx);
+        for k in [0u8, 5] {
+            assert_eq!(f.iter().find(|f| f.key == k).unwrap().jpeg, err, "key {k}");
+        }
+    }
+
+    #[test]
+    fn span_tiles_differ_for_an_image_and_share_the_dependency() {
+        // regular buttons and a span on the same page keep their frames when only the span changes
+        let (mut e, mut rx, _ha, _d) = setup(SPAN_CONFIG);
+        e.goto_page(1, "music");
+        drain(&mut rx);
+        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
+        let f = drain(&mut rx);
+        assert!(f.iter().all(|f| [1, 2, 6, 7].contains(&f.key)));
     }
 }

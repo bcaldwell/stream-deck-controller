@@ -94,6 +94,23 @@ sdc.page("media", {
       return { text = title or "Nothing playing", fg = title and "#ffffff" or "#888888" }
     end,
   },
+  -- row 2: a 2x2 span, list position 6 = key 5, covers keys 5, 6, 10, 11: artwork across four
+  -- keys. The other positions it covers (7, 11, 12) must be false.
+  sdc.span {
+    cols = 2, rows = 2,
+    render = function()
+      local p = ha.state("media_player.living_room_2")
+      local art = p and p.state == "playing" and p.attributes.entity_picture
+      return art and { image = art } or { text = "Nothing playing", fg = "#888888" }
+    end,
+    press = function() ha.call("media_player", "media_play_pause", { entity_id = "media_player.living_room_2" }) end,
+  },
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
 })
 
 sdc.default_page("home")
