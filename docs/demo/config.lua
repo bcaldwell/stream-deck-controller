@@ -2,9 +2,7 @@
 -- Paths are relative to this file.
 local sdc = require("sdc")
 
-sdc.brightness(60)
 sdc.key_gap(18) -- continue pictures across the bezel between keys
-sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }
 
 local ON, OFF = "#f5b400", "#2a2a2e"
 
@@ -97,5 +95,9 @@ sdc.page("media", {
   false, false, false, false, false, false,
 })
 
-sdc.device("living-room", { pages = { "home", "media" }, home = "home" })
-sdc.default_page("home")
+sdc.device("living-room", {
+  pages = { "home", "media" },
+  home = "home",
+  brightness = 60,
+  idle = { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 },
+})

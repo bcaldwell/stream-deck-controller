@@ -33,6 +33,7 @@ sdc.page("home", {
   },
   sdc.button{ render = { text = "Static" } },
 })
+sdc.device("deck", { pages = { "home" } })
 
 sdc.export("lamp", sdc.button{
   label = "Lamp",
@@ -170,22 +171,32 @@ async fn next_msg(c: &mut Client) -> Message {
         .unwrap()
 }
 
+/// The next image frame; the brightness message every connect sends is skipped.
 async fn next_frame(c: &mut Client) -> (u8, Vec<u8>) {
-    match next_msg(c).await {
-        Message::Binary(b) => {
-            let f = ImageFrame::decode(&b).unwrap();
-            (f.key, f.image.to_vec())
+    loop {
+        match next_msg(c).await {
+            Message::Binary(b) => {
+                let f = ImageFrame::decode(&b).unwrap();
+                return (f.key, f.image.to_vec());
+            }
+            Message::Text(t) if t.contains("\"brightness\"") => {}
+            other => panic!("expected binary frame, got {other:?}"),
         }
-        other => panic!("expected binary frame, got {other:?}"),
     }
 }
 
 /// Frames that arrive within `quiet` of each other.
 async fn drain_frames(c: &mut Client, quiet: Duration) -> Vec<(u8, Vec<u8>)> {
     let mut out = Vec::new();
-    while let Ok(Some(Ok(Message::Binary(b)))) = tokio::time::timeout(quiet, c.next()).await {
-        let f = ImageFrame::decode(&b).unwrap();
-        out.push((f.key, f.image.to_vec()));
+    while let Ok(Some(Ok(msg))) = tokio::time::timeout(quiet, c.next()).await {
+        match msg {
+            Message::Binary(b) => {
+                let f = ImageFrame::decode(&b).unwrap();
+                out.push((f.key, f.image.to_vec()));
+            }
+            Message::Text(t) if t.contains("\"brightness\"") => {}
+            _ => break,
+        }
     }
     out
 }
@@ -607,6 +618,7 @@ sdc.page("other", {
   sdc.button{ render = { text = "Back", bg = "#0000cc" }, press = function(ctx) ctx.goto_page("home") end },
   sdc.button{ render = { text = "Other", bg = "#0000cc" } },
 })
+sdc.device("main", { pages = { "home", "other" } })
 "##;
 
 const EMAIL: &str = "X-Auth-Request-Email: me@example.com\r\n";
@@ -815,6 +827,7 @@ async fn deck_devices_api_lists_configured_devices_behind_sso() {
     assert_eq!(
         serde_json::from_slice::<Value>(&body).unwrap(),
         json!([
+            {"name": "main", "pages": ["home", "other"], "home": "home"},
             {"name": "one", "pages": ["home"], "home": "home"},
             {"name": "both", "pages": ["other", "home"], "home": "other"},
         ])
@@ -825,13 +838,6 @@ async fn deck_devices_api_lists_configured_devices_behind_sso() {
     initial_frames(&mut web).await;
     let list = deck_clients(&url).await;
     assert_eq!(list[0]["page"], "other");
-}
-
-#[tokio::test]
-async fn deck_devices_api_is_empty_without_devices() {
-    let (url, _dir) = start_deck_server("deck-nodevices", None, http::DeckAuth::Sso).await;
-    let (status, body) = http_get_raw(&url, "/deck/api/devices", EMAIL).await;
-    assert_eq!((status, &body[..]), (200, &b"[]"[..]));
 }
 
 #[tokio::test]
@@ -1198,6 +1204,7 @@ async fn plugin_subscribe_render_dependencies_and_input() {
     std::fs::write(
         dir.0.join("config.lua"),
         r#"sdc.page("home", {})
+           sdc.device("deck", { pages = { "home" } })
            sdc.export("static", sdc.button{ render = { text = "Static" } })"#,
     )
     .unwrap();

@@ -94,11 +94,9 @@ sdc.page("home", {                -- list index = key index, row-major, key 1 (L
   false,                          -- empty key (nil/false)
   sdc.button { render = { text = "Media" }, press = function(ctx) ctx.goto_page("media") end },
 })
-sdc.default_page("home")          -- optional; default is the first page defined (see Devices for per-deck page sets)
-sdc.brightness(60)                -- optional; active brightness 0-100 (sent on connect and on wake)
+sdc.device("deck", { pages = { "home" } })   -- required: at least one; brightness and idle are set here (see Devices)
 sdc.key_gap(18)                   -- optional; gap between keys for spans (px at 72 px keys, default 0)
 sdc.feedback(true)                -- optional; flash a key briefly after its press ran OK (default true)
-sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }   -- optional, seconds
 ```
 
 - Render descriptor: `text` (`\n` allowed; wraps and auto-shrinks), `bg`/`fg` (`#rgb`, `#rrggbb`),
@@ -115,15 +113,15 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3
   the encoded image actually changed.
 - A Lua error in `render`/`press` is logged and shows a red `ERR` tile; the server keeps running.
 - Other `.lua` files next to the config can be loaded with `require`.
-- Idle: without `sdc.idle` a deck never idles. Otherwise, after `dim_after` seconds without a key press the
+- Idle (the `idle` table of an `sdc.device`): without it a deck never idles. Otherwise, after `dim_after` seconds without a key press the
   server sends brightness `dim_brightness` (default 10), and after `off_after` seconds brightness 0
   (backlight off; key images are left alone). Both are optional. The next key press restores the active
-  brightness (`sdc.brightness`, default 60) and is consumed: it only wakes the deck, its press and release
+  brightness (the device's `brightness`, default 60, sent on connect and on wake) and is consumed: it only wakes the deck, its press and release
   handlers do not run. Any press while awake restarts the timer. Clients are checked once a second; a config
   reload re-reads the settings without waking or dimming anyone (a changed setting takes effect on the next check).
 - Pages: the server remembers each client's page by `client_id` (in memory), so a client that reconnects (server
   deploy, client self-update) returns to the page it was on, unless that page no longer exists. Waking an idle
-  deck also keeps its page. `home_after` (optional) switches a client to the default page after that many seconds
+  deck also keeps its page. `home_after` (optional) switches a client to its device's home page after that many seconds
   without a key press, rendering it even while the display is off, so waking shows home; a disconnected client's
   remembered page expires after the same time. Without `home_after` pages are remembered until the server restarts.
 - Rendering: Lua `render` functions run one after the other, then the keys of a page (connect, page switch,
@@ -140,8 +138,8 @@ local home = sdc.page("home", { ... })   -- sdc.page / sdc.device return handles
 local living = sdc.device("living-room", {
   pages = { home, "lights", "music" },  -- page handles or names (must exist); order irrelevant
   home = home,                          -- start/default page, must be in pages (default: the first of pages)
-  brightness = 60,                      -- optional, like sdc.brightness
-  idle = { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }, -- optional, like sdc.idle
+  brightness = 60,                      -- optional, 0-100 (default 60)
+  idle = { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }, -- optional; absent: never idles
 })
 sdc.default_device { mk2 = living, plus = "office-plus", ["*"] = living }   -- device handles or names
 ```
@@ -151,10 +149,10 @@ sdc.default_device { mk2 = living, plus = "office-plus", ["*"] = living }   -- d
   `browser` for `/deck` clients. `"*"` is the fallback.
 - A connecting client gets, in order: the device it asked for (`sdc-client --device <name>` /
   `SDC_DEVICE`, `Hello.device_name`; an unknown name is logged as a warning and skipped), the
-  `sdc.default_device` entry for its type, the `"*"` entry, the first `sdc.device` defined. If the config
-  defines no devices at all nothing changes: every page, `sdc.default_page`, the global settings.
-- A device's `idle` and `brightness` replace the global `sdc.idle` / `sdc.brightness` when set (the idle table
-  as a whole, not field by field); otherwise the global ones apply. `sdc.default_page` is only used without devices.
+  `sdc.default_device` entry for its type, the `"*"` entry, the first `sdc.device` defined.
+- A config must define at least one `sdc.device` (otherwise it fails to load). `sdc.default_page`, `sdc.idle` and
+  `sdc.brightness` were removed (calling them is an error); a device's `idle` and `brightness` replace them, and a
+  device without them never idles and uses brightness 60. `sdc.key_gap` and `sdc.feedback` stay global.
 - `ctx.goto_page` to a page outside the client's device is logged and ignored. The device's `home` is the start page, the
   target of `home_after` and the fallback when a remembered page is not on the device (also after a config
   reload). A reconnecting client that lands on a different device than before starts at that device's home.

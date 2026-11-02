@@ -187,7 +187,7 @@ async fn deck_clients(State(state): State<WsState>) -> Response {
     }
 }
 
-/// The config's `sdc.device`s (empty without any), for the browser deck's layout choice.
+/// The config's `sdc.device`s for the browser deck's layout choice.
 async fn deck_devices(State(state): State<WsState>) -> Response {
     let (tx, rx) = tokio::sync::oneshot::channel();
     if state.engine.send(EngineEvent::ListDevices(tx)).is_err() {

@@ -15,9 +15,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::assets::{Assets, Fetcher, HaApi, S3Config};
 use crate::ha::{HaCommand, HaEvent};
-use crate::lua_api::{
-    Cell, CtxInfo, DeviceDef, Host, IdleConfig, LuaRuntime, Settings, SpanCell, DEFAULT_BRIGHTNESS,
-};
+use crate::lua_api::{Cell, CtxInfo, DeviceDef, Host, IdleConfig, LuaRuntime, Settings, SpanCell};
 use crate::render::{gap_px, Color, RenderSpec, Renderer, SpanGeom, DEFAULT_GAP};
 
 mod plugin;
@@ -139,34 +137,28 @@ pub enum EngineEvent {
 }
 
 /// What is kept of a client that went away: page, last key press, device name.
-type Remembered = (String, Instant, Option<String>);
+type Remembered = (String, Instant, String);
 
-/// What a client's device (or, without devices, the global settings) allows.
+/// What a client's `sdc.device` allows.
 struct Policy {
     /// Start page, also where `home_after` leads.
     home: String,
-    /// Pages the client may show; `None`: all.
-    pages: Option<Vec<String>>,
+    /// Pages the client may show.
+    pages: Vec<String>,
     idle: IdleConfig,
-    brightness: Option<u8>,
-    /// Name of the `sdc.device`; `None` in the legacy case.
-    device: Option<String>,
+    brightness: u8,
+    /// Name of the `sdc.device`.
+    device: String,
 }
 
 impl Policy {
     fn allows(&self, page: &str) -> bool {
-        self.pages
-            .as_ref()
-            .is_none_or(|p| p.iter().any(|n| n == page))
-    }
-
-    fn active_brightness(&self) -> u8 {
-        self.brightness.unwrap_or(DEFAULT_BRIGHTNESS)
+        self.pages.iter().any(|n| n == page)
     }
 
     fn level(&self, power: Power) -> u8 {
         match power {
-            Power::Active => self.active_brightness(),
+            Power::Active => self.brightness,
             Power::Dim => self.idle.dim_brightness,
             Power::Off => 0,
         }
@@ -192,9 +184,8 @@ struct Client {
     device: DeviceInfo,
     /// `Hello.device_name`; kept to re-resolve the device on config reload.
     want_device: Option<String>,
-    /// Name of the `sdc.device` in effect (`None`: the config has none, legacy behaviour).
-    /// A viewer carries the mirrored deck's.
-    device_name: Option<String>,
+    /// Name of the `sdc.device` in effect. A viewer carries the mirrored deck's.
+    device_name: String,
     tx: UnboundedSender<Out>,
     page: String,
     /// Last key press (or connect): drives dim/off.
@@ -287,7 +278,7 @@ impl Engine {
         let old: Vec<_> = self
             .clients
             .iter()
-            .map(|(id, c)| (*id, self.policy_of(c)))
+            .filter_map(|(id, c)| Some((*id, self.policy_of(c)?)))
             .collect();
         let rt = LuaRuntime::load(&self.config_path, self.host.clone())?;
         tracing::info!(
@@ -311,7 +302,11 @@ impl Engine {
             let Some(c) = self.clients.get(id).filter(|c| !c.mirror) else {
                 continue;
             };
-            let policy = self.policy_for(c.want_device.as_deref(), client_kind(c.web, &c.device));
+            let Some(policy) =
+                self.policy_for(c.want_device.as_deref(), client_kind(c.web, &c.device))
+            else {
+                continue;
+            };
             let rt = self.runtime.as_ref().expect("just set");
             let c = self.clients.get_mut(id).expect("listed");
             if c.device_name != policy.device || !rt.has_page(&c.page) || !policy.allows(&c.page) {
@@ -346,7 +341,8 @@ impl Engine {
             .iter()
             .filter_map(|(id, was)| {
                 let c = self.clients.get(id)?;
-                (was.level(c.power) != self.policy_of(c).level(c.power)).then_some(*id)
+                (Some(was.level(c.power)) != self.policy_of(c).map(|p| p.level(c.power)))
+                    .then_some(*id)
             })
             .collect();
         for id in changed {
@@ -370,13 +366,18 @@ impl Engine {
                 want_device,
                 tx,
             } => {
-                let policy = self.policy_for(want_device.as_deref(), client_kind(web, &device));
+                let Some(policy) =
+                    self.policy_for(want_device.as_deref(), client_kind(web, &device))
+                else {
+                    tracing::warn!("client {client_id} connected before a config was loaded");
+                    return;
+                };
                 tracing::info!(
                     "client {client_id} connected ({}x{} @ {}px, device {})",
                     device.rows,
                     device.cols,
                     device.key_size_px,
-                    policy.device.as_deref().unwrap_or("-")
+                    policy.device
                 );
                 let sent = vec![None; device.key_count() as usize];
                 // Resume the page of the previous connection (still listed if its disconnect
@@ -417,9 +418,7 @@ impl Engine {
                         sent,
                     },
                 );
-                if policy.brightness.is_some() {
-                    self.send_brightness(id);
-                }
+                self.send_brightness(id);
                 self.render_client(id);
                 // Viewers left behind by a previous connection of this deck follow it again.
                 self.sync_viewers(&client_id);
@@ -559,10 +558,10 @@ impl Engine {
     /// not include it).
     pub fn goto_page(&mut self, id: ClientId, page: &str) {
         if let Some(c) = self.clients.get(&id) {
-            if !self.policy_of(c).allows(page) {
+            if !self.policy_of(c).is_some_and(|p| p.allows(page)) {
                 tracing::warn!(
                     "goto_page: page '{page}' is not on device '{}'",
-                    c.device_name.as_deref().unwrap_or("-")
+                    c.device_name
                 );
                 return;
             }
@@ -622,48 +621,29 @@ impl Engine {
         }
     }
 
-    fn default_page(&self) -> String {
-        self.runtime
-            .as_ref()
-            .and_then(|rt| rt.default_page())
-            .unwrap_or_default()
-    }
-
-    /// The policy of the device a client asking for `want` (of device type `kind`) gets now.
-    fn policy_for(&self, want: Option<&str>, kind: &str) -> Policy {
-        let global = self.settings();
-        let device = self
-            .runtime
-            .as_ref()
-            .and_then(|rt| rt.resolve_device(want, kind));
-        Self::policy(&self.default_page(), global, device)
+    /// The policy of the device a client asking for `want` (of device type `kind`) gets now;
+    /// `None` before any config is loaded.
+    fn policy_for(&self, want: Option<&str>, kind: &str) -> Option<Policy> {
+        let d = self.runtime.as_ref()?.resolve_device(want, kind);
+        Some(Self::policy(d))
     }
 
     /// The policy of a client's current device (viewers carry their deck's).
-    fn policy_of(&self, c: &Client) -> Policy {
-        let device = c
-            .device_name
-            .as_deref()
-            .and_then(|n| self.runtime.as_ref()?.device(n));
-        Self::policy(&self.default_page(), self.settings(), device)
+    fn policy_of(&self, c: &Client) -> Option<Policy> {
+        self.policy_named(&c.device_name)
     }
 
-    fn policy(default_page: &str, global: Settings, device: Option<DeviceDef>) -> Policy {
-        match device {
-            Some(d) => Policy {
-                home: d.home,
-                pages: Some(d.pages),
-                idle: d.idle.unwrap_or(global.idle),
-                brightness: d.brightness.or(global.brightness),
-                device: Some(d.name),
-            },
-            None => Policy {
-                home: default_page.to_string(),
-                pages: None,
-                idle: global.idle,
-                brightness: global.brightness,
-                device: None,
-            },
+    fn policy_named(&self, name: &str) -> Option<Policy> {
+        self.runtime.as_ref()?.device(name).map(Self::policy)
+    }
+
+    fn policy(d: DeviceDef) -> Policy {
+        Policy {
+            home: d.home,
+            pages: d.pages,
+            idle: d.idle,
+            brightness: d.brightness,
+            device: d.name,
         }
     }
 
@@ -721,28 +701,25 @@ impl Engine {
         let Some(c) = self.clients.get(&id).filter(|c| !c.mirror) else {
             return;
         };
-        let _ = c.tx.send(Out::Brightness(self.policy_of(c).level(c.power)));
+        if let Some(p) = self.policy_of(c) {
+            let _ = c.tx.send(Out::Brightness(p.level(c.power)));
+        }
     }
 
     /// Dims, then switches off, clients that have been idle for the configured time, and sends
     /// them (and forgets disconnected ones) home after `home_after`.
     pub fn tick(&mut self, now: Instant) {
         self.end_flashes(now);
-        let global = self.settings();
-        let default = self.default_page();
-        let mut policies: HashMap<Option<String>, Policy> = HashMap::new();
+        let mut policies: HashMap<String, Policy> = HashMap::new();
         for name in self
             .clients
             .values()
             .map(|c| c.device_name.clone())
             .chain(self.remembered.values().map(|(_, _, d)| d.clone()))
         {
-            let device = name
-                .as_deref()
-                .and_then(|n| self.runtime.as_ref()?.device(n));
-            policies
-                .entry(name)
-                .or_insert_with(|| Self::policy(&default, global, device));
+            if let Some(p) = self.policy_named(&name) {
+                policies.entry(name).or_insert(p);
+            }
         }
         self.remembered.retain(|_, (_, at, dev)| {
             !home_due(policies.get(dev).and_then(|p| p.idle.home_after), *at, now)
@@ -750,11 +727,11 @@ impl Engine {
         let home: Vec<_> = self
             .clients
             .iter()
-            .filter(|(_, c)| {
-                let p = &policies[&c.device_name];
-                !c.mirror && c.page != p.home && home_due(p.idle.home_after, c.last_press, now)
+            .filter_map(|(id, c)| {
+                let p = policies.get(&c.device_name)?;
+                (!c.mirror && c.page != p.home && home_due(p.idle.home_after, c.last_press, now))
+                    .then(|| (*id, p.home.clone()))
             })
-            .map(|(id, c)| (*id, policies[&c.device_name].home.clone()))
             .collect();
         for (id, page) in home {
             // Rendered even while the display is off, so waking shows home.
@@ -763,10 +740,10 @@ impl Engine {
         }
         let mut changed = Vec::new();
         for (id, c) in self.clients.iter_mut().filter(|(_, c)| !c.mirror) {
-            let want = power_after(
-                &policies[&c.device_name].idle,
-                now.saturating_duration_since(c.last_activity),
-            );
+            let Some(p) = policies.get(&c.device_name) else {
+                continue;
+            };
+            let want = power_after(&p.idle, now.saturating_duration_since(c.last_activity));
             if want != c.power {
                 tracing::info!(client = %c.client_id, from = ?c.power, to = ?want, "power");
                 c.power = want;
@@ -1220,7 +1197,7 @@ mod tests {
         let p = dir.join("config.lua");
         std::fs::File::create(&p)
             .unwrap()
-            .write_all(src.as_bytes())
+            .write_all(crate::lua_api::test_config(src).as_bytes())
             .unwrap();
         p
     }
@@ -1413,8 +1390,8 @@ mod tests {
     }
 
     const IDLE_CONFIG: &str = r##"
-        sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600 }
-        sdc.brightness(80)
+        sdc.device("d", { pages = { "home" }, brightness = 80,
+                          idle = { dim_after = 120, dim_brightness = 10, off_after = 600 } })
         sdc.page("home", {
           sdc.button{ render = { text = "A" },
             press = function() ha.call("light", "toggle", { entity_id = "light.a" }) end,
@@ -1498,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn without_idle_config_no_brightness_messages() {
+    fn without_idle_config_never_idles() {
         let (mut e, mut rx, mut ha, _d) = setup(CONFIG);
         let t0 = Instant::now();
         e.tick(t0 + secs(100_000));
@@ -1509,12 +1486,8 @@ mod tests {
 
     #[test]
     fn default_wake_brightness_and_reload_keep_idle_state() {
-        let cfg = r##"sdc.idle { dim_after = 10 } sdc.page("home", {})"##;
+        let cfg = r##"sdc.page("home", {}) sdc.device("d", { pages = { "home" }, idle = { dim_after = 10 } })"##;
         let (mut e, mut rx, _ha, d) = setup(cfg);
-        assert!(
-            drain_out(&mut rx).is_empty(),
-            "no sdc.brightness: nothing on connect"
-        );
         let t0 = Instant::now();
         e.tick(t0 + secs(11));
         assert_eq!(brightness(&drain_out(&mut rx)), [10]);
@@ -1527,7 +1500,7 @@ mod tests {
             [60],
             "default active brightness"
         );
-        // dropping sdc.idle while dimmed wakes the client on the next tick
+        // dropping the idle setting while dimmed wakes the client on the next tick
         e.tick(t0 + secs(30));
         assert_eq!(brightness(&drain_out(&mut rx)), [10]);
         write_config(d.path(), r##"sdc.page("home", {})"##);
@@ -1535,14 +1508,18 @@ mod tests {
         assert!(brightness(&drain_out(&mut rx)).is_empty());
         e.tick(t0 + secs(32));
         assert_eq!(brightness(&drain_out(&mut rx)), [60]);
-        // a changed sdc.brightness reaches an awake client right away
-        write_config(d.path(), r##"sdc.brightness(30) sdc.page("home", {})"##);
+        // a changed brightness reaches an awake client right away
+        write_config(
+            d.path(),
+            r##"sdc.page("home", {}) sdc.device("d", { pages = { "home" }, brightness = 30 })"##,
+        );
         e.handle_at(EngineEvent::Reload, t0 + secs(33));
         assert_eq!(brightness(&drain_out(&mut rx)), [30]);
     }
 
     const HOME_CONFIG: &str = r##"
-        sdc.idle { dim_after = 120, off_after = 600, home_after = 3600 }
+        sdc.device("d", { pages = { "home", "two" },
+                          idle = { dim_after = 120, off_after = 600, home_after = 3600 } })
         sdc.page("home", { sdc.button{ render = { text = "H" }, press = function(ctx) ctx.goto_page("two") end } })
         sdc.page("two", { sdc.button{ render = { text = "T" } } })
     "##;
@@ -1723,7 +1700,7 @@ mod tests {
         rx
     }
 
-    fn dev_of(e: &Engine, id: ClientId) -> (Option<String>, String) {
+    fn dev_of(e: &Engine, id: ClientId) -> (String, String) {
         (
             e.clients[&id].device_name.clone(),
             e.clients[&id].page.clone(),
@@ -1736,19 +1713,19 @@ mod tests {
         let t = Instant::now();
         // explicit name beats the type default
         connect_dev(&mut e, 1, "Mk2", false, Some("b"), t);
-        assert_eq!(dev_of(&e, 1), (Some("b".into()), "tv".into()));
+        assert_eq!(dev_of(&e, 1), ("b".into(), "tv".into()));
         // type default
         connect_dev(&mut e, 2, "Mk2Scissor", false, None, t);
-        assert_eq!(dev_of(&e, 2), (Some("a".into()), "home".into()));
+        assert_eq!(dev_of(&e, 2), ("a".into(), "home".into()));
         // an unknown name falls through to the type default
         connect_dev(&mut e, 3, "Mk2", false, Some("nope"), t);
-        assert_eq!(dev_of(&e, 3), (Some("a".into()), "home".into()));
+        assert_eq!(dev_of(&e, 3), ("a".into(), "home".into()));
         // "*" for a type without an entry
         connect_dev(&mut e, 4, "XlV2", false, None, t);
-        assert_eq!(dev_of(&e, 4), (Some("b".into()), "tv".into()));
+        assert_eq!(dev_of(&e, 4), ("b".into(), "tv".into()));
         // browser type
         connect_dev(&mut e, 5, "Web Deck", true, None, t);
-        assert_eq!(dev_of(&e, 5), (Some("b".into()), "tv".into()));
+        assert_eq!(dev_of(&e, 5), ("b".into(), "tv".into()));
 
         // no "*" and no matching type: the first device
         write_config(
@@ -1759,18 +1736,7 @@ mod tests {
         );
         e.handle_at(EngineEvent::Reload, t);
         connect_dev(&mut e, 6, "XlV2", false, None, t);
-        assert_eq!(dev_of(&e, 6), (Some("a".into()), "home".into()));
-
-        // no devices at all: legacy, all pages, sdc.default_page
-        write_config(
-            d.path(),
-            r##"sdc.page("x", {}) sdc.page("y", {}) sdc.default_page("y")"##,
-        );
-        e.handle_at(EngineEvent::Reload, t);
-        connect_dev(&mut e, 7, "Mk2", false, Some("a"), t);
-        assert_eq!(dev_of(&e, 7), (None, "y".into()));
-        e.goto_page(7, "x");
-        assert_eq!(e.clients[&7].page, "x");
+        assert_eq!(dev_of(&e, 6), ("a".into(), "home".into()));
     }
 
     #[test]
@@ -1801,7 +1767,7 @@ mod tests {
         assert_eq!(e.clients[&1].page, "lights");
         e.tick(t0 + secs(100));
         assert_eq!(e.clients[&1].page, "home");
-        // device b has no idle of its own and the global one is unset: never goes home
+        // device b sets no idle: never goes home
         connect_dev(&mut e, 2, "XlV2", false, None, t0);
         e.goto_page(2, "home");
         e.tick(t0 + secs(100_000));
@@ -1809,14 +1775,13 @@ mod tests {
     }
 
     #[test]
-    fn device_brightness_and_global_defaults() {
-        let src = format!("sdc.brightness(80)\n{DEVICES_CONFIG}");
-        let (mut e, _d) = device_engine(&src);
+    fn device_brightness_and_default() {
+        let (mut e, _d) = device_engine(DEVICES_CONFIG);
         let t = Instant::now();
         let mut b = connect_dev(&mut e, 1, "XlV2", false, None, t);
         assert_eq!(brightness(&drain_out(&mut b)), [30]);
         let mut a = connect_dev(&mut e, 2, "Mk2", false, None, t);
-        assert_eq!(brightness(&drain_out(&mut a)), [80], "global default");
+        assert_eq!(brightness(&drain_out(&mut a)), [60], "default brightness");
     }
 
     #[test]
@@ -1831,7 +1796,7 @@ mod tests {
             &DEVICES_CONFIG.replace(r#"mk2 = "a""#, r#"mk2 = "b""#),
         );
         e.handle_at(EngineEvent::Reload, t);
-        assert_eq!(dev_of(&e, 1), (Some("b".into()), "tv".into()));
+        assert_eq!(dev_of(&e, 1), ("b".into(), "tv".into()));
         // same device but the page was dropped from it: home
         write_config(
             d.path(),
@@ -1841,14 +1806,14 @@ mod tests {
                 .replace(r#"home = "tv""#, r#"home = "home""#),
         );
         e.handle_at(EngineEvent::Reload, t);
-        assert_eq!(dev_of(&e, 1), (Some("b".into()), "home".into()));
+        assert_eq!(dev_of(&e, 1), ("b".into(), "home".into()));
         // an invalid device config keeps the old one
         write_config(
             d.path(),
             r#"sdc.page("p", {}) sdc.device("x", { pages = { "q" } })"#,
         );
         e.handle_at(EngineEvent::Reload, t);
-        assert_eq!(dev_of(&e, 1), (Some("b".into()), "home".into()));
+        assert_eq!(dev_of(&e, 1), ("b".into(), "home".into()));
     }
 
     #[test]
@@ -1861,11 +1826,11 @@ mod tests {
         e.handle_at(EngineEvent::ClientDisconnected(1), t);
         // same device: resumes
         connect_dev(&mut e, 1, "Mk2", false, None, t + secs(1));
-        assert_eq!(dev_of(&e, 1), (Some("a".into()), "lights".into()));
+        assert_eq!(dev_of(&e, 1), ("a".into(), "lights".into()));
         e.handle_at(EngineEvent::ClientDisconnected(1), t + secs(2));
         // another device (asked for by name): home of that device
         connect_dev(&mut e, 1, "Mk2", false, Some("b"), t + secs(3));
-        assert_eq!(dev_of(&e, 1), (Some("b".into()), "tv".into()));
+        assert_eq!(dev_of(&e, 1), ("b".into(), "tv".into()));
         drop(d);
     }
 
@@ -1884,7 +1849,7 @@ mod tests {
             },
             t,
         );
-        assert_eq!(dev_of(&e, 9), (Some("a".into()), "home".into()));
+        assert_eq!(dev_of(&e, 9), ("a".into(), "home".into()));
         // the viewer's press acts on the deck, under the deck's device rules
         e.handle_at(EngineEvent::KeyDown { id: 9, key: 0 }, t);
         e.handle_at(EngineEvent::KeyDown { id: 9, key: 0 }, t); // lights -> tv refused
@@ -2156,7 +2121,9 @@ mod tests {
 
     #[test]
     fn wake_press_does_not_flash() {
-        let cfg = format!("sdc.idle {{ dim_after = 10 }} {FLASH_PAGE}");
+        let cfg = format!(
+            r#"{FLASH_PAGE} sdc.device("d", {{ pages = {{ "home", "two" }}, idle = {{ dim_after = 10 }} }})"#
+        );
         let (mut e, mut rx, _ha, _d) = setup(&cfg);
         let t0 = Instant::now();
         e.tick(t0 + secs(11));
