@@ -28,6 +28,11 @@ struct Args {
     #[arg(long, env = "SDC_CLIENT_ID")]
     client_id: Option<String>,
 
+    /// Name of the server's `sdc.device` this deck should use (default: the server's
+    /// `sdc.default_device` for this kind of deck)
+    #[arg(long, env = "SDC_DEVICE")]
+    device: Option<String>,
+
     /// Initial brightness 0-100
     #[arg(long, env = "SDC_BRIGHTNESS", default_value_t = 60,
           value_parser = clap::value_parser!(u8).range(0..=100))]
@@ -156,6 +161,7 @@ async fn main() -> Result<()> {
         server: args.server,
         token: args.token.filter(|t| !t.is_empty()),
         client_id: args.client_id.unwrap_or_else(hostname),
+        device: args.device.filter(|d| !d.is_empty()),
         brightness: args.brightness,
         offline_after: Duration::from_secs(args.offline_after),
         client_sha256: update::exe_sha256()

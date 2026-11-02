@@ -63,6 +63,28 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Device types a config can key `sdc.default_device` by (besides `"*"`): [`device_type`] of a
+/// physical deck, or `"browser"` for browser decks.
+pub const DEVICE_TYPES: &[&str] = &[
+    "original", "mk2", "mini", "xl", "plus", "plus-xl", "neo", "pedal", "browser",
+];
+
+/// Short stable type of a physical deck from [`DeviceInfo::model`] (the `elgato-streamdeck`
+/// `Kind` name the client sends, e.g. `Mk2Scissor` -> `mk2`). `"unknown"` for anything else.
+pub fn device_type(model: &str) -> &'static str {
+    match model {
+        "Original" | "OriginalV2" => "original",
+        "Mk2" | "Mk2Scissor" | "Mk2Module" | "Mk2ModuleScissor" => "mk2",
+        "Mini" | "MiniDiscord" | "MiniMk2" | "MiniMk2Module" => "mini",
+        "Xl" | "XlV2" | "XlV2Module" => "xl",
+        "Plus" => "plus",
+        "PlusXl" => "plus-xl",
+        "Neo" => "neo",
+        "Pedal" => "pedal",
+        _ => "unknown",
+    }
+}
+
 /// Physical layout of the deck attached to a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -99,6 +121,10 @@ pub enum ClientMessage {
         /// of being a deck of its own. Ignored on `/ws`; absent from older clients.
         #[serde(default)]
         mirror: Option<String>,
+        /// Name of the Lua device (`sdc.device`) this client wants; unknown or absent: the
+        /// server picks one from `sdc.default_device`. (Not `device`: that is the hardware.)
+        #[serde(default)]
+        device_name: Option<String>,
     },
     KeyDown {
         key: u8,
@@ -266,10 +292,28 @@ mod tests {
                 client_target,
                 client_sha256,
                 mirror,
+                device_name,
                 ..
-            } => assert!(client_target.is_none() && client_sha256.is_none() && mirror.is_none()),
+            } => assert!(
+                client_target.is_none()
+                    && client_sha256.is_none()
+                    && mirror.is_none()
+                    && device_name.is_none()
+            ),
             _ => panic!("not hello"),
         }
+    }
+
+    #[test]
+    fn device_types_from_kind_names() {
+        assert_eq!(device_type("OriginalV2"), "original");
+        assert_eq!(device_type("Mk2Scissor"), "mk2");
+        assert_eq!(device_type("XlV2"), "xl");
+        assert_eq!(device_type("Plus"), "plus");
+        assert_eq!(device_type("Fake Stream Deck"), "unknown");
+        assert!(["Original", "MiniMk2", "Neo", "Pedal", "PlusXl"]
+            .iter()
+            .all(|m| DEVICE_TYPES.contains(&device_type(m))));
     }
 
     #[test]

@@ -69,10 +69,11 @@ pub async fn run(
         id: 1,
         client_id: "preview".into(),
         device,
+        want_device: None,
         tx,
     });
     if let Some(p) = &page {
-        engine.goto_page(1, p);
+        engine.show_page(1, p);
     }
 
     let waited = tokio::time::timeout(FETCH_WAIT, async {

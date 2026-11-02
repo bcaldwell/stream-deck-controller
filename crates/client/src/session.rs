@@ -247,6 +247,8 @@ pub struct Config {
     pub token: Option<String>,
     pub client_id: String,
     pub brightness: u8,
+    /// Requested server-side device layout (`sdc.device` name), sent in Hello.
+    pub device: Option<String>,
     /// How long the server may be unreachable before the deck shows its offline screen.
     pub offline_after: Duration,
     /// Hash of the running executable, reported in Hello (None: could not read it).
@@ -423,6 +425,7 @@ async fn session(
         client_target: sdc_protocol::client_target().map(str::to_string),
         client_sha256: cfg.client_sha256.clone(),
         mirror: None,
+        device_name: cfg.device.clone(),
     };
     tx.send(Message::text(serde_json::to_string(&hello)?))
         .await?;
@@ -651,6 +654,7 @@ mod tests {
             client_target: Some("aarch64-linux".into()),
             client_sha256: None,
             mirror: None,
+            device_name: None,
         };
         let s = serde_json::to_string(&hello).unwrap();
         assert!(s.contains(r#""type":"hello""#) && s.contains(r#""key_size_px":72"#));

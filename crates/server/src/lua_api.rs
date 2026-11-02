@@ -6,11 +6,11 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use mlua::{serde::SerializeOptions, Function, Lua, LuaSerdeExt, Table, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
-use sdc_protocol::{ExportItem, SlotKind};
+use sdc_protocol::{ExportItem, SlotKind, DEVICE_TYPES};
 
 use crate::ha::{EntityState, HaCommand};
 use crate::render::{Color, RenderSpec};
@@ -179,10 +179,26 @@ impl Default for Settings {
     }
 }
 
+/// `sdc.device{...}`: which pages a deck shows, where it starts, and its own idle/brightness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceDef {
+    pub name: String,
+    /// Pages this device may show (all exist; validated after the config ran).
+    pub pages: Vec<String>,
+    /// Start/default page; one of `pages`.
+    pub home: String,
+    pub brightness: Option<u8>,
+    /// Replaces the global `sdc.idle` for this device when set.
+    pub idle: Option<IdleConfig>,
+}
+
 #[derive(Default)]
 struct Registry {
     pages: Vec<(String, Vec<Option<ButtonDef>>)>,
     default: Option<String>,
+    devices: Vec<DeviceDef>,
+    /// `sdc.default_device`: device type (or `*`) -> device name.
+    default_devices: Vec<(String, String)>,
     settings: Settings,
     exports: Vec<(String, Export, Option<String>)>,
 }
@@ -227,6 +243,7 @@ impl LuaRuntime {
             .set_name(format!("@{}", path.display()))
             .exec()
             .map_err(lerr)?;
+        rt.validate_devices()?;
         Ok(rt)
     }
 
@@ -234,6 +251,7 @@ impl LuaRuntime {
     pub fn load_str(src: &str, host: Rc<Host>) -> Result<Self> {
         let rt = Self::new(host, None)?;
         rt.lua.load(src).set_name("=config").exec().map_err(lerr)?;
+        rt.validate_devices()?;
         Ok(rt)
     }
 
@@ -257,6 +275,76 @@ impl LuaRuntime {
 
     pub fn settings(&self) -> Settings {
         self.registry.borrow().settings
+    }
+
+    /// Cross-checks `sdc.device` / `sdc.default_device` against the pages once the whole config
+    /// has run (pages may be defined after the devices that use them).
+    fn validate_devices(&self) -> Result<()> {
+        let r = self.registry.borrow();
+        for d in &r.devices {
+            for p in &d.pages {
+                if !r.pages.iter().any(|(n, _)| n == p) {
+                    bail!("sdc.device('{}'): unknown page '{p}' in pages", d.name);
+                }
+            }
+            if !d.pages.contains(&d.home) {
+                bail!(
+                    "sdc.device('{}'): home '{}' is not in its pages",
+                    d.name,
+                    d.home
+                );
+            }
+        }
+        for (kind, name) in &r.default_devices {
+            if !r.devices.iter().any(|d| d.name == *name) {
+                bail!("sdc.default_device: '{kind}' names unknown device '{name}'");
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the config defines any `sdc.device` (otherwise everything works as before devices).
+    pub fn has_devices(&self) -> bool {
+        !self.registry.borrow().devices.is_empty()
+    }
+
+    /// The device a connecting client gets: the requested name if it exists, else
+    /// `sdc.default_device` for its `kind` then `*`, else the first `sdc.device`. `None` when
+    /// the config has no devices (legacy behaviour).
+    pub fn resolve_device(&self, requested: Option<&str>, kind: &str) -> Option<DeviceDef> {
+        let r = self.registry.borrow();
+        let find = |name: &str| r.devices.iter().find(|d| d.name == name);
+        if let Some(name) = requested {
+            match find(name) {
+                Some(d) => return Some(d.clone()),
+                None => tracing::warn!("requested device '{name}' is not defined, using default"),
+            }
+        }
+        [kind, "*"]
+            .iter()
+            .find_map(|k| {
+                r.default_devices
+                    .iter()
+                    .find(|(t, _)| t == k)
+                    .and_then(|(_, n)| find(n))
+            })
+            .or_else(|| r.devices.first())
+            .cloned()
+    }
+
+    /// A defined device by name.
+    pub fn device(&self, name: &str) -> Option<DeviceDef> {
+        self.registry
+            .borrow()
+            .devices
+            .iter()
+            .find(|d| d.name == name)
+            .cloned()
+    }
+
+    /// All defined devices, in definition order.
+    pub fn devices(&self) -> Vec<DeviceDef> {
+        self.registry.borrow().devices.clone()
     }
 
     pub fn has_page(&self, name: &str) -> bool {
@@ -686,34 +774,112 @@ fn install(
     sdc.set(
         "idle",
         lua.create_function(move |_, t: Table| {
-            let mut idle = IdleConfig {
-                dim_brightness: DEFAULT_DIM_BRIGHTNESS,
-                ..Default::default()
-            };
+            reg.borrow_mut().settings.idle = idle_arg("sdc.idle", &t)?;
+            Ok(())
+        })?,
+    )?;
+
+    let reg = registry.clone();
+    sdc.set(
+        "device",
+        lua.create_function(move |_, (name, t): (String, Table)| {
+            let what = format!("sdc.device('{name}')");
+            if name.is_empty() {
+                return Err(mlua::Error::runtime("sdc.device: name must not be empty"));
+            }
+            if reg.borrow().devices.iter().any(|d| d.name == name) {
+                return Err(mlua::Error::runtime(format!(
+                    "sdc.device: duplicate device '{name}'"
+                )));
+            }
+            let mut pages: Vec<String> = Vec::new();
+            let mut home = None;
+            let mut brightness = None;
+            let mut idle = None;
             for pair in t.pairs::<String, Value>() {
                 let (k, v) = pair?;
-                match k.as_str() {
-                    "dim_after" => idle.dim_after = Some(seconds_arg(&k, &v)?),
-                    "off_after" => idle.off_after = Some(seconds_arg(&k, &v)?),
-                    "home_after" => idle.home_after = Some(seconds_arg(&k, &v)?),
-                    "dim_brightness" => match v {
-                        Value::Integer(i) => {
-                            idle.dim_brightness = percent_arg("sdc.idle: 'dim_brightness'", i)?
+                match (k.as_str(), v) {
+                    ("pages", Value::Table(list)) => {
+                        for p in list.sequence_values::<String>() {
+                            let p = p.map_err(|_| {
+                                mlua::Error::runtime(format!("{what}: pages must be page names"))
+                            })?;
+                            if !pages.contains(&p) {
+                                pages.push(p);
+                            }
                         }
-                        _ => {
-                            return Err(mlua::Error::runtime(
-                                "sdc.idle: 'dim_brightness' must be an integer 0-100",
-                            ))
-                        }
-                    },
+                    }
+                    ("home", Value::String(h)) => home = Some(h.to_str()?.to_string()),
+                    ("brightness", Value::Integer(i)) => {
+                        brightness = Some(percent_arg(&format!("{what}: 'brightness'"), i)?)
+                    }
+                    ("idle", Value::Table(i)) => idle = Some(idle_arg(&what, &i)?),
+                    ("pages", _) => {
+                        return Err(mlua::Error::runtime(format!(
+                            "{what}: 'pages' must be a list of page names"
+                        )))
+                    }
+                    ("home", _) => {
+                        return Err(mlua::Error::runtime(format!(
+                            "{what}: 'home' must be a page name"
+                        )))
+                    }
+                    ("brightness", _) => {
+                        return Err(mlua::Error::runtime(format!(
+                            "{what}: 'brightness' must be an integer 0-100"
+                        )))
+                    }
+                    ("idle", _) => {
+                        return Err(mlua::Error::runtime(format!(
+                            "{what}: 'idle' must be a table like sdc.idle's"
+                        )))
+                    }
                     _ => {
                         return Err(mlua::Error::runtime(format!(
-                        "sdc.idle: unknown field '{k}' (use dim_after, dim_brightness, off_after, home_after)"
-                    )))
+                            "{what}: unknown field '{k}' (use pages, home, brightness, idle)"
+                        )))
                     }
                 }
             }
-            reg.borrow_mut().settings.idle = idle;
+            if pages.is_empty() {
+                return Err(mlua::Error::runtime(format!(
+                    "{what}: 'pages' must list at least one page"
+                )));
+            }
+            let home = home.unwrap_or_else(|| pages[0].clone());
+            reg.borrow_mut().devices.push(DeviceDef {
+                name,
+                pages,
+                home,
+                brightness,
+                idle,
+            });
+            Ok(())
+        })?,
+    )?;
+
+    let reg = registry.clone();
+    sdc.set(
+        "default_device",
+        lua.create_function(move |_, t: Table| {
+            let mut map = Vec::new();
+            for pair in t.pairs::<Value, Value>() {
+                let (k, v) = pair?;
+                let (Value::String(k), Value::String(v)) = (&k, &v) else {
+                    return Err(mlua::Error::runtime(
+                        "sdc.default_device: expected { <device type or \"*\"> = \"<device name>\" }",
+                    ));
+                };
+                let (k, v) = (k.to_str()?.to_string(), v.to_str()?.to_string());
+                if k != "*" && !DEVICE_TYPES.contains(&k.as_str()) {
+                    return Err(mlua::Error::runtime(format!(
+                        "sdc.default_device: unknown device type '{k}' (use {} or \"*\")",
+                        DEVICE_TYPES.join(", ")
+                    )));
+                }
+                map.push((k, v));
+            }
+            reg.borrow_mut().default_devices = map;
             Ok(())
         })?,
     )?;
@@ -850,7 +1016,39 @@ fn percent_arg(what: &str, v: i64) -> mlua::Result<u8> {
         .ok_or_else(|| mlua::Error::runtime(format!("{what}: {v} is not a percentage (0-100)")))
 }
 
-fn seconds_arg(field: &str, v: &Value) -> mlua::Result<Duration> {
+/// Parses the table of `sdc.idle` (and a device's `idle`).
+fn idle_arg(what: &str, t: &Table) -> mlua::Result<IdleConfig> {
+    let mut idle = IdleConfig {
+        dim_brightness: DEFAULT_DIM_BRIGHTNESS,
+        ..Default::default()
+    };
+    for pair in t.pairs::<String, Value>() {
+        let (k, v) = pair?;
+        match k.as_str() {
+            "dim_after" => idle.dim_after = Some(seconds_arg(what, &k, &v)?),
+            "off_after" => idle.off_after = Some(seconds_arg(what, &k, &v)?),
+            "home_after" => idle.home_after = Some(seconds_arg(what, &k, &v)?),
+            "dim_brightness" => match v {
+                Value::Integer(i) => {
+                    idle.dim_brightness = percent_arg(&format!("{what}: 'dim_brightness'"), i)?
+                }
+                _ => {
+                    return Err(mlua::Error::runtime(format!(
+                        "{what}: 'dim_brightness' must be an integer 0-100"
+                    )))
+                }
+            },
+            _ => {
+                return Err(mlua::Error::runtime(format!(
+                    "{what}: unknown field '{k}' (use dim_after, dim_brightness, off_after, home_after)"
+                )))
+            }
+        }
+    }
+    Ok(idle)
+}
+
+fn seconds_arg(what: &str, field: &str, v: &Value) -> mlua::Result<Duration> {
     let secs = match v {
         Value::Integer(i) => *i as f64,
         Value::Number(n) => *n,
@@ -860,7 +1058,7 @@ fn seconds_arg(field: &str, v: &Value) -> mlua::Result<Duration> {
         Ok(Duration::from_secs_f64(secs))
     } else {
         Err(mlua::Error::runtime(format!(
-            "sdc.idle: '{field}' must be a number of seconds > 0"
+            "{what}: '{field}' must be a number of seconds > 0"
         )))
     }
 }
@@ -1116,6 +1314,98 @@ mod tests {
         ] {
             assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn devices_parse_and_resolve() {
+        let rt = LuaRuntime::load_str(
+            r#"
+            sdc.device("a", { pages = { "p", "q", "p" }, home = "q", brightness = 40,
+                              idle = { dim_after = 5 } })
+            sdc.device("b", { pages = { "q" } })
+            sdc.default_device { mk2 = "b", ["*"] = "a" }
+            sdc.page("p", {}) sdc.page("q", {})
+            "#,
+            Host::new(None),
+        )
+        .unwrap();
+        let a = rt.device("a").unwrap();
+        assert_eq!(a.pages, ["p", "q"]);
+        assert_eq!((a.home.as_str(), a.brightness), ("q", Some(40)));
+        assert_eq!(a.idle.unwrap().dim_after, Some(Duration::from_secs(5)));
+        let b = rt.device("b").unwrap();
+        assert_eq!(
+            (b.home.as_str(), b.idle),
+            ("q", None),
+            "home defaults to the first page"
+        );
+        let name = |req, kind| rt.resolve_device(req, kind).map(|d| d.name);
+        assert_eq!(name(Some("a"), "mk2").as_deref(), Some("a"));
+        assert_eq!(name(None, "mk2").as_deref(), Some("b"));
+        assert_eq!(name(None, "xl").as_deref(), Some("a"));
+        assert_eq!(name(Some("zzz"), "mk2").as_deref(), Some("b"));
+        let rt = LuaRuntime::load_str("sdc.page('p', {})", Host::new(None)).unwrap();
+        assert!(!rt.has_devices() && rt.resolve_device(Some("a"), "mk2").is_none());
+    }
+
+    #[test]
+    fn device_config_errors() {
+        let err = |src: &str| {
+            LuaRuntime::load_str(src, Host::new(None))
+                .err()
+                .unwrap_or_else(|| panic!("accepted: {src}"))
+                .to_string()
+        };
+        let pages = r#"sdc.page("p", {}) sdc.page("q", {}) "#;
+        let cases = [
+            (
+                r#"sdc.device("a", { pages = { "nope" } })"#,
+                "unknown page 'nope'",
+            ),
+            (
+                r#"sdc.device("a", { pages = { "p" }, home = "q" })"#,
+                "home 'q' is not in its pages",
+            ),
+            (
+                r#"sdc.device("a", { pages = { "p" } }) sdc.device("a", { pages = { "q" } })"#,
+                "duplicate device 'a'",
+            ),
+            (r#"sdc.device("a", { pages = {} })"#, "at least one page"),
+            (
+                r#"sdc.device("a", { pages = { "p" }, brightnes = 5 })"#,
+                "unknown field 'brightnes'",
+            ),
+            (
+                r#"sdc.device("a", { pages = { "p" }, brightness = 101 })"#,
+                "not a percentage",
+            ),
+            (
+                r#"sdc.device("a", { pages = { "p" }, idle = { dim_after = 0 } })"#,
+                "sdc.device('a')",
+            ),
+            (
+                r#"sdc.device("a", { pages = { "p" } }) sdc.default_device { mk2 = "zz" }"#,
+                "unknown device 'zz'",
+            ),
+            (
+                r#"sdc.device("a", { pages = { "p" } }) sdc.default_device { mk3 = "a" }"#,
+                "unknown device type 'mk3'",
+            ),
+            (
+                r#"sdc.default_device { ["*"] = "a" }"#,
+                "unknown device 'a'",
+            ),
+        ];
+        for (src, want) in cases {
+            let e = err(&format!("{pages}{src}"));
+            assert!(e.contains(want), "{src}: {e}");
+        }
+        // pages may be defined after the device that uses them
+        LuaRuntime::load_str(
+            r#"sdc.device("a", { pages = { "late" } }) sdc.page("late", {})"#,
+            Host::new(None),
+        )
+        .unwrap();
     }
 
     #[test]

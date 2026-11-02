@@ -61,6 +61,9 @@ installable on a phone). It speaks the normal client protocol over `/deck/ws`.
   wake). The real deck's brightness/idle messages are not sent to the viewer. If the deck is not
   connected the server answers `Error` and the UI shows its own deck instead. The choice is kept in
   localStorage.
+- **Layout** (own-deck mode only): when the config has `sdc.device`s, the menu also lists "Default" plus
+  every device name (`GET /deck/api/devices`: `[{name, pages, home}]`, same SSO auth, `[]` without
+  devices). The choice is kept in localStorage and sent as `Hello.device_name`; changing it reconnects.
 - Phones: a portrait viewport rotates the deck 90 degrees; the bezel has a fullscreen button
   (locks landscape where supported). The LED shows the connection (green, or pulsing amber while
   reconnecting with backoff).
@@ -91,7 +94,7 @@ sdc.page("home", {                -- list index = key index, row-major, key 1 (L
   false,                          -- empty key (nil/false)
   sdc.button { render = { text = "Media" }, press = function(ctx) ctx.goto_page("media") end },
 })
-sdc.default_page("home")          -- optional; default is the first page defined
+sdc.default_page("home")          -- optional; default is the first page defined (see Devices for per-deck page sets)
 sdc.brightness(60)                -- optional; active brightness 0-100 (sent on connect and on wake)
 sdc.key_gap(18)                   -- optional; gap between keys for spans (px at 72 px keys, default 0)
 sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }   -- optional, seconds
@@ -122,6 +125,37 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3
   reload) are rasterized and JPEG-encoded in parallel. Pictures are premultiplied and shrunk (shorter side
   <= 256 px) when decoded, and scaled once per key size and cached until the next config reload.
   `RUST_LOG=sdc_server=debug` logs how long each render took.
+
+## Devices
+
+Pages are global; a *device* picks which of them a deck shows, where it starts and how it idles.
+
+```lua
+sdc.device("living-room", {
+  pages = { "home", "lights", "music", "speakers", "tv", "tv_apps" }, -- page names (must exist); order irrelevant
+  home = "home",                 -- start/default page, must be in pages (default: the first of pages)
+  brightness = 60,               -- optional, like sdc.brightness
+  idle = { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }, -- optional, like sdc.idle
+})
+sdc.default_device { mk2 = "living-room", plus = "office-plus", browser = "living-room", ["*"] = "living-room" }
+```
+
+- Device types for `sdc.default_device`: `original` (Original, OriginalV2), `mk2` (Mk2 and its scissor/module
+  variants), `mini`, `xl`, `plus`, `plus-xl`, `neo`, `pedal`, derived from the model name the client sends, and
+  `browser` for `/deck` clients. `"*"` is the fallback.
+- A connecting client gets, in order: the device it asked for (`sdc-client --device <name>` /
+  `SDC_DEVICE`, `Hello.device_name`; an unknown name is logged as a warning and skipped), the
+  `sdc.default_device` entry for its type, the `"*"` entry, the first `sdc.device` defined. If the config
+  defines no devices at all nothing changes: every page, `sdc.default_page`, the global settings.
+- A device's `idle` and `brightness` replace the global `sdc.idle` / `sdc.brightness` when set (the idle table
+  as a whole, not field by field); otherwise the global ones apply. `sdc.default_page` is only used without devices.
+- `ctx.goto_page` to a page outside the client's device is logged and ignored. The device's `home` is the start page, the
+  target of `home_after` and the fallback when a remembered page is not on the device (also after a config
+  reload). A reconnecting client that lands on a different device than before starts at that device's home.
+- Config reload re-resolves every connected client's device. Mirror viewers use the mirrored deck's device. The
+  Elgato plugin (`sdc.export`) is not affected.
+- Config errors fail the load (the previous config stays active): unknown page in `pages`, `home` not in
+  `pages`, duplicate device names, `sdc.default_device` naming an unknown device or type.
 
 ## Exports and dials (Elgato plugin)
 

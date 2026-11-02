@@ -113,4 +113,12 @@ sdc.page("media", {
   false,
 })
 
-sdc.default_page("home")
+-- Pages are global; a device picks which ones a deck shows. Clients get the device named by
+-- --device / SDC_DEVICE, else the sdc.default_device entry for their type, else "*".
+sdc.device("office", {
+  pages = { "home", "media" },
+  home = "home",
+})
+sdc.default_device { ["*"] = "office" }
+
+sdc.default_page("home") -- used only when no sdc.device is defined

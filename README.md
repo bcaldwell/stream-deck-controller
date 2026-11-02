@@ -48,7 +48,7 @@ task plugin:build      # Elgato plugin (needs node, in the devShell); plugin:pac
 ```
 
 Client flags/env: `--server/SDC_SERVER`, `--client-id/SDC_CLIENT_ID` (default hostname),
-`--token/SDC_CLIENT_TOKEN`, `--brightness/SDC_BRIGHTNESS` (60), `--offline-after/SDC_OFFLINE_AFTER` (1800, seconds without a connection before the deck switches to its dimmed offline screen; until then it keeps the last images and a key press shows a red-barred "offline" flash on that key), `--usb-suspend/SDC_USB_SUSPEND` (on for Linux: while the server has the screen off, close the deck so it can USB-suspend; a key press wakes it, see deploy/pi/README.md), `--no-update/SDC_NO_UPDATE`, `--list`, `--fake-device`, `--fake-out`, `--test-pattern <secs>`.
+`--token/SDC_CLIENT_TOKEN`, `--device/SDC_DEVICE` (name of the server's `sdc.device` to use; default: the server's `sdc.default_device` for this deck type), `--brightness/SDC_BRIGHTNESS` (60), `--offline-after/SDC_OFFLINE_AFTER` (1800, seconds without a connection before the deck switches to its dimmed offline screen; until then it keeps the last images and a key press shows a red-barred "offline" flash on that key), `--usb-suspend/SDC_USB_SUSPEND` (on for Linux: while the server has the screen off, close the deck so it can USB-suspend; a key press wakes it, see deploy/pi/README.md), `--no-update/SDC_NO_UPDATE`, `--list`, `--fake-device`, `--fake-out`, `--test-pattern <secs>`.
 
 Note: `vendor/elgato-streamdeck` is a copy of the upstream crate with its hidapi backend switched to the
 pure-Rust Linux backend so the client builds as a static musl binary (see `vendor/elgato-streamdeck/PATCHED.md`).

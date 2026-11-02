@@ -16,6 +16,7 @@
 //! - `GET /deck/icon.svg`                 its icon
 //! - `GET /deck/ws`                       websocket for browser decks (same protocol as `/ws`)
 //! - `GET /deck/api/clients`              connected decks, for the device picker
+//! - `GET /deck/api/devices`              configured `sdc.device`s (`[{name, pages, home}]`)
 
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::clients::ClientBinaries;
-use crate::engine::{DeckInfo, EngineEvent};
+use crate::engine::{DeckInfo, DeviceListing, EngineEvent};
 use crate::ws::{self, WsState};
 
 /// How `/deck` routes are authenticated.
@@ -72,6 +73,7 @@ pub fn router(
         .route("/deck/icon.svg", get(deck_icon))
         .route("/deck/ws", get(ws::deck_upgrade))
         .route("/deck/api/clients", get(deck_clients))
+        .route("/deck/api/devices", get(deck_devices))
         .route_layer(middleware::from_fn_with_state(deck_auth, deck_guard));
     Router::new()
         .route("/ws", get(ws::upgrade))
@@ -180,6 +182,19 @@ async fn deck_clients(State(state): State<WsState>) -> Response {
     let mut decks: Vec<DeckInfo> = rx.await.unwrap_or_default();
     decks.sort_by(|a, b| (a.web, &a.client_id).cmp(&(b.web, &b.client_id)));
     match serde_json::to_string(&decks) {
+        Ok(body) => ([(header::CONTENT_TYPE, "application/json"), NO_STORE], body).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// The config's `sdc.device`s (empty without any), for the browser deck's layout choice.
+async fn deck_devices(State(state): State<WsState>) -> Response {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if state.engine.send(EngineEvent::ListDevices(tx)).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let devices: Vec<DeviceListing> = rx.await.unwrap_or_default();
+    match serde_json::to_string(&devices) {
         Ok(body) => ([(header::CONTENT_TYPE, "application/json"), NO_STORE], body).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

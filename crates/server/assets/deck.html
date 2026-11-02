@@ -88,12 +88,6 @@
 
   /* bezel strip */
   #bezel { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; padding: 0 34px; }
-  #badge {
-    position: absolute; left: 50%; transform: translateX(-50%);
-    font-weight: 600; letter-spacing: .42em; font-size: 10px; text-transform: uppercase;
-    color: rgba(255, 255, 255, .20); text-shadow: 0 -1px 0 rgba(0, 0, 0, .8), 0 1px 0 rgba(255, 255, 255, .05);
-    pointer-events: none;
-  }
   #bezel .sp { flex: 1; }
   .ctl {
     appearance: none; border: 0; background: none; padding: 8px; margin: 0; cursor: pointer; color: rgba(255, 255, 255, .28);
@@ -140,7 +134,6 @@
 <div id="deck">
   <div id="screen"><div id="keys"></div></div>
   <div id="bezel">
-    <span id="badge">Stream Deck</span>
     <span id="who"></span>
     <span class="sp"></span>
     <button class="ctl" id="fs" title="Fullscreen" aria-label="Fullscreen" hidden>
@@ -172,6 +165,7 @@
     store.set("sdc.deck.id", myId);
   }
   let selected = store.get("sdc.deck.sel") || "";   // "" = this browser's own deck, else a client_id
+  let layout = store.get("sdc.deck.layout") || "";   // "" = the server's default device, else an sdc.device name
   let forceOwn = false;                              // mirrored deck unavailable: own deck for now
 
   // ---- layout ----
@@ -280,6 +274,7 @@
         device: { model: "Web Deck", serial: null, rows: OWN_ROWS, cols: OWN_COLS, key_size_px: keyPx() },
       };
       if (mirror) hello.mirror = mirror;
+      else if (layout) hello.device_name = layout;
       sock.send(JSON.stringify(hello));
     };
     sock.onmessage = (ev) => {
@@ -335,9 +330,15 @@
       return r.ok ? await r.json() : [];
     } catch (_) { return []; }
   }
+  async function fetchDevices() {
+    try {
+      const r = await fetch(base + "api/devices", { credentials: "same-origin", cache: "no-store" });
+      return r.ok ? await r.json() : [];
+    } catch (_) { return []; }
+  }
   async function openMenu() {
     menu.classList.add("open");
-    const decks = (await fetchDecks()).filter((d) => d.client_id !== myId);
+    const [decks, devices] = await Promise.all([fetchDecks().then((l) => l.filter((d) => d.client_id !== myId)), fetchDevices()]);
     const item = (label, sub, id) => {
       const b = document.createElement("button");
       const t = document.createElement("span"); t.className = "tick";
@@ -356,6 +357,21 @@
     }
     if (!decks.length) {
       const e = document.createElement("h4"); e.textContent = "No other decks connected"; menu.append(e);
+    }
+    if (!mirrorTarget() && devices.length) {   // layouts only apply to this browser's own deck
+      const lh = document.createElement("h4"); lh.textContent = "Layout"; menu.append(lh);
+      const choice = (label, sub, name) => {
+        const b = document.createElement("button");
+        const t = document.createElement("span"); t.className = "tick";
+        t.textContent = layout === name ? "✓" : "";
+        const l = document.createElement("span"); l.textContent = label;
+        b.append(t, l);
+        if (sub) { const s = document.createElement("small"); s.textContent = sub; b.append(s); }
+        b.onclick = () => { layout = name; store.set("sdc.deck.layout", name || null); closeMenu(); reconnect(); };
+        return b;
+      };
+      menu.append(choice("Default", "", ""));
+      for (const d of devices) menu.append(choice(d.name, d.pages.length + " pages", d.name));
     }
   }
   function closeMenu() { menu.classList.remove("open"); }

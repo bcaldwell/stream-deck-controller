@@ -9,13 +9,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use image::RgbaImage;
-use sdc_protocol::{DeviceInfo, PluginClientMessage};
+use sdc_protocol::{device_type, DeviceInfo, PluginClientMessage};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::assets::{Assets, Fetcher, HaApi, S3Config};
 use crate::ha::{HaCommand, HaEvent};
-use crate::lua_api::{Cell, CtxInfo, Host, IdleConfig, LuaRuntime, Settings, SpanCell};
+use crate::lua_api::{
+    Cell, CtxInfo, DeviceDef, Host, IdleConfig, LuaRuntime, Settings, SpanCell, DEFAULT_BRIGHTNESS,
+};
 use crate::render::{gap_px, Color, RenderSpec, Renderer, SpanGeom, DEFAULT_GAP};
 
 mod plugin;
@@ -55,6 +57,14 @@ pub struct DeckInfo {
     pub web: bool,
 }
 
+/// A configured device, for the browser deck's layout choice (`GET /deck/api/devices`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DeviceListing {
+    pub name: String,
+    pub pages: Vec<String>,
+    pub home: String,
+}
+
 /// How often the engine checks clients for idleness.
 const TICK: Duration = Duration::from_secs(1);
 
@@ -73,6 +83,8 @@ pub enum EngineEvent {
         id: ClientId,
         client_id: String,
         device: DeviceInfo,
+        /// The `sdc.device` the client asked for (`Hello.device_name`).
+        want_device: Option<String>,
         tx: UnboundedSender<Out>,
     },
     /// A browser that mirrors the deck of client `mirror`: it gets that deck's page rendered at
@@ -99,6 +111,8 @@ pub enum EngineEvent {
     },
     /// The connected decks (not viewers), for the device picker.
     ListClients(tokio::sync::oneshot::Sender<Vec<DeckInfo>>),
+    /// The config's `sdc.device`s, for the browser deck's layout choice.
+    ListDevices(tokio::sync::oneshot::Sender<Vec<DeviceListing>>),
     KeyDown {
         id: ClientId,
         key: u8,
@@ -122,6 +136,50 @@ pub enum EngineEvent {
     Tick,
 }
 
+/// What is kept of a client that went away: page, last key press, device name.
+type Remembered = (String, Instant, Option<String>);
+
+/// What a client's device (or, without devices, the global settings) allows.
+struct Policy {
+    /// Start page, also where `home_after` leads.
+    home: String,
+    /// Pages the client may show; `None`: all.
+    pages: Option<Vec<String>>,
+    idle: IdleConfig,
+    brightness: Option<u8>,
+    /// Name of the `sdc.device`; `None` in the legacy case.
+    device: Option<String>,
+}
+
+impl Policy {
+    fn allows(&self, page: &str) -> bool {
+        self.pages
+            .as_ref()
+            .is_none_or(|p| p.iter().any(|n| n == page))
+    }
+
+    fn active_brightness(&self) -> u8 {
+        self.brightness.unwrap_or(DEFAULT_BRIGHTNESS)
+    }
+
+    fn level(&self, power: Power) -> u8 {
+        match power {
+            Power::Active => self.active_brightness(),
+            Power::Dim => self.idle.dim_brightness,
+            Power::Off => 0,
+        }
+    }
+}
+
+/// Device type used for `sdc.default_device`.
+fn client_kind(web: bool, device: &DeviceInfo) -> &'static str {
+    if web {
+        "browser"
+    } else {
+        device_type(&device.model)
+    }
+}
+
 struct Client {
     /// For a viewer, the id of the deck it mirrors.
     client_id: String,
@@ -130,6 +188,11 @@ struct Client {
     /// of its own and its key events are handled as the mirrored deck's.
     mirror: bool,
     device: DeviceInfo,
+    /// `Hello.device_name`; kept to re-resolve the device on config reload.
+    want_device: Option<String>,
+    /// Name of the `sdc.device` in effect (`None`: the config has none, legacy behaviour).
+    /// A viewer carries the mirrored deck's.
+    device_name: Option<String>,
     tx: UnboundedSender<Out>,
     page: String,
     /// Last key press (or connect): drives dim/off.
@@ -150,8 +213,9 @@ pub struct Engine {
     renderer: Renderer,
     clients: BTreeMap<ClientId, Client>,
     /// Page and last key press of clients that went away, by client_id, so a reconnect (deploy,
-    /// client update) resumes where they were. Expires after `home_after`; lost on restart.
-    remembered: HashMap<String, (String, Instant)>,
+    /// client update) resumes where they were. Expires after the device's `home_after`; lost on
+    /// restart.
+    remembered: HashMap<String, Remembered>,
     key_deps: HashMap<(ClientId, u8), HashSet<String>>,
     /// dependency -> keys whose last render read it: an entity id, or `img:<cache key>` for a
     /// remote image (so keys re-render when their download completes)
@@ -204,7 +268,11 @@ impl Engine {
 
     /// (Re)loads the config. On failure the previous config stays active.
     pub fn reload(&mut self) -> Result<()> {
-        let old = self.settings();
+        let old: Vec<_> = self
+            .clients
+            .iter()
+            .map(|(id, c)| (*id, self.policy_of(c)))
+            .collect();
         let rt = LuaRuntime::load(&self.config_path, self.host.clone())?;
         tracing::info!(
             "loaded {} (pages: {})",
@@ -216,26 +284,54 @@ impl Engine {
         self.key_deps.clear();
         self.rev_deps.clear();
         self.slot_deps.clear();
-        let default = self.default_page();
         let rt = self.runtime.as_ref().expect("just set");
         for name in rt.static_image_names() {
             self.renderer.prefetch(&name);
         }
-        for c in self.clients.values_mut() {
-            if !rt.has_page(&c.page) {
-                c.page = default.clone();
+        // Re-resolve every deck's device; a changed device or a page it no longer allows
+        // sends the deck to its (new) home. Viewers follow their deck.
+        let ids: Vec<_> = self.clients.keys().copied().collect();
+        for id in &ids {
+            let Some(c) = self.clients.get(id).filter(|c| !c.mirror) else {
+                continue;
+            };
+            let policy = self.policy_for(c.want_device.as_deref(), client_kind(c.web, &c.device));
+            let rt = self.runtime.as_ref().expect("just set");
+            let c = self.clients.get_mut(id).expect("listed");
+            if c.device_name != policy.device || !rt.has_page(&c.page) || !policy.allows(&c.page) {
+                c.page = policy.home.clone();
+            }
+            c.device_name = policy.device;
+        }
+        for id in &ids {
+            let Some(c) = self.clients.get(id).filter(|c| c.mirror) else {
+                continue;
+            };
+            let target = self
+                .mirror_target(&c.client_id)
+                .and_then(|t| self.clients.get(&t))
+                .map(|t| (t.device_name.clone(), t.page.clone()));
+            let rt = self.runtime.as_ref().expect("just set");
+            let c = self.clients.get_mut(id).expect("listed");
+            match target {
+                Some((device, page)) => {
+                    c.device_name = device;
+                    c.page = page;
+                }
+                None if !rt.has_page(&c.page) => c.page = String::new(),
+                None => {}
             }
         }
         self.push_exports();
         self.render_all_clients();
         // Tell clients about brightness the new config changed; a client is not woken or put
         // to sleep here (the next tick does that if the idle settings now say so).
-        let new = self.settings();
-        let changed: Vec<_> = self
-            .clients
+        let changed: Vec<_> = old
             .iter()
-            .filter(|(_, c)| level(&old, c.power) != level(&new, c.power))
-            .map(|(id, _)| *id)
+            .filter_map(|(id, was)| {
+                let c = self.clients.get(id)?;
+                (was.level(c.power) != self.policy_of(c).level(c.power)).then_some(*id)
+            })
             .collect();
         for id in changed {
             self.send_brightness(id);
@@ -255,32 +351,37 @@ impl Engine {
                 id,
                 client_id,
                 device,
+                want_device,
                 tx,
             } => {
+                let policy = self.policy_for(want_device.as_deref(), client_kind(web, &device));
                 tracing::info!(
-                    "client {client_id} connected ({}x{} @ {}px)",
+                    "client {client_id} connected ({}x{} @ {}px, device {})",
                     device.rows,
                     device.cols,
-                    device.key_size_px
+                    device.key_size_px,
+                    policy.device.as_deref().unwrap_or("-")
                 );
                 let sent = vec![None; device.key_count() as usize];
                 // Resume the page of the previous connection (still listed if its disconnect
-                // has not arrived yet), unless it is gone from the config or home_after passed.
-                let home_after = self.settings().idle.home_after;
+                // has not arrived yet), unless it is gone from the config, not on this
+                // device, or home_after passed.
                 let prev = self
                     .clients
                     .values()
                     .find(|c| !c.mirror && c.client_id == client_id)
-                    .map(|c| (c.page.clone(), c.last_press))
+                    .map(|c| (c.page.clone(), c.last_press, c.device_name.clone()))
                     .or_else(|| self.remembered.remove(&client_id));
                 let (page, last_press) = match prev {
-                    Some((page, at))
-                        if self.runtime.as_ref().is_some_and(|rt| rt.has_page(&page))
-                            && !home_due(home_after, at, now) =>
+                    Some((page, at, dev))
+                        if dev == policy.device
+                            && self.runtime.as_ref().is_some_and(|rt| rt.has_page(&page))
+                            && policy.allows(&page)
+                            && !home_due(policy.idle.home_after, at, now) =>
                     {
                         (page, at)
                     }
-                    _ => (self.default_page(), now),
+                    _ => (policy.home.clone(), now),
                 };
                 self.clients.insert(
                     id,
@@ -289,6 +390,8 @@ impl Engine {
                         web,
                         mirror: false,
                         device,
+                        want_device,
+                        device_name: policy.device.clone(),
                         tx,
                         page,
                         last_activity: now,
@@ -298,7 +401,7 @@ impl Engine {
                         sent,
                     },
                 );
-                if self.settings().brightness.is_some() {
+                if policy.brightness.is_some() {
                     self.send_brightness(id);
                 }
                 self.render_client(id);
@@ -317,13 +420,13 @@ impl Engine {
                     Some(t) => self
                         .clients
                         .get(&t)
-                        .map(|c| (c.page.clone(), c.device.clone())),
+                        .map(|c| (c.page.clone(), c.device.clone(), c.device_name.clone())),
                     None => self
                         .remembered
                         .get(&mirror)
-                        .map(|(p, _)| (p.clone(), device.clone())),
+                        .map(|(p, _, dev)| (p.clone(), device.clone(), dev.clone())),
                 };
-                let Some((page, grid)) = page else {
+                let Some((page, grid, device_name)) = page else {
                     tracing::warn!("viewer asked to mirror unknown client {mirror}");
                     let _ = tx.send(Out::Error(format!("no such deck: {mirror}")));
                     return;
@@ -342,6 +445,8 @@ impl Engine {
                         web: true,
                         mirror: true,
                         device,
+                        want_device: None,
+                        device_name,
                         tx,
                         page,
                         last_activity: now,
@@ -374,6 +479,23 @@ impl Engine {
                         .collect(),
                 );
             }
+            EngineEvent::ListDevices(reply) => {
+                let _ = reply.send(
+                    self.runtime
+                        .as_ref()
+                        .map(|rt| {
+                            rt.devices()
+                                .into_iter()
+                                .map(|d| DeviceListing {
+                                    name: d.name,
+                                    pages: d.pages,
+                                    home: d.home,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
             EngineEvent::ClientDisconnected(id) => {
                 if let Some(c) = self.clients.remove(&id) {
                     if c.mirror {
@@ -386,7 +508,8 @@ impl Engine {
                             .values()
                             .any(|o| !o.mirror && o.client_id == c.client_id)
                         {
-                            self.remembered.insert(c.client_id, (c.page, c.last_press));
+                            self.remembered
+                                .insert(c.client_id, (c.page, c.last_press, c.device_name));
                         }
                     }
                 }
@@ -416,8 +539,23 @@ impl Engine {
         }
     }
 
-    /// Switches a client to `page` (no-op with a warning if it doesn't exist).
+    /// Switches a client to `page` (no-op with a warning if it doesn't exist or its device does
+    /// not include it).
     pub fn goto_page(&mut self, id: ClientId, page: &str) {
+        if let Some(c) = self.clients.get(&id) {
+            if !self.policy_of(c).allows(page) {
+                tracing::warn!(
+                    "goto_page: page '{page}' is not on device '{}'",
+                    c.device_name.as_deref().unwrap_or("-")
+                );
+                return;
+            }
+        }
+        self.show_page(id, page);
+    }
+
+    /// Like [`Engine::goto_page`] but ignoring the client's device (the page preview).
+    pub fn show_page(&mut self, id: ClientId, page: &str) {
         if !self.runtime.as_ref().is_some_and(|rt| rt.has_page(page)) {
             tracing::warn!("goto_page: no such page '{page}'");
             return;
@@ -471,6 +609,44 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// The policy of the device a client asking for `want` (of device type `kind`) gets now.
+    fn policy_for(&self, want: Option<&str>, kind: &str) -> Policy {
+        let global = self.settings();
+        let device = self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.resolve_device(want, kind));
+        Self::policy(&self.default_page(), global, device)
+    }
+
+    /// The policy of a client's current device (viewers carry their deck's).
+    fn policy_of(&self, c: &Client) -> Policy {
+        let device = c
+            .device_name
+            .as_deref()
+            .and_then(|n| self.runtime.as_ref()?.device(n));
+        Self::policy(&self.default_page(), self.settings(), device)
+    }
+
+    fn policy(default_page: &str, global: Settings, device: Option<DeviceDef>) -> Policy {
+        match device {
+            Some(d) => Policy {
+                home: d.home,
+                pages: Some(d.pages),
+                idle: d.idle.unwrap_or(global.idle),
+                brightness: d.brightness.or(global.brightness),
+                device: Some(d.name),
+            },
+            None => Policy {
+                home: default_page.to_string(),
+                pages: None,
+                idle: global.idle,
+                brightness: global.brightness,
+                device: None,
+            },
+        }
+    }
+
     fn ha_event(&mut self, e: HaEvent) {
         match e {
             HaEvent::Seed(states) => {
@@ -521,36 +697,55 @@ impl Engine {
 
     /// Sends the brightness that matches the client's current power state.
     fn send_brightness(&mut self, id: ClientId) {
-        let settings = self.settings();
         // Viewers never dim: the mirrored deck's power state is not theirs.
-        if let Some(c) = self.clients.get_mut(&id).filter(|c| !c.mirror) {
-            let _ = c.tx.send(Out::Brightness(level(&settings, c.power)));
-        }
+        let Some(c) = self.clients.get(&id).filter(|c| !c.mirror) else {
+            return;
+        };
+        let _ = c.tx.send(Out::Brightness(self.policy_of(c).level(c.power)));
     }
 
     /// Dims, then switches off, clients that have been idle for the configured time, and sends
     /// them (and forgets disconnected ones) home after `home_after`.
     pub fn tick(&mut self, now: Instant) {
-        let idle = self.settings().idle;
-        self.remembered
-            .retain(|_, (_, at)| !home_due(idle.home_after, *at, now));
+        let global = self.settings();
         let default = self.default_page();
+        let mut policies: HashMap<Option<String>, Policy> = HashMap::new();
+        for name in self
+            .clients
+            .values()
+            .map(|c| c.device_name.clone())
+            .chain(self.remembered.values().map(|(_, _, d)| d.clone()))
+        {
+            let device = name
+                .as_deref()
+                .and_then(|n| self.runtime.as_ref()?.device(n));
+            policies
+                .entry(name)
+                .or_insert_with(|| Self::policy(&default, global, device));
+        }
+        self.remembered.retain(|_, (_, at, dev)| {
+            !home_due(policies.get(dev).and_then(|p| p.idle.home_after), *at, now)
+        });
         let home: Vec<_> = self
             .clients
             .iter()
             .filter(|(_, c)| {
-                !c.mirror && c.page != default && home_due(idle.home_after, c.last_press, now)
+                let p = &policies[&c.device_name];
+                !c.mirror && c.page != p.home && home_due(p.idle.home_after, c.last_press, now)
             })
-            .map(|(id, _)| *id)
+            .map(|(id, c)| (*id, policies[&c.device_name].home.clone()))
             .collect();
-        for id in home {
+        for (id, page) in home {
             // Rendered even while the display is off, so waking shows home.
-            tracing::info!(client = id, page = %default, "idle for home_after, going home");
-            self.goto_page(id, &default);
+            tracing::info!(client = id, page = %page, "idle for home_after, going home");
+            self.goto_page(id, &page);
         }
         let mut changed = Vec::new();
         for (id, c) in self.clients.iter_mut().filter(|(_, c)| !c.mirror) {
-            let want = power_after(&idle, now.saturating_duration_since(c.last_activity));
+            let want = power_after(
+                &policies[&c.device_name].idle,
+                now.saturating_duration_since(c.last_activity),
+            );
             if want != c.power {
                 tracing::info!(client = %c.client_id, from = ?c.power, to = ?want, "power");
                 c.power = want;
@@ -848,15 +1043,6 @@ fn power_after(cfg: &IdleConfig, idle: Duration) -> Power {
     }
 }
 
-/// Brightness percent to show in a power state.
-fn level(settings: &Settings, power: Power) -> u8 {
-    match power {
-        Power::Active => settings.active_brightness(),
-        Power::Dim => settings.idle.dim_brightness,
-        Power::Off => 0,
-    }
-}
-
 fn ctx_info(c: &Client, key: u8) -> CtxInfo {
     CtxInfo {
         client_id: c.client_id.clone(),
@@ -1006,6 +1192,7 @@ mod tests {
             id: 1,
             client_id: "c1".into(),
             device: device(),
+            want_device: None,
             tx,
         });
         assert_eq!(drain(&mut rx).len(), 15);
@@ -1157,6 +1344,7 @@ mod tests {
                 id: 2,
                 client_id: "c2".into(),
                 device: device(),
+                want_device: None,
                 tx,
             },
             t0,
@@ -1272,6 +1460,7 @@ mod tests {
                 id,
                 client_id: name.into(),
                 device: device(),
+                want_device: None,
                 tx,
             },
             t,
@@ -1395,6 +1584,219 @@ mod tests {
         assert_eq!(e.clients[&2].page, "home");
     }
 
+    const DEVICES_CONFIG: &str = r##"
+        sdc.page("home", { sdc.button{ render = { text = "H" }, press = function(ctx) ctx.goto_page("lights") end } })
+        sdc.page("lights", { sdc.button{ render = { text = "L" }, press = function(ctx) ctx.goto_page("tv") end } })
+        sdc.page("tv", { sdc.button{ render = { text = "T" } } })
+        sdc.device("a", { pages = { "home", "lights" }, home = "home",
+                          idle = { home_after = 100 } })
+        sdc.device("b", { pages = { "tv", "home" }, home = "tv", brightness = 30 })
+        sdc.default_device { mk2 = "a", browser = "b", ["*"] = "b" }
+    "##;
+
+    fn device_engine(src: &str) -> (Engine, tempdir::Dir) {
+        let dir = tempdir::Dir::new();
+        let path = write_config(dir.path(), src);
+        let mut e = Engine::new(path, None);
+        e.reload().unwrap();
+        (e, dir)
+    }
+
+    fn connect_dev(
+        e: &mut Engine,
+        id: ClientId,
+        model: &str,
+        web: bool,
+        want: Option<&str>,
+        t: Instant,
+    ) -> UnboundedReceiver<Out> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        e.handle_at(
+            EngineEvent::ClientConnected {
+                web,
+                id,
+                client_id: format!("c{id}"),
+                device: DeviceInfo {
+                    model: model.into(),
+                    ..device()
+                },
+                want_device: want.map(Into::into),
+                tx,
+            },
+            t,
+        );
+        rx
+    }
+
+    fn dev_of(e: &Engine, id: ClientId) -> (Option<String>, String) {
+        (
+            e.clients[&id].device_name.clone(),
+            e.clients[&id].page.clone(),
+        )
+    }
+
+    #[test]
+    fn device_resolution_order() {
+        let (mut e, d) = device_engine(DEVICES_CONFIG);
+        let t = Instant::now();
+        // explicit name beats the type default
+        connect_dev(&mut e, 1, "Mk2", false, Some("b"), t);
+        assert_eq!(dev_of(&e, 1), (Some("b".into()), "tv".into()));
+        // type default
+        connect_dev(&mut e, 2, "Mk2Scissor", false, None, t);
+        assert_eq!(dev_of(&e, 2), (Some("a".into()), "home".into()));
+        // an unknown name falls through to the type default
+        connect_dev(&mut e, 3, "Mk2", false, Some("nope"), t);
+        assert_eq!(dev_of(&e, 3), (Some("a".into()), "home".into()));
+        // "*" for a type without an entry
+        connect_dev(&mut e, 4, "XlV2", false, None, t);
+        assert_eq!(dev_of(&e, 4), (Some("b".into()), "tv".into()));
+        // browser type
+        connect_dev(&mut e, 5, "Web Deck", true, None, t);
+        assert_eq!(dev_of(&e, 5), (Some("b".into()), "tv".into()));
+
+        // no "*" and no matching type: the first device
+        write_config(
+            d.path(),
+            &DEVICES_CONFIG
+                .replace(r#"["*"] = "b""#, "")
+                .replace(r#"browser = "b","#, ""),
+        );
+        e.handle_at(EngineEvent::Reload, t);
+        connect_dev(&mut e, 6, "XlV2", false, None, t);
+        assert_eq!(dev_of(&e, 6), (Some("a".into()), "home".into()));
+
+        // no devices at all: legacy, all pages, sdc.default_page
+        write_config(
+            d.path(),
+            r##"sdc.page("x", {}) sdc.page("y", {}) sdc.default_page("y")"##,
+        );
+        e.handle_at(EngineEvent::Reload, t);
+        connect_dev(&mut e, 7, "Mk2", false, Some("a"), t);
+        assert_eq!(dev_of(&e, 7), (None, "y".into()));
+        e.goto_page(7, "x");
+        assert_eq!(e.clients[&7].page, "x");
+    }
+
+    #[test]
+    fn goto_page_outside_the_device_is_ignored() {
+        let (mut e, _d) = device_engine(DEVICES_CONFIG);
+        let t = Instant::now();
+        let mut rx = connect_dev(&mut e, 1, "Mk2", false, None, t); // device a
+        drain(&mut rx);
+        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t); // home -> lights
+        assert_eq!(e.clients[&1].page, "lights");
+        drain(&mut rx);
+        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t); // lights -> tv: not on a
+        assert_eq!(e.clients[&1].page, "lights");
+        assert!(drain(&mut rx).is_empty());
+        e.goto_page(1, "nonexistent");
+        assert_eq!(e.clients[&1].page, "lights");
+    }
+
+    #[test]
+    fn home_after_goes_to_the_device_home() {
+        let (mut e, _d) = device_engine(DEVICES_CONFIG);
+        let t0 = Instant::now();
+        // device a: home_after 100, home "home"
+        connect_dev(&mut e, 1, "Mk2", false, None, t0);
+        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0);
+        assert_eq!(e.clients[&1].page, "lights");
+        e.tick(t0 + secs(99));
+        assert_eq!(e.clients[&1].page, "lights");
+        e.tick(t0 + secs(100));
+        assert_eq!(e.clients[&1].page, "home");
+        // device b has no idle of its own and the global one is unset: never goes home
+        connect_dev(&mut e, 2, "XlV2", false, None, t0);
+        e.goto_page(2, "home");
+        e.tick(t0 + secs(100_000));
+        assert_eq!(e.clients[&2].page, "home");
+    }
+
+    #[test]
+    fn device_brightness_and_global_defaults() {
+        let src = format!("sdc.brightness(80)\n{DEVICES_CONFIG}");
+        let (mut e, _d) = device_engine(&src);
+        let t = Instant::now();
+        let mut b = connect_dev(&mut e, 1, "XlV2", false, None, t);
+        assert_eq!(brightness(&drain_out(&mut b)), [30]);
+        let mut a = connect_dev(&mut e, 2, "Mk2", false, None, t);
+        assert_eq!(brightness(&drain_out(&mut a)), [80], "global default");
+    }
+
+    #[test]
+    fn reload_re_resolves_devices_and_remembered_page_follows_the_device() {
+        let (mut e, d) = device_engine(DEVICES_CONFIG);
+        let t = Instant::now();
+        connect_dev(&mut e, 1, "Mk2", false, None, t); // a
+        e.goto_page(1, "lights");
+        // default for mk2 now b: the client moves to b's home
+        write_config(
+            d.path(),
+            &DEVICES_CONFIG.replace(r#"mk2 = "a""#, r#"mk2 = "b""#),
+        );
+        e.handle_at(EngineEvent::Reload, t);
+        assert_eq!(dev_of(&e, 1), (Some("b".into()), "tv".into()));
+        // same device but the page was dropped from it: home
+        write_config(
+            d.path(),
+            &DEVICES_CONFIG
+                .replace(r#"mk2 = "a""#, r#"mk2 = "b""#)
+                .replace(r#"{ "tv", "home" }"#, r#"{ "home" }"#)
+                .replace(r#"home = "tv""#, r#"home = "home""#),
+        );
+        e.handle_at(EngineEvent::Reload, t);
+        assert_eq!(dev_of(&e, 1), (Some("b".into()), "home".into()));
+        // an invalid device config keeps the old one
+        write_config(
+            d.path(),
+            r#"sdc.page("p", {}) sdc.device("x", { pages = { "q" } })"#,
+        );
+        e.handle_at(EngineEvent::Reload, t);
+        assert_eq!(dev_of(&e, 1), (Some("b".into()), "home".into()));
+    }
+
+    #[test]
+    fn reconnect_on_another_device_starts_at_its_home() {
+        let (mut e, d) = device_engine(DEVICES_CONFIG);
+        let t = Instant::now();
+        connect_dev(&mut e, 1, "Mk2", false, None, t); // a
+        e.goto_page(1, "home");
+        e.goto_page(1, "lights");
+        e.handle_at(EngineEvent::ClientDisconnected(1), t);
+        // same device: resumes
+        connect_dev(&mut e, 1, "Mk2", false, None, t + secs(1));
+        assert_eq!(dev_of(&e, 1), (Some("a".into()), "lights".into()));
+        e.handle_at(EngineEvent::ClientDisconnected(1), t + secs(2));
+        // another device (asked for by name): home of that device
+        connect_dev(&mut e, 1, "Mk2", false, Some("b"), t + secs(3));
+        assert_eq!(dev_of(&e, 1), (Some("b".into()), "tv".into()));
+        drop(d);
+    }
+
+    #[test]
+    fn viewers_follow_the_mirrored_decks_device() {
+        let (mut e, _d) = device_engine(DEVICES_CONFIG);
+        let t = Instant::now();
+        connect_dev(&mut e, 1, "Mk2", false, None, t); // a
+        let (tx, _rx) = mpsc::unbounded_channel();
+        e.handle_at(
+            EngineEvent::ViewerConnected {
+                id: 9,
+                mirror: "c1".into(),
+                device: device(),
+                tx,
+            },
+            t,
+        );
+        assert_eq!(dev_of(&e, 9), (Some("a".into()), "home".into()));
+        // the viewer's press acts on the deck, under the deck's device rules
+        e.handle_at(EngineEvent::KeyDown { id: 9, key: 0 }, t);
+        e.handle_at(EngineEvent::KeyDown { id: 9, key: 0 }, t); // lights -> tv refused
+        assert_eq!(e.clients[&1].page, "lights");
+        assert_eq!(e.clients[&9].page, "lights");
+    }
+
     /// Serves a solid red PNG at /ok.png and 404 elsewhere; returns its base URL.
     async fn image_server() -> String {
         let mut png = Vec::new();
@@ -1455,6 +1857,7 @@ mod tests {
             id: 1,
             client_id: "c1".into(),
             device: device(),
+            want_device: None,
             tx,
         });
         // cache miss: the key renders right away, without the picture

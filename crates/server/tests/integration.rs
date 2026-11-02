@@ -138,6 +138,7 @@ async fn connect_as(url: &str, target: Option<&str>, sha256: Option<&str>) -> Cl
         client_target: target.map(Into::into),
         client_sha256: sha256.map(Into::into),
         mirror: None,
+        device_name: None,
     };
     c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -263,6 +264,7 @@ async fn rejects_wrong_protocol_version() {
         client_target: None,
         client_sha256: None,
         mirror: None,
+        device_name: None,
     };
     c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -367,6 +369,7 @@ async fn client_token_guards_ws_and_client_downloads() {
         client_target: None,
         client_sha256: None,
         mirror: None,
+        device_name: None,
     };
     c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -600,9 +603,18 @@ async fn start_deck_server(
     token: Option<&str>,
     deck_auth: http::DeckAuth,
 ) -> (String, TempDir) {
+    start_deck_server_with(tag, DECK_CONFIG, token, deck_auth).await
+}
+
+async fn start_deck_server_with(
+    tag: &str,
+    config: &str,
+    token: Option<&str>,
+    deck_auth: http::DeckAuth,
+) -> (String, TempDir) {
     let dir = TempDir::new(tag);
     let cfg = dir.0.join("config.lua");
-    std::fs::write(&cfg, DECK_CONFIG).unwrap();
+    std::fs::write(&cfg, config).unwrap();
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
     let engine_tx = engine::spawn(cfg, Some(ha_tx));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -658,6 +670,16 @@ async fn deck_handshake(
 
 /// Connects a browser deck and sends Hello; returns the socket (Welcome not yet read).
 async fn deck_connect(ws_url: &str, client_id: &str, mirror: Option<&str>, px: u32) -> Client {
+    deck_connect_as(ws_url, client_id, mirror, px, None).await
+}
+
+async fn deck_connect_as(
+    ws_url: &str,
+    client_id: &str,
+    mirror: Option<&str>,
+    px: u32,
+    device: Option<&str>,
+) -> Client {
     let mut c = deck_handshake(ws_url, &[("x-auth-request-email", "me@example.com")])
         .await
         .unwrap();
@@ -674,6 +696,7 @@ async fn deck_connect(ws_url: &str, client_id: &str, mirror: Option<&str>, px: u
         client_target: None,
         client_sha256: None,
         mirror: mirror.map(Into::into),
+        device_name: device.map(Into::into),
     };
     c.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -759,6 +782,41 @@ async fn deck_routes_require_sso_header() {
     assert_eq!(denied(foreign), 403);
     // health stays open
     assert_eq!(http_get_raw(&url, "/healthz", "").await.0, 200);
+}
+
+#[tokio::test]
+async fn deck_devices_api_lists_configured_devices_behind_sso() {
+    let config = format!(
+        r##"{DECK_CONFIG}
+        sdc.device("one", {{ pages = {{ "home" }} }})
+        sdc.device("both", {{ pages = {{ "other", "home" }}, home = "other" }})
+        "##
+    );
+    let (url, _dir) =
+        start_deck_server_with("deck-devices", &config, None, http::DeckAuth::Sso).await;
+    assert_eq!(http_get_raw(&url, "/deck/api/devices", "").await.0, 401);
+    let (status, body) = http_get_raw(&url, "/deck/api/devices", EMAIL).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!([
+            {"name": "one", "pages": ["home"], "home": "home"},
+            {"name": "both", "pages": ["other", "home"], "home": "other"},
+        ])
+    );
+    // a browser deck asking for a layout starts on that device's home page
+    let mut web = deck_connect_as(&url, "web-dev", None, 144, Some("both")).await;
+    expect_welcome(&mut web).await;
+    initial_frames(&mut web).await;
+    let list = deck_clients(&url).await;
+    assert_eq!(list[0]["page"], "other");
+}
+
+#[tokio::test]
+async fn deck_devices_api_is_empty_without_devices() {
+    let (url, _dir) = start_deck_server("deck-nodevices", None, http::DeckAuth::Sso).await;
+    let (status, body) = http_get_raw(&url, "/deck/api/devices", EMAIL).await;
+    assert_eq!((status, &body[..]), (200, &b"[]"[..]));
 }
 
 #[tokio::test]

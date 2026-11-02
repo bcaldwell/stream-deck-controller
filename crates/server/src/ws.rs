@@ -143,6 +143,7 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
         client_target,
         client_sha256,
         mirror,
+        device_name,
     } = hello
     else {
         bail!("first message was not hello");
@@ -219,6 +220,7 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
             id,
             client_id,
             device,
+            want_device: device_name.filter(|d| !d.is_empty()),
             tx,
         }),
     };
