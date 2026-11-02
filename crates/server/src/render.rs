@@ -21,13 +21,19 @@ const PAD: f32 = 4.0;
 const MIN_FONT_PX: f32 = 9.0;
 const LINE: f32 = 1.15;
 /// Layout of a key with an `icon` and `text` (fractions of the canvas's shorter side): the icon
-/// starts `ICON_TOP` from the top; the text sits in a band `TEXT_BAND` tall, `TEXT_MARGIN` above
-/// the bottom edge, with its last line on the band's bottom.
-const ICON_TOP: f32 = 0.04;
-const TEXT_MARGIN: f32 = 0.04;
-const TEXT_BAND: f32 = 0.33;
+/// starts `ICON_TOP` from the top and ends `ICON_GAP` above the text, which sits in a band
+/// `TEXT_BAND` tall, `TEXT_MARGIN` above the bottom edge, with its last line on the band's bottom.
+/// Icons are trimmed to their visible pixels when decoded, so these boxes are the glyph's size.
+const ICON_TOP: f32 = 0.08;
+const ICON_GAP: f32 = 0.03;
+const TEXT_MARGIN: f32 = 0.05;
+const TEXT_BAND: f32 = 0.27;
 /// Taller band for text that wraps onto several lines.
-const TEXT_BAND_MULTI: f32 = 0.42;
+const TEXT_BAND_MULTI: f32 = 0.38;
+/// Box (fraction of the shorter side, centered) for a key with only an icon.
+const ICON_ONLY: f32 = 0.66;
+/// Alpha at or below this counts as empty when trimming an icon's transparent border.
+const TRIM_ALPHA: u8 = 8;
 /// How long a failed download is remembered before it is tried again.
 const FAIL_TTL: Duration = Duration::from_secs(60);
 pub const ERR_BG: Color = Color([0xb0, 0x00, 0x20]);
@@ -113,6 +119,7 @@ impl Loaded {
     /// Premultiplies `img` (once, so scaling never bleeds the colour of transparent pixels) and
     /// shrinks it to at most [`MAX_SRC_SHORT`] on the shorter side.
     fn new(id: String, mut img: RgbaImage) -> Arc<Self> {
+        img = trim_transparent(img);
         premultiply(&mut img);
         let short = img.width().min(img.height());
         if short > MAX_SRC_SHORT {
@@ -623,12 +630,12 @@ impl Painter {
             w: w as f32 - 2.0 * pad,
             h: h as f32 - 2.0 * pad,
         };
-        let ipad = pad * 0.75;
+        let box_ = s * ICON_ONLY;
         let icon_only = Area {
-            x: ipad,
-            y: ipad,
-            w: w as f32 - 2.0 * ipad,
-            h: h as f32 - 2.0 * ipad,
+            x: (w as f32 - box_) / 2.0,
+            y: (h as f32 - box_) / 2.0,
+            w: box_,
+            h: box_,
         };
         let full = Area {
             x: 0.0,
@@ -653,12 +660,13 @@ impl Painter {
                 let margin = (s * TEXT_MARGIN).round();
                 let band = (s * band).round();
                 let text_y = h as f32 - margin - band;
+                let icon_h = text_y - (s * ICON_GAP).round() - top;
                 (
                     Some(Area {
-                        x: pad,
+                        x: (w as f32 - icon_h) / 2.0,
                         y: top,
-                        w: inner.w,
-                        h: text_y - top,
+                        w: icon_h,
+                        h: icon_h,
                     }),
                     Some(Area {
                         x: pad,
@@ -666,7 +674,8 @@ impl Painter {
                         w: inner.w,
                         h: band,
                     }),
-                    s * 0.22,
+                    // every line must fit in the band, so the label never runs into the icon
+                    (s * 0.22).min(band / (lines.max(1) as f32 * LINE)),
                 )
             }
             (true, None) => (Some(icon_only), None, 0.0),
@@ -725,15 +734,13 @@ impl Painter {
                 );
             }
             let bottom = icon.is_some() && image.is_none();
-            self.draw_text(
-                &mut img,
-                text,
-                area,
-                spec.fg,
-                spec.font_size,
-                text_max,
-                bottom,
-            );
+            // under an icon even an explicit size may not overflow the band into the icon
+            let font_size = if bottom {
+                spec.font_size.map(|f| f.min(text_max))
+            } else {
+                spec.font_size
+            };
+            self.draw_text(&mut img, text, area, spec.fg, font_size, text_max, bottom);
         }
         img
     }
@@ -928,6 +935,26 @@ pub fn cover(src: &RgbaImage, w: u32, h: u32) -> RgbaImage {
     let mut out = imageops::crop_imm(&scaled, (sw - w) / 2, (sh - h) / 2, w, h).to_image();
     unpremultiply(&mut out);
     out
+}
+
+/// Crops a picture's fully transparent border, so icons drawn with different amounts of padding
+/// in their files come out the same size and centered on their visible shape. Opaque pictures
+/// (and fully transparent ones) are returned unchanged.
+fn trim_transparent(img: RgbaImage) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+    for (x, y, p) in img.enumerate_pixels() {
+        if p.0[3] > TRIM_ALPHA {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
+        }
+    }
+    if x0 >= x1 || (x0, y0, x1, y1) == (0, 0, w, h) {
+        return img;
+    }
+    imageops::crop_imm(&img, x0, y0, x1 - x0, y1 - y0).to_image()
 }
 
 fn premultiply(img: &mut RgbaImage) {
@@ -1209,7 +1236,7 @@ mod tests {
             72,
         );
         assert!(
-            near(px(&icon, 6, 6), ERR_BG.0),
+            near(px(&icon, 36, 15), ERR_BG.0),
             "icon area is the error tile"
         );
         assert!(
@@ -1508,7 +1535,7 @@ mod tests {
             let icon_h = (bottom - top + 1) as f32;
             // before: the icon was at most half of the inner area (~0.44 of the key)
             assert!(icon_h >= 0.52 * s, "icon {icon_h}px of {size}");
-            assert!(top as f32 <= 0.08 * s);
+            assert!(top as f32 <= 0.1 * s);
             let (t_top, t_bottom) = y_extent(&img, |p| p.0[0] > 150 && p.0[1] > 150).unwrap();
             assert!(t_top > bottom, "text below the icon");
             assert!(t_bottom as f32 >= 0.84 * s, "text baseline low: {t_bottom}");
@@ -1517,6 +1544,50 @@ mod tests {
                 "text keeps a margin: {t_bottom}"
             );
         }
+    }
+
+    #[test]
+    fn icons_are_trimmed_and_centered_on_their_visible_pixels() {
+        // a glyph drawn in the top-left corner of a big transparent canvas
+        let mut padded = RgbaImage::from_pixel(100, 100, image::Rgba([0, 0, 0, 0]));
+        for y in 5..25 {
+            for x in 10..30 {
+                padded.put_pixel(x, y, image::Rgba([0, 200, 0, 255]));
+            }
+        }
+        let trimmed = trim_transparent(padded);
+        assert_eq!(trimmed.dimensions(), (20, 20));
+        let opaque = RgbaImage::from_pixel(8, 4, image::Rgba([1, 2, 3, 255]));
+        assert_eq!(trim_transparent(opaque).dimensions(), (8, 4));
+        let empty = RgbaImage::from_pixel(8, 4, image::Rgba([0, 0, 0, 0]));
+        assert_eq!(trim_transparent(empty).dimensions(), (8, 4));
+
+        let mut corner = RgbaImage::from_pixel(100, 100, image::Rgba([0, 0, 0, 0]));
+        for y in 0..20 {
+            for x in 0..20 {
+                corner.put_pixel(x, y, image::Rgba([0, 200, 0, 255]));
+            }
+        }
+        let dir = png_dir("trim", &[("corner.png", corner)]);
+        let mut r = Renderer::new(dir);
+        let img = r.render_image(
+            &RenderSpec {
+                icon: Some("corner.png".into()),
+                ..Default::default()
+            },
+            72,
+        );
+        let is_icon = |p: &Rgb<u8>| p.0[1] > 150 && p.0[0] < 60;
+        let (top, bottom) = y_extent(&img, is_icon).unwrap();
+        let mid = (top + bottom) as f32 / 2.0;
+        assert!(
+            (mid - 35.5).abs() <= 1.5,
+            "centered vertically: {top}..{bottom}"
+        );
+        assert!(
+            (bottom - top + 1) as f32 >= 0.6 * 72.0,
+            "fills the icon box"
+        );
     }
 
     #[test]
