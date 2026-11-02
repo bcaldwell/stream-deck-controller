@@ -93,6 +93,37 @@ mkdir -p /etc/systemd/timesyncd.conf.d
 printf '[Time]\nNTP=time.cloudflare.com\n' > /etc/systemd/timesyncd.conf.d/sdc.conf
 systemctl restart systemd-timesyncd 2>/dev/null || true
 
+# Power trims for running on a battery pack: the Pi only drives a USB deck over
+# Wi-Fi, so turn off what it never uses. Firmware settings take effect after a
+# reboot; re-runs replace the block instead of appending.
+BOOTCFG=/boot/firmware/config.txt
+[ -f "$BOOTCFG" ] || BOOTCFG=/boot/config.txt
+if [ -f "$BOOTCFG" ]; then
+  before=$(cksum < "$BOOTCFG")
+  sed -i \
+    -e '/^# sdc power trims >>>$/,/^# sdc power trims <<<$/d' \
+    -e 's/^dtoverlay=vc4-kms-v3d/#sdc: dtoverlay=vc4-kms-v3d/' \
+    -e 's/^dtparam=audio=on/dtparam=audio=off/' \
+    -e 's/^camera_auto_detect=1/camera_auto_detect=0/' \
+    -e 's/^display_auto_detect=1/display_auto_detect=0/' \
+    "$BOOTCFG"
+  cat >> "$BOOTCFG" <<'EOF'
+# sdc power trims >>>
+[all]
+# No Bluetooth (frees the UART too), activity LED off, top clock 800 MHz
+# (the deck needs very little CPU; ondemand still idles at 600).
+dtoverlay=disable-bt
+dtparam=act_led_trigger=none
+dtparam=act_led_activelow=on
+arm_freq=800
+# sdc power trims <<<
+EOF
+  [ "$(cksum < "$BOOTCFG")" = "$before" ] || echo "==> $BOOTCFG changed: reboot to apply the power trims"
+fi
+for unit in bluetooth.service hciuart.service getty@tty1.service; do
+  systemctl disable --now "$unit" 2>/dev/null || true
+done
+
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=hidraw --subsystem-match=usb || true
 systemctl daemon-reload
