@@ -350,7 +350,7 @@
     };
     menu.textContent = "";
     const h = document.createElement("h4"); h.textContent = "Deck"; menu.append(h);
-    menu.append(item("This browser (own deck)", "", ""));
+    menu.append(item("This browser", "", ""));
     for (const d of decks) {
       menu.append(item(d.web ? "Browser " + d.client_id : d.client_id, d.model + " · " + (d.page || ""), d.client_id));
     }
