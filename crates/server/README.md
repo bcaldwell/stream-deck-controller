@@ -93,7 +93,7 @@ sdc.page("home", {                -- list index = key index, row-major, key 1 (L
 })
 sdc.default_page("home")          -- optional; default is the first page defined
 sdc.brightness(60)                -- optional; active brightness 0-100 (sent on connect and on wake)
-sdc.key_gap(18)                   -- optional; default gap between keys for spans (px at 72 px keys, default 18)
+sdc.key_gap(18)                   -- optional; gap between keys for spans (px at 72 px keys, default 0)
 sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }   -- optional, seconds
 ```
 
@@ -185,7 +185,8 @@ sdc.page("music", {
   covers the whole canvas (center-cropped to its aspect); `icon`/`text` are placed on the whole canvas, with
   padding and text size following its shorter side.
 - `gap` (per span) or `sdc.key_gap(px)` (global) is in px at 72 px keys and scales with the client's key size;
-  the default is 18 (0.25 of a key, about the pitch of a Stream Deck MK.2).
+  the default is 0 (plain tiles). About 18 matches the bezel of a Stream Deck MK.2, so lines continue
+  straight across keys, at the cost of hiding the strip of the picture behind the bezel.
 - Dependencies: entities read by a span's `render` and its image downloads re-render all of its keys. Each tile
   is still only sent when its JPEG changed. Scaled pictures are cached per canvas size.
 - `ctx` in `render` has `key` = the span's top-left key; in `press`/`release`, `key` is the pressed key and

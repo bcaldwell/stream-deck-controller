@@ -293,8 +293,10 @@ pub struct SpanGeom {
     pub gap: u32,
 }
 
-/// Default gap between keys in px at 72 px keys (Stream Deck MK.2 pitch is ~0.25 of a key).
-pub const DEFAULT_GAP: u32 = 18;
+/// Default gap between keys in px at 72 px keys. 0 cuts a span into plain tiles; a
+/// gap matching the bezel (~18 on an MK.2) keeps lines straight across keys but
+/// hides a strip of the picture, usually the middle where the subject is.
+pub const DEFAULT_GAP: u32 = 0;
 
 /// A configured gap (px at 72 px keys) scaled to `key` px keys.
 pub fn gap_px(gap72: u32, key: u32) -> u32 {
