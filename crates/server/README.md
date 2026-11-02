@@ -98,7 +98,7 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3
 ```
 
 - Render descriptor: `text` (`\n` allowed; wraps and auto-shrinks), `bg`/`fg` (`#rgb`, `#rrggbb`),
-  `icon` and `image` (see [Icons and images](#icons-and-images)), `font_size` (px; auto-fit when absent).
+  `icon` and `image` (see [Icons and images](#icons-and-images)), `font_size` (px at a 72 px key, scaled with the key's size; auto-fit when absent).
 - `ctx`: `client_id`, `key` (0-based), `page`, `rows`, `cols`, `goto_page(name)`; for spans also
   `span_cols`, `span_rows` and, in `press`/`release`, `span_index` (see [Spans](#spans)).
 - `ha` (also `sdc.ha`): `ha.state(entity_id)` and fire-and-forget `ha.call(domain, service, data)`.

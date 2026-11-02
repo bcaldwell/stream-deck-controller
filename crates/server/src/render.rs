@@ -25,11 +25,11 @@ const LINE: f32 = 1.15;
 /// `TEXT_FONT`, or `TEXT_FONT_MULTI` per line when it wraps); the icon fills the rest, from
 /// `ICON_TOP` down to `ICON_GAP` above the label. Icons are drawn from their visible pixels, so
 /// that box is the glyph's size.
-const ICON_TOP: f32 = 0.06;
-const ICON_GAP: f32 = 0.03;
+const ICON_TOP: f32 = 0.05;
+const ICON_GAP: f32 = 0.02;
 const TEXT_MARGIN: f32 = 0.05;
 const TEXT_FONT: f32 = 0.2;
-const TEXT_FONT_MULTI: f32 = 0.18;
+const TEXT_FONT_MULTI: f32 = 0.21;
 /// Box (fraction of the shorter side, centered) for a key with only an icon.
 const ICON_ONLY: f32 = 0.66;
 /// Alpha at or below this counts as empty when trimming an icon's transparent border.
@@ -636,6 +636,9 @@ impl Painter {
         // sizes of padding, text and shadow follow the shorter side of the canvas
         let s = w.min(h) as f32;
         let pad = PAD * s / 72.0;
+        // `font_size` is in px at a 72 px key, so a label keeps its proportions on 144 px browser
+        // keys and plugin keys
+        let spec_font = spec.font_size.map(|f| f * s / 72.0);
         let inner = Area {
             x: pad,
             y: pad,
@@ -668,7 +671,7 @@ impl Painter {
                 } else {
                     s * TEXT_FONT
                 };
-                let font = spec.font_size.map_or(font, |f| f.min(font));
+                let font = spec_font.map_or(font, |f| f.min(font));
                 let top = (s * ICON_TOP).round();
                 let margin = (s * TEXT_MARGIN).round();
                 let band = (lines as f32 * font * LINE).ceil();
@@ -741,7 +744,7 @@ impl Painter {
                     text,
                     shadow,
                     Color::BLACK,
-                    spec.font_size,
+                    spec_font,
                     text_max,
                     false,
                 );
@@ -749,9 +752,9 @@ impl Painter {
             let bottom = icon.is_some() && image.is_none();
             // under an icon even an explicit size may not overflow the band into the icon
             let font_size = if bottom {
-                spec.font_size.map(|f| f.min(text_max))
+                spec_font.map(|f| f.min(text_max))
             } else {
-                spec.font_size
+                spec_font
             };
             self.draw_text(&mut img, text, area, spec.fg, font_size, text_max, bottom);
         }
@@ -1623,6 +1626,26 @@ mod tests {
         );
         assert!(near(px(&img, 4, 4), bg.0), "margin stays transparent");
         assert!(px(&img, 36, 36)[1] > 150, "logo in the middle");
+    }
+
+    #[test]
+    fn explicit_font_size_scales_with_the_key() {
+        let mut r = Renderer::new(PathBuf::from("/nonexistent"));
+        let height = |img: &RgbImage| {
+            let (top, bottom) = y_extent(img, |p| p.0[0] > 150).unwrap();
+            (bottom - top + 1) as f32
+        };
+        let spec = RenderSpec {
+            text: Some("Pause".into()),
+            font_size: Some(18.0),
+            ..Default::default()
+        };
+        let small = height(&r.render_image(&spec, 72));
+        let big = height(&r.render_image(&spec, 144));
+        assert!(
+            (big / small - 2.0).abs() < 0.25,
+            "{small}px at 72, {big}px at 144"
+        );
     }
 
     #[test]
