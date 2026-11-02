@@ -107,7 +107,7 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3
 - Press feedback: after a `press` handler finishes without a Lua error, the key shows a white ring for 400 ms (physical, browser and
   Elgato plugin keys). Not shown for presses that only wake the display, that call `ctx.goto_page`, for buttons without `press`, for
   spans, or when turned off globally with `sdc.feedback(false)` or per button with `feedback = false` in `sdc.button{}`.
-- `ctx`: `client_id`, `key` (0-based), `page`, `rows`, `cols`, `goto_page(name)`; for spans also
+- `ctx`: `client_id`, `key` (0-based), `page`, `rows`, `cols`, `goto_page(page)` (a page handle or name); for spans also
   `span_cols`, `span_rows` and, in `press`/`release`, `span_index` (see [Spans](#spans)).
 - `ha` (also `sdc.ha`): `ha.state(entity_id)` and fire-and-forget `ha.call(domain, service, data)`.
 - Dependency tracking is automatic: every entity passed to `ha.state` during a render is recorded
@@ -136,13 +136,14 @@ sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3
 Pages are global; a *device* picks which of them a deck shows, where it starts and how it idles.
 
 ```lua
-sdc.device("living-room", {
-  pages = { "home", "lights", "music", "speakers", "tv", "tv_apps" }, -- page names (must exist); order irrelevant
-  home = "home",                 -- start/default page, must be in pages (default: the first of pages)
-  brightness = 60,               -- optional, like sdc.brightness
+local home = sdc.page("home", { ... })   -- sdc.page / sdc.device return handles; names work too
+local living = sdc.device("living-room", {
+  pages = { home, "lights", "music" },  -- page handles or names (must exist); order irrelevant
+  home = home,                          -- start/default page, must be in pages (default: the first of pages)
+  brightness = 60,                      -- optional, like sdc.brightness
   idle = { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }, -- optional, like sdc.idle
 })
-sdc.default_device { mk2 = "living-room", plus = "office-plus", browser = "living-room", ["*"] = "living-room" }
+sdc.default_device { mk2 = living, plus = "office-plus", ["*"] = living }   -- device handles or names
 ```
 
 - Device types for `sdc.default_device`: `original` (Original, OriginalV2), `mk2` (Mk2 and its scissor/module

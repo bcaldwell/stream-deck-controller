@@ -595,13 +595,58 @@ impl LuaRuntime {
         let host = self.host.clone();
         t.set(
             "goto_page",
-            self.lua.create_function(move |_, name: String| {
-                *host.pending_goto.borrow_mut() = Some(name);
+            self.lua.create_function(move |_, page: Value| {
+                *host.pending_goto.borrow_mut() = Some(name_ref(&page, "page", "goto_page(...)")?);
                 Ok(())
             })?,
         )?;
         Ok(t)
     }
+}
+
+/// A page or device handle, as returned by `sdc.page` / `sdc.device`: `{ __sdc = kind, name = ... }`
+/// with a `__tostring` that gives the name.
+fn handle(lua: &Lua, kind: &str, name: &str) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set("__sdc", kind)?;
+    t.set("name", name)?;
+    let mt = lua.create_table()?;
+    mt.set(
+        "__tostring",
+        lua.create_function(|_, t: Table| t.get::<String>("name"))?,
+    )?;
+    t.set_metatable(Some(mt))?;
+    Ok(t)
+}
+
+/// The name behind a `kind` ("page" / "device") reference: a handle or a name string. `nil`
+/// usually means a misspelled or not-yet-defined variable, so it says so.
+fn name_ref(v: &Value, kind: &str, what: &str) -> mlua::Result<String> {
+    match v {
+        Value::String(s) => Ok(s.to_str()?.to_string()),
+        Value::Table(t) if t.get::<Option<String>>("__sdc")?.as_deref() == Some(kind) => {
+            t.get("name")
+        }
+        Value::Nil => Err(mlua::Error::runtime(format!(
+            "{what} is nil — is the {kind} variable defined above?"
+        ))),
+        _ => Err(mlua::Error::runtime(format!(
+            "{what} must be a {kind} (from sdc.{kind}) or a {kind} name"
+        ))),
+    }
+}
+
+/// The items of a Lua list in order, refusing holes: `{ a, b, c }` where `b` is an undefined
+/// variable would otherwise silently end the list at `a`.
+fn list_items(t: &Table, what: &str) -> mlua::Result<Vec<Value>> {
+    let mut n = 0;
+    for pair in t.clone().pairs::<Value, Value>() {
+        match pair?.0 {
+            Value::Integer(i) if i >= 1 => n = n.max(i as usize),
+            _ => return Err(mlua::Error::runtime(format!("{what} must be a list"))),
+        }
+    }
+    (1..=n).map(|i| t.get::<Value>(i)).collect()
 }
 
 fn install(
@@ -735,7 +780,7 @@ fn install(
     let reg = registry.clone();
     sdc.set(
         "page",
-        lua.create_function(move |_, (name, items): (String, Table)| {
+        lua.create_function(move |lua, (name, items): (String, Table)| {
             let mut keys: Vec<Option<ButtonDef>> = Vec::new();
             for pair in items.pairs::<Value, Value>() {
                 let (k, v) = pair?;
@@ -767,9 +812,9 @@ fn install(
             let mut r = reg.borrow_mut();
             match r.pages.iter_mut().find(|(n, _)| *n == name) {
                 Some(slot) => slot.1 = keys,
-                None => r.pages.push((name, keys)),
+                None => r.pages.push((name.clone(), keys)),
             }
-            Ok(())
+            handle(lua, "page", &name)
         })?,
     )?;
 
@@ -803,7 +848,7 @@ fn install(
     let reg = registry.clone();
     sdc.set(
         "device",
-        lua.create_function(move |_, (name, t): (String, Table)| {
+        lua.create_function(move |lua, (name, t): (String, Table)| {
             let what = format!("sdc.device('{name}')");
             if name.is_empty() {
                 return Err(mlua::Error::runtime("sdc.device: name must not be empty"));
@@ -821,28 +866,31 @@ fn install(
                 let (k, v) = pair?;
                 match (k.as_str(), v) {
                     ("pages", Value::Table(list)) => {
-                        for p in list.sequence_values::<String>() {
-                            let p = p.map_err(|_| {
-                                mlua::Error::runtime(format!("{what}: pages must be page names"))
-                            })?;
+                        for (i, p) in list_items(&list, &format!("{what}: 'pages'"))?
+                            .iter()
+                            .enumerate()
+                        {
+                            let p = name_ref(p, "page", &format!("{what}: pages[{}]", i + 1))?;
                             if !pages.contains(&p) {
                                 pages.push(p);
                             }
                         }
                     }
-                    ("home", Value::String(h)) => home = Some(h.to_str()?.to_string()),
+                    ("home", h @ (Value::String(_) | Value::Table(_))) => {
+                        home = Some(name_ref(&h, "page", &format!("{what}: 'home'"))?)
+                    }
                     ("brightness", Value::Integer(i)) => {
                         brightness = Some(percent_arg(&format!("{what}: 'brightness'"), i)?)
                     }
                     ("idle", Value::Table(i)) => idle = Some(idle_arg(&what, &i)?),
                     ("pages", _) => {
                         return Err(mlua::Error::runtime(format!(
-                            "{what}: 'pages' must be a list of page names"
+                            "{what}: 'pages' must be a list of pages (handles or names)"
                         )))
                     }
                     ("home", _) => {
                         return Err(mlua::Error::runtime(format!(
-                            "{what}: 'home' must be a page name"
+                            "{what}: 'home' must be a page (handle or name)"
                         )))
                     }
                     ("brightness", _) => {
@@ -868,6 +916,7 @@ fn install(
                 )));
             }
             let home = home.unwrap_or_else(|| pages[0].clone());
+            let h = handle(lua, "device", &name)?;
             reg.borrow_mut().devices.push(DeviceDef {
                 name,
                 pages,
@@ -875,7 +924,7 @@ fn install(
                 brightness,
                 idle,
             });
-            Ok(())
+            Ok(h)
         })?,
     )?;
 
@@ -886,12 +935,13 @@ fn install(
             let mut map = Vec::new();
             for pair in t.pairs::<Value, Value>() {
                 let (k, v) = pair?;
-                let (Value::String(k), Value::String(v)) = (&k, &v) else {
+                let Value::String(k) = &k else {
                     return Err(mlua::Error::runtime(
-                        "sdc.default_device: expected { <device type or \"*\"> = \"<device name>\" }",
+                        "sdc.default_device: expected { <device type or \"*\"> = <device> }",
                     ));
                 };
-                let (k, v) = (k.to_str()?.to_string(), v.to_str()?.to_string());
+                let k = k.to_str()?.to_string();
+                let v = name_ref(&v, "device", &format!("sdc.default_device: '{k}'"))?;
                 if k != "*" && !DEVICE_TYPES.contains(&k.as_str()) {
                     return Err(mlua::Error::runtime(format!(
                         "sdc.default_device: unknown device type '{k}' (use {} or \"*\")",
@@ -1242,6 +1292,60 @@ mod tests {
         assert_eq!(b.spec.fg, Color([255, 0, 0]));
         let c = rt.render(&rt.button("p", 2).unwrap(), &info("p", 2));
         assert_eq!(c.spec.text.as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn pages_and_devices_are_handles_or_names() {
+        let rt = LuaRuntime::load_str(
+            r#"
+            local other = sdc.page("other", {})
+            local home = sdc.page("home", {
+              sdc.button{ press = function(ctx) ctx.goto_page(other) end },
+              sdc.button{ press = function(ctx) ctx.goto_page("home") end },
+            })
+            assert(tostring(home) == "home")
+            local deck = sdc.device("deck", { pages = { home, "other" }, home = other })
+            sdc.device("web", { pages = { home } })
+            sdc.default_device { mk2 = deck, browser = "web" }
+            "#,
+            Host::new(None),
+        )
+        .unwrap();
+        let d = rt.device("deck").unwrap();
+        assert_eq!(
+            (d.pages.as_slice(), d.home.as_str()),
+            (&["home".to_string(), "other".to_string()][..], "other")
+        );
+        assert_eq!(rt.resolve_device(None, "mk2").unwrap().name, "deck");
+        assert_eq!(rt.resolve_device(None, "browser").unwrap().name, "web");
+        let goto = |key| {
+            rt.press(&rt.button("home", key).unwrap(), &info("home", key), true)
+                .unwrap()
+        };
+        assert_eq!(goto(0).as_deref(), Some("other"), "handle");
+        assert_eq!(goto(1).as_deref(), Some("home"), "name");
+    }
+
+    #[test]
+    fn undefined_page_variables_are_load_errors() {
+        let err = |src: &str| {
+            LuaRuntime::load_str(src, Host::new(None))
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default()
+        };
+        // a typo'd variable is nil: inside the list it would otherwise silently end it
+        let e = err(r#"local a = sdc.page("a", {}) local b = sdc.page("b", {})
+                       sdc.device("d", { pages = { a, bb, b } })"#);
+        assert!(
+            e.contains("pages[2] is nil") && e.contains("defined above"),
+            "{e}"
+        );
+        let e = err(r#"sdc.page("a", {}) sdc.device("d", { pages = { "a" } })
+                       sdc.default_device { mk2 = sdc.page("a", {}) }"#);
+        assert!(e.contains("must be a device"), "{e}");
+        let e = err(r#"local a = sdc.page("a", {}) sdc.device("d", { pages = { a }, home = 5 })"#);
+        assert!(e.contains("'home' must be a page"), "{e}");
     }
 
     #[test]

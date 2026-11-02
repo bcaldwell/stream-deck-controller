@@ -63,7 +63,7 @@ sdc.default_page("home")                   -- optional; default is the first pag
 | `client_id`, `page` | Which deck and which page |
 | `key` | 0-based key index |
 | `rows`, `cols` | The deck's grid |
-| `goto_page(name)` | Switch this deck to another page |
+| `goto_page(page)` | Switch this deck to another page (a page handle or name) |
 | `span_cols`, `span_rows`, `span_index` | For spans, see [Spans](#spans) |
 
 A Lua error in `render` or `press` is logged and shows a red `ERR` tile on that key; the server keeps running.
@@ -220,16 +220,25 @@ Stream Deck Plus in the office that needs different pages than the Mk.2 in the l
 `sdc.device` behaves exactly as described above: every deck sees every page.
 
 ```lua
-sdc.device("living-room", {
-  pages = { "home", "media" },     -- page names, which must exist; order does not matter
-  home = "home",                   -- start page, must be in pages (default: the first of pages)
+local home  = sdc.page("home", { ... })   -- sdc.page and sdc.device return handles
+local media = sdc.page("media", { ... })
+
+local living = sdc.device("living-room", {
+  pages = { home, media },         -- handles or names; must exist; order does not matter
+  home = home,                     -- start page, must be in pages (default: the first of pages)
   brightness = 60,                 -- optional, like sdc.brightness
   idle = { dim_after = 120, off_after = 600, home_after = 3600 },   -- optional, like sdc.idle
 })
-sdc.device("office", { pages = { "home" } })
+local office = sdc.device("office", { pages = { home } })
 
-sdc.default_device { mk2 = "living-room", plus = "office", ["*"] = "living-room" }
+sdc.default_device { mk2 = living, plus = office, ["*"] = living }
 ```
+
+Pages and devices can be referred to by **handle** (the value `sdc.page` / `sdc.device` returns) or by **name**:
+handles catch typos when the config loads (a misspelled variable is `nil`, and `pages[2] is nil — is the page
+variable defined above?` stops the load), names work anywhere, including before a page is defined, which helps when
+pages link to each other (`ctx.goto_page("lights")` on a page defined before `lights`). One Lua caveat: a field
+set to `nil` simply doesn't exist, so a misspelled `home = homee` behaves like leaving `home` out.
 
 `sdc.default_device` maps a device type to a device name. The types, derived from the model name a client reports,
 are `original` (Original and OriginalV2), `mk2` (including its scissor and module variants), `mini`, `xl`, `plus`,
