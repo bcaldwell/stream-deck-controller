@@ -10,8 +10,8 @@ use std::time::Instant;
 use sdc_protocol::{ExportItem, PluginClientMessage, SlotKind};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{ClientId, Engine, FlashKey};
-use crate::lua_api::{CtxInfo, DialInput, Export};
+use super::{ClientId, Engine, EngineEvent, FlashKey};
+use crate::lua_api::{CtxInfo, DialInput, Export, DIAL_SETTLE};
 use crate::render::RenderSpec;
 
 /// Slots a single plugin connection may hold.
@@ -419,5 +419,22 @@ impl Engine {
         }
         // Handlers may change Lua state that `render` reads (a dial's mode, say); unchanged output is not resent.
         self.render_slot(id, slot);
+        if matches!(input, DialInput::Rotate(_)) {
+            self.redraw_after_settle(id, slot);
+        }
+    }
+
+    /// Built-in dials show their own value while being turned; redraw once that is over so the
+    /// slot shows Home Assistant's state again even if no state change arrives.
+    fn redraw_after_settle(&self, id: ClientId, slot: &str) {
+        if let Some((handle, events)) = &self.timer {
+            let (events, slot) = (events.clone(), slot.to_string());
+            handle.spawn(async move {
+                tokio::time::sleep(DIAL_SETTLE + std::time::Duration::from_millis(50)).await;
+                if let Some(tx) = events.upgrade() {
+                    let _ = tx.send(EngineEvent::RedrawSlot { id, slot });
+                }
+            });
+        }
     }
 }

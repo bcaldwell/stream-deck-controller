@@ -198,20 +198,30 @@ so the same button can also be placed in a page:
 ```lua
 sdc.export("living_light", light("light.living_room", "Living"))
 
-sdc.export("living_dimmer", sdc.dial {
-  label = "Living room",
+-- Built-in dials: press cycles brightness / warmth / hue (whatever the light supports),
+-- a tap on the touch strip toggles it.
+sdc.export("living_dimmer", sdc.light_dial { entity = "light.living_room", label = "Living", icon = "icons/bulb.png" })
+sdc.export("kitchen_volume", sdc.volume_dial { entity = "media_player.kitchen", label = "Kitchen" })
+
+-- Or a dial of your own:
+sdc.export("fan", sdc.dial {
+  label = "Fan",
   render = function()
-    local l = ha.state("light.living_room")
-    local pct = l and l.attributes.brightness and math.floor(l.attributes.brightness / 2.55 + 0.5) or 0
-    return { title = "Living", value = (l and l.state == "on") and (pct .. "%") or "off",
-             indicator = pct, icon = "icons/bulb.png" }
+    local f = ha.state("fan.office")
+    local pct = (f and f.attributes.percentage) or 0
+    return { title = "Fan", value = pct .. "%", indicator = pct }
   end,
   rotate = function(ctx, ticks)
-    ha.call("light", "turn_on", { entity_id = "light.living_room", brightness_step_pct = ticks * 5 })
+    ha.call("fan", "increase_speed", { entity_id = "fan.office", percentage_step = ticks * 10 })
   end,
-  press = function() ha.call("light", "toggle", { entity_id = "light.living_room" }) end,
 })
 ```
+
+`sdc.light_dial` and `sdc.volume_dial` keep counting from their own value while you turn and show it straight
+away. Home Assistant only learns a light's new state once the light reports back, so stepping from HA's state
+loses or reverses steps on a fast turn. Options: `entity` (required), `label`, `icon`, plus `modes` (e.g.
+`{ "brightness", "warmth" }`) and `step` (`{ brightness = 5, warmth = 100, hue = 10 }`) for lights, or `step`
+(volume %, default 2) for speakers.
 
 Ids are 1-64 characters of `A-Z a-z 0-9 _ - .` and must be unique (a bad id fails the load). A dial cannot sit in
 a page; it is export-only. Full details in [crates/server/README.md](../crates/server/README.md#exports-and-dials-elgato-plugin).

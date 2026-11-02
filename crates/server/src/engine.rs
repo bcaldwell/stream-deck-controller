@@ -97,6 +97,11 @@ pub enum EngineEvent {
         tx: UnboundedSender<Out>,
     },
     ClientDisconnected(ClientId),
+    /// Redraw one plugin slot (a dial whose turn has settled, see [`crate::lua_api::DIAL_SETTLE`]).
+    RedrawSlot {
+        id: ClientId,
+        slot: String,
+    },
     /// An Elgato plugin connected on `/plugin/ws`; it gets the export list right away.
     PluginConnected {
         id: ClientId,
@@ -477,6 +482,7 @@ impl Engine {
                 self.plugin_connected(id, client_id, tx)
             }
             EngineEvent::PluginDisconnected(id) => self.plugin_disconnected(id),
+            EngineEvent::RedrawSlot { id, slot } => self.render_slot(id, &slot),
             EngineEvent::Plugin { id, msg } => self.plugin_message(id, msg),
             EngineEvent::ListClients(reply) => {
                 let _ = reply.send(

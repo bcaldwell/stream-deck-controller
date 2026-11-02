@@ -53,6 +53,7 @@ sdc.export("dimmer", sdc.dial{
   rotate = function(ctx, ticks) ha.call("light", "turn_on", { entity_id = "light.dial", step = ticks }) end,
   press = function(ctx) dial_mode[ctx.slot] = "Warmth" end,
 })
+sdc.export("lamp_dial", sdc.light_dial { entity = "light.lamp", label = "Lamp" })
 "##;
 
 type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -1068,6 +1069,7 @@ async fn plugin_subscribe_render_dependencies_and_input() {
             ("lamp", SlotKind::Key, Some("Lamp")),
             ("static", SlotKind::Key, None),
             ("dimmer", SlotKind::Dial, None),
+            ("lamp_dial", SlotKind::Dial, Some("Lamp")),
         ]
     );
 
@@ -1177,6 +1179,44 @@ async fn plugin_subscribe_render_dependencies_and_input() {
         cmd,
         expect_call(json!({"entity_id": "light.dial", "step": -4}), "turn_on")
     );
+    // a built-in light dial shows its own value at once, then HA's state once the turn settles
+    plugin_send(&mut c, subscribe("d2", "lamp_dial", SlotKind::Dial)).await;
+    plugin_drain(&mut c, Duration::from_millis(300)).await;
+    plugin_send(
+        &mut c,
+        PluginClientMessage::DialRotate {
+            slot: "d2".into(),
+            ticks: 1,
+        },
+    )
+    .await;
+    let cmd = tokio::time::timeout(Duration::from_secs(5), ha_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cmd,
+        expect_call(
+            json!({"entity_id": "light.lamp", "brightness_pct": 5}),
+            "turn_on"
+        )
+    );
+    let msgs = plugin_drain(&mut c, Duration::from_millis(300)).await;
+    assert!(
+        matches!(msgs.as_slice(), [PluginServerMessage::DialFeedback { slot, value, .. }] if slot == "d2" && value == "5%"),
+        "{msgs:?}"
+    );
+    let msgs = plugin_drain(&mut c, Duration::from_millis(1800)).await;
+    assert!(
+        matches!(msgs.as_slice(), [PluginServerMessage::DialFeedback { slot, value, .. }] if slot == "d2" && value == "off"),
+        "{msgs:?}"
+    );
+    plugin_send(
+        &mut c,
+        PluginClientMessage::Unsubscribe { slot: "d2".into() },
+    )
+    .await;
+
     // a press that only changes Lua state still redraws the dial
     plugin_send(&mut c, PluginClientMessage::DialDown { slot: "d1".into() }).await;
     let msgs = plugin_drain(&mut c, Duration::from_millis(300)).await;

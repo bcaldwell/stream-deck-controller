@@ -187,6 +187,12 @@ sdc.export("living_dimmer", sdc.dial {
   touch   = function(ctx) end,                 -- optional: tap on the touch strip
 })
 ```
+- `sdc.light_dial { entity, label?, icon?, modes?, step? }` and `sdc.volume_dial { entity, label?, icon?, step? }`
+  are built-in dials (`crates/server/src/lua/dials.lua`). While being turned they step from their own value, not
+  HA's lagging state, send absolute values and show their value at once; `DIAL_SETTLE` (1.5 s) after the last turn
+  the engine redraws the slot and HA's state shows again. A light dial's press cycles brightness, warmth and hue
+  (those the light's `supported_color_modes` allow) and a tap toggles; a volume dial's press mutes. `sdc.now()`
+  gives milliseconds on a monotonic clock.
 - `sdc.dial { render, rotate, press, release, touch }`: all handlers optional except `render`. `render` returns
   `title`, `value` (strings or numbers), `indicator` (0-100, clamped), `icon` (same sources as button icons) and
   `bg` (`#rrggbb`, behind the icon; default black). A Lua error shows `ERR` as the title and is logged. A dial

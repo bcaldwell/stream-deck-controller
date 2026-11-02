@@ -4,7 +4,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use mlua::{serde::SerializeOptions, Function, Lua, LuaSerdeExt, Table, Value};
@@ -19,6 +20,14 @@ pub fn lerr(e: mlua::Error) -> anyhow::Error {
     anyhow!("{e}")
 }
 
+/// How long a built-in dial (`sdc.light_dial`, `sdc.volume_dial`) keeps stepping from and showing
+/// its own value after the last turn, before it shows Home Assistant's state again. The engine
+/// redraws a dial slot this long after a turn.
+pub const DIAL_SETTLE: Duration = Duration::from_millis(1500);
+
+/// The built-in dials, run against `sdc` when a config loads.
+const DIALS_LUA: &str = include_str!("lua/dials.lua");
+
 /// State shared between the engine and the Lua closures (single-threaded).
 #[derive(Default)]
 pub struct Host {
@@ -26,6 +35,9 @@ pub struct Host {
     pub ha_tx: Option<UnboundedSender<HaCommand>>,
     tracking: RefCell<Option<HashSet<String>>>,
     pending_goto: RefCell<Option<String>>,
+    /// Tests set `sdc.now()` by hand.
+    #[cfg(test)]
+    pub(crate) now_ms: std::cell::Cell<Option<f64>>,
 }
 
 impl Host {
@@ -34,6 +46,16 @@ impl Host {
             ha_tx,
             ..Default::default()
         })
+    }
+
+    /// `sdc.now()`: milliseconds on a monotonic clock (from the first call).
+    fn now_ms(&self) -> f64 {
+        #[cfg(test)]
+        if let Some(t) = self.now_ms.get() {
+            return t;
+        }
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
     }
 }
 
@@ -999,6 +1021,13 @@ fn install(
     globals.set("ha", ha)?;
     globals.set("sdc", sdc.clone())?;
 
+    let h = host.clone();
+    sdc.set("now", lua.create_function(move |_, ()| Ok(h.now_ms()))?)?;
+    sdc.set("DIAL_SETTLE_MS", DIAL_SETTLE.as_millis() as f64)?;
+    lua.load(DIALS_LUA)
+        .set_name("@sdc/dials.lua")
+        .call::<()>(sdc.clone())?;
+
     // require("sdc") plus relative requires from the config directory
     let package: Table = globals.get("package")?;
     let loaded: Table = package.get("loaded")?;
@@ -1751,6 +1780,161 @@ mod tests {
         rt.dial_input(&d, &slot_info("slot-1"), DialInput::Touch)
             .unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A runtime whose `ha.call`s land in the returned receiver, with `states` already known.
+    fn dial_runtime(
+        src: &str,
+        states: &[(&str, &str, serde_json::Value)],
+    ) -> (
+        LuaRuntime,
+        Rc<Host>,
+        tokio::sync::mpsc::UnboundedReceiver<HaCommand>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = Host::new(Some(tx));
+        host.now_ms.set(Some(0.0));
+        for (id, st, attrs) in states {
+            host.states.borrow_mut().insert(
+                id.to_string(),
+                EntityState {
+                    entity_id: id.to_string(),
+                    state: st.to_string(),
+                    attributes: attrs.clone(),
+                },
+            );
+        }
+        let rt = LuaRuntime::load_str(src, host.clone()).unwrap();
+        (rt, host, rx)
+    }
+
+    fn dial_of(rt: &LuaRuntime, id: &str) -> DialDef {
+        let Some(Export::Dial(d)) = rt.export(id) else {
+            panic!("{id} is not a dial")
+        };
+        d
+    }
+
+    fn call_data(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<HaCommand>,
+    ) -> (String, serde_json::Value) {
+        let HaCommand::CallService { service, data, .. } = rx.try_recv().expect("a call");
+        (service, data)
+    }
+
+    #[test]
+    fn light_dial_steps_from_its_own_value_until_settled() {
+        let (rt, host, mut rx) = dial_runtime(
+            r#"sdc.export("d", sdc.light_dial { entity = "light.o", label = "Office" })"#,
+            &[(
+                "light.o",
+                "on",
+                json!({"brightness": 128, "supported_color_modes": ["color_temp", "xy"],
+                       "color_mode": "color_temp", "color_temp_kelvin": 3000,
+                       "min_color_temp_kelvin": 2000, "max_color_temp_kelvin": 6000}),
+            )],
+        );
+        let d = dial_of(&rt, "d");
+        let ctx = slot_info("s");
+        // HA still says 50% after every call; the dial keeps counting from its own value
+        for want in [55, 60, 65] {
+            rt.dial_input(&d, &ctx, DialInput::Rotate(1)).unwrap();
+            assert_eq!(call_data(&mut rx).1["brightness_pct"], json!(want));
+        }
+        let o = rt.render_dial(&d, &ctx);
+        assert_eq!(
+            (
+                o.spec.title.as_str(),
+                o.spec.value.as_str(),
+                o.spec.indicator
+            ),
+            ("Office", "65%", 65)
+        );
+        // after the settle time HA's state is shown and used again
+        host.now_ms.set(Some(DIAL_SETTLE.as_millis() as f64 + 1.0));
+        assert_eq!(rt.render_dial(&d, &ctx).spec.value, "50%");
+        rt.dial_input(&d, &ctx, DialInput::Rotate(-2)).unwrap();
+        assert_eq!(call_data(&mut rx).1["brightness_pct"], json!(40));
+
+        // press cycles brightness -> warmth -> hue -> brightness
+        rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
+        assert_eq!(rt.render_dial(&d, &ctx).spec.title, "Office · warmth");
+        rt.dial_input(&d, &ctx, DialInput::Rotate(3)).unwrap();
+        assert_eq!(call_data(&mut rx).1["color_temp_kelvin"], json!(3300));
+        assert_eq!(rt.render_dial(&d, &ctx).spec.value, "3300K");
+        rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
+        rt.dial_input(&d, &ctx, DialInput::Rotate(-1)).unwrap();
+        // from white: a saturated colour, hue stepping down wraps
+        assert_eq!(call_data(&mut rx).1["hs_color"], json!([350, 80]));
+        assert_eq!(rt.render_dial(&d, &ctx).spec.title, "Office · hue");
+        rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
+        assert_eq!(rt.render_dial(&d, &ctx).spec.title, "Office");
+        // a tap toggles
+        rt.dial_input(&d, &ctx, DialInput::Touch).unwrap();
+        assert_eq!(call_data(&mut rx).0, "toggle");
+    }
+
+    #[test]
+    fn light_dial_modes_follow_the_light() {
+        let (rt, _host, mut rx) = dial_runtime(
+            r#"sdc.export("d", sdc.light_dial { entity = "light.k" })"#,
+            &[(
+                "light.k",
+                "off",
+                json!({"supported_color_modes": ["color_temp"],
+                "min_color_temp_kelvin": 2900, "max_color_temp_kelvin": 7000}),
+            )],
+        );
+        let d = dial_of(&rt, "d");
+        let ctx = slot_info("s");
+        assert_eq!(rt.render_dial(&d, &ctx).spec.value, "off");
+        // off: turning up starts from 0
+        rt.dial_input(&d, &ctx, DialInput::Rotate(2)).unwrap();
+        assert_eq!(call_data(&mut rx).1["brightness_pct"], json!(10));
+        assert_eq!(rt.render_dial(&d, &ctx).spec.value, "10%");
+        rt.dial_input(&d, &ctx, DialInput::Rotate(-5)).unwrap();
+        assert_eq!(call_data(&mut rx).0, "turn_off");
+        // no colour: brightness and warmth only
+        rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
+        assert_eq!(rt.render_dial(&d, &ctx).spec.title, "light.k · warmth");
+        rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
+        assert_eq!(rt.render_dial(&d, &ctx).spec.title, "light.k");
+    }
+
+    #[test]
+    fn volume_dial_steps_and_mutes() {
+        let (rt, _host, mut rx) = dial_runtime(
+            r#"sdc.export("v", sdc.volume_dial { entity = "media_player.k", label = "Kitchen", step = 3 })"#,
+            &[(
+                "media_player.k",
+                "playing",
+                json!({"volume_level": 0.2, "is_volume_muted": false}),
+            )],
+        );
+        let d = dial_of(&rt, "v");
+        let ctx = slot_info("s");
+        rt.dial_input(&d, &ctx, DialInput::Rotate(1)).unwrap();
+        rt.dial_input(&d, &ctx, DialInput::Rotate(1)).unwrap();
+        call_data(&mut rx);
+        assert_eq!(call_data(&mut rx).1["volume_level"], json!(0.26));
+        assert_eq!(rt.render_dial(&d, &ctx).spec.value, "26%");
+        rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
+        assert_eq!(
+            call_data(&mut rx),
+            (
+                "volume_mute".into(),
+                json!({"entity_id": "media_player.k", "is_volume_muted": true})
+            )
+        );
+    }
+
+    #[test]
+    fn built_in_dials_need_an_entity() {
+        let e = LuaRuntime::load_str(r#"sdc.export("d", sdc.light_dial {})"#, Host::new(None))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("sdc.light_dial: { entity"), "{e}");
     }
 
     #[test]
