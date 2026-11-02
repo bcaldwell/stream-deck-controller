@@ -5,11 +5,12 @@
 //! only sends what changed.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use sdc_protocol::{ExportItem, PluginClientMessage, SlotKind};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{ClientId, Engine};
+use super::{ClientId, Engine, FlashKey};
 use crate::lua_api::{CtxInfo, DialInput, Export};
 use crate::render::RenderSpec;
 
@@ -255,7 +256,7 @@ impl Engine {
     }
 
     /// Renders one slot and sends the result if it differs from what the plugin has.
-    fn render_slot(&mut self, id: ClientId, slot: &str) {
+    pub(super) fn render_slot(&mut self, id: ClientId, slot: &str) {
         let Some(info) = self.slot_ctx(id, slot) else {
             return;
         };
@@ -268,7 +269,10 @@ impl Engine {
         let (fingerprint, deps, out) = match (export, kind) {
             (Some(Export::Button(def)), SlotKind::Key) => {
                 let rt = self.runtime.as_ref().expect("export implies runtime");
-                let r = rt.render(&def, &info);
+                let mut r = rt.render(&def, &info);
+                r.spec.flash = self
+                    .flashes
+                    .contains_key(&(id, FlashKey::Slot(slot.to_string())));
                 if let Some(e) = &r.error {
                     tracing::error!("render export {export_id} for {}: {e}", info.client_id);
                 }
@@ -366,13 +370,18 @@ impl Engine {
     }
 
     fn key_input(&mut self, id: ClientId, slot: &str, down: bool) {
+        let now = Instant::now();
         let Some((info, Export::Button(def))) = self.slot_export(id, slot, SlotKind::Key) else {
             return;
         };
         let Some(rt) = &self.runtime else { return };
         match rt.press(&def, &info, down) {
             Ok(Some(page)) => tracing::debug!("goto_page({page}) from a plugin key ignored"),
-            Ok(None) => {}
+            Ok(None) => {
+                if down && def.has_press() && def.feedback {
+                    self.flash_slot(id, slot, now);
+                }
+            }
             Err(e) => {
                 tracing::error!(
                     "export key {slot} {}: {e:#}",

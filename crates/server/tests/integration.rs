@@ -230,6 +230,10 @@ async fn fake_ha_full_flow() {
         }
     );
 
+    // the press flashes key 0 and then restores it
+    let flash = drain_frames(&mut c, Duration::from_millis(700)).await;
+    assert_eq!(flash.iter().map(|f| f.0).collect::<Vec<_>>(), [0, 0]);
+
     // state change -> only key 0 re-sent
     engine_tx
         .send(EngineEvent::Ha(HaEvent::Changed(on("light.office"))))
@@ -566,6 +570,7 @@ async fn real_ha_client_against_mock_ha() {
     assert_eq!(call["domain"], "light");
     assert_eq!(call["service"], "toggle");
     assert_eq!(call["service_data"]["entity_id"], "light.office");
+    drain_frames(&mut c, Duration::from_millis(700)).await; // press flash
 
     // HA pushes state_changed -> key 0 changes, others don't
     mock.push
@@ -1073,6 +1078,12 @@ async fn plugin_subscribe_render_dependencies_and_input() {
     assert_eq!(
         cmd,
         expect_call(json!({"entity_id": "light.office"}), "toggle")
+    );
+    // the press flashes the slot, then restores it
+    let msgs = plugin_drain(&mut c, Duration::from_millis(700)).await;
+    assert!(
+        matches!(msgs.as_slice(), [PluginServerMessage::KeyImage { slot: a, .. }, PluginServerMessage::KeyImage { slot: b, .. }] if a == "k1" && b == "k1"),
+        "{msgs:?}"
     );
     plugin_send(
         &mut c,

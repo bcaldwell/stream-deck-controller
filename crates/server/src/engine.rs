@@ -57,6 +57,8 @@ pub struct DeckInfo {
 
 /// How often the engine checks clients for idleness.
 const TICK: Duration = Duration::from_secs(1);
+/// How long a key shows the press flash.
+const FLASH: Duration = Duration::from_millis(400);
 
 /// Display state of a client; only ever left by a tick (dim/off) or a key press (wake).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +162,17 @@ pub struct Engine {
     plugins: BTreeMap<ClientId, Plugin>,
     /// The same dependency tracking as `key_deps`/`rev_deps`, for plugin slots.
     slot_deps: SlotDeps,
+    /// Keys and plugin slots showing the press flash, with when it ends.
+    flashes: HashMap<(ClientId, FlashKey), Instant>,
+    /// Wakes the event loop when a flash is due (set by [`Engine::enable_fetch`]).
+    timer: Option<(Handle, mpsc::WeakUnboundedSender<EngineEvent>)>,
+}
+
+/// What a press flash is on: a key of a client, or a plugin slot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FlashKey {
+    Key(u8),
+    Slot(String),
 }
 
 impl Engine {
@@ -181,6 +194,8 @@ impl Engine {
             rev_deps: HashMap::new(),
             plugins: BTreeMap::new(),
             slot_deps: SlotDeps::default(),
+            flashes: HashMap::new(),
+            timer: None,
         }
     }
 
@@ -188,6 +203,7 @@ impl Engine {
     /// back as [`EngineEvent::ImageFetched`] on `events` (held weakly, so it does not keep the
     /// event loop alive).
     pub fn enable_fetch(&mut self, handle: Handle, events: &UnboundedSender<EngineEvent>) {
+        self.timer = Some((handle.clone(), events.downgrade()));
         let events = events.downgrade();
         self.renderer
             .set_fetcher(Some(Fetcher::new(handle, move |(key, result)| {
@@ -424,6 +440,8 @@ impl Engine {
         }
         if let Some(c) = self.clients.get_mut(&id) {
             c.page = page.to_string();
+            self.flashes
+                .retain(|(cid, k), _| *cid != id || !matches!(k, FlashKey::Key(_)));
             let client_id = (!c.mirror).then(|| c.client_id.clone());
             self.render_client(id);
             if let Some(client_id) = client_id {
@@ -460,6 +478,8 @@ impl Engine {
             if let Some(v) = self.clients.get_mut(&id) {
                 v.page = page.clone();
             }
+            self.flashes
+                .retain(|(cid, k), _| *cid != id || !matches!(k, FlashKey::Key(_)));
             self.render_client(id);
         }
     }
@@ -531,6 +551,7 @@ impl Engine {
     /// Dims, then switches off, clients that have been idle for the configured time, and sends
     /// them (and forgets disconnected ones) home after `home_after`.
     pub fn tick(&mut self, now: Instant) {
+        self.end_flashes(now);
         let idle = self.settings().idle;
         self.remembered
             .retain(|_, (_, at)| !home_due(idle.home_after, *at, now));
@@ -625,7 +646,11 @@ impl Engine {
         tracing::debug!(client = %c.client_id, page = %c.page, key, down, "key event");
         match rt.press(&btn, &info, down) {
             Ok(Some(page)) => self.goto_page(id, &page),
-            Ok(None) => {}
+            Ok(None) => {
+                if down && btn.has_press() && btn.feedback && info.span.is_none() {
+                    self.flash_key(id, key, now);
+                }
+            }
             Err(e) => {
                 tracing::error!(
                     "{} key {key} {}: {e:#}",
@@ -636,6 +661,68 @@ impl Engine {
                     .renderer
                     .render(&RenderSpec::error(), c.device.key_size_px);
                 self.send_if_changed(id, key, jpeg);
+            }
+        }
+    }
+
+    /// Shows the press flash on `key` of deck `id` and its viewers for [`FLASH`].
+    fn flash_key(&mut self, id: ClientId, key: u8, now: Instant) {
+        if !self.settings().feedback {
+            return;
+        }
+        let Some(deck) = self.clients.get(&id).map(|c| c.client_id.clone()) else {
+            return;
+        };
+        let ids: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|(i, c)| **i == id || (c.mirror && c.client_id == deck))
+            .map(|(i, _)| *i)
+            .collect();
+        for i in ids {
+            self.flashes.insert((i, FlashKey::Key(key)), now + FLASH);
+            self.render_keys(i, &[key]);
+        }
+        self.schedule_flash_end();
+    }
+
+    /// Shows the press flash on a plugin slot for [`FLASH`].
+    fn flash_slot(&mut self, id: ClientId, slot: &str, now: Instant) {
+        if !self.settings().feedback {
+            return;
+        }
+        self.flashes
+            .insert((id, FlashKey::Slot(slot.to_string())), now + FLASH);
+        self.render_slot(id, slot);
+        self.schedule_flash_end();
+    }
+
+    /// Sends a [`EngineEvent::Tick`] once the flash is over (the regular tick is too coarse).
+    fn schedule_flash_end(&self) {
+        if let Some((handle, events)) = &self.timer {
+            let events = events.clone();
+            handle.spawn(async move {
+                tokio::time::sleep(FLASH).await;
+                if let Some(tx) = events.upgrade() {
+                    let _ = tx.send(EngineEvent::Tick);
+                }
+            });
+        }
+    }
+
+    /// Re-renders the keys and slots whose flash is over.
+    fn end_flashes(&mut self, now: Instant) {
+        let due: Vec<_> = self
+            .flashes
+            .iter()
+            .filter(|(_, until)| **until <= now)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in due {
+            self.flashes.remove(&k);
+            match k {
+                (id, FlashKey::Key(key)) => self.render_keys(id, &[key]),
+                (id, FlashKey::Slot(slot)) => self.render_slot(id, &slot),
             }
         }
     }
@@ -688,7 +775,9 @@ impl Engine {
                     if let Some(e) = &out.error {
                         tracing::error!("render {} key {key} for {}: {e}", info.page, c.client_id);
                     }
-                    (out.spec, out.deps)
+                    let mut spec = out.spec;
+                    spec.flash = self.flashes.contains_key(&(id, FlashKey::Key(key)));
+                    (spec, out.deps)
                 }
                 (Cell::Span(sp), Some(rt)) => {
                     if !spans_done.insert(sp.origin) {
@@ -1199,7 +1288,7 @@ mod tests {
         up(&mut e, t0 + secs(200));
         assert_eq!(calls(&mut ha), 2);
         e.tick(t0 + secs(200 + 119));
-        assert!(drain_out(&mut rx).is_empty());
+        assert!(brightness(&drain_out(&mut rx)).is_empty());
         e.tick(t0 + secs(200 + 120));
         assert_eq!(brightness(&drain_out(&mut rx)), [10]);
 
@@ -1578,5 +1667,91 @@ mod tests {
         e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
         let f = drain(&mut rx);
         assert!(f.iter().all(|f| [1, 2, 6, 7].contains(&f.key)));
+    }
+
+    /// Dimmest channel of the top-edge pixel of a key image: the flash ring is white there.
+    fn edge(f: &Frame) -> u8 {
+        let img = image::load_from_memory(&f.jpeg).unwrap().to_rgb8();
+        *img.get_pixel(36, 1).0.iter().min().unwrap()
+    }
+
+    const FLASH_PAGE: &str = r#"
+        sdc.page("home", {
+          sdc.button{ render = { text = "A" }, press = function() end },
+          sdc.button{ render = { text = "B" }, press = function() end, feedback = false },
+          sdc.button{ render = { text = "C" }, press = function(ctx) ctx.goto_page("two") end },
+          sdc.button{ render = { text = "D" }, press = function() error("nope") end },
+          sdc.button{ render = { text = "E" } },
+        })
+        sdc.page("two", {})
+    "#;
+
+    fn press_frames(
+        e: &mut Engine,
+        rx: &mut UnboundedReceiver<Out>,
+        key: u8,
+        t: Instant,
+    ) -> Vec<Frame> {
+        e.handle_at(EngineEvent::KeyDown { id: 1, key }, t);
+        drain(rx)
+    }
+
+    #[test]
+    fn press_flashes_the_key_then_clears_it() {
+        let (mut e, mut rx, _ha, _d) = setup(FLASH_PAGE);
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let f = press_frames(&mut e, &mut rx, 0, t0);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].key, 0);
+        assert!(edge(&f[0]) > 200, "ring while flashing");
+        e.tick(t0 + ms(399));
+        assert!(drain(&mut rx).is_empty(), "still flashing");
+        // nothing else changed: the flash still ends and the key goes back to normal
+        e.tick(t0 + ms(400));
+        let f = drain(&mut rx);
+        assert_eq!(f.len(), 1);
+        assert!(edge(&f[0]) < 80, "ring gone");
+        e.tick(t0 + ms(1400));
+        assert!(drain(&mut rx).is_empty(), "no frame once settled");
+        // a second press restarts the flash
+        assert_eq!(press_frames(&mut e, &mut rx, 0, t0 + ms(2000)).len(), 1);
+    }
+
+    #[test]
+    fn no_flash_for_errors_goto_opt_out_or_missing_press() {
+        let (mut e, mut rx, _ha, _d) = setup(FLASH_PAGE);
+        let t0 = Instant::now();
+        let f = press_frames(&mut e, &mut rx, 1, t0);
+        assert!(f.is_empty(), "feedback = false");
+        let f = press_frames(&mut e, &mut rx, 3, t0);
+        assert_eq!(f.len(), 1);
+        assert!(edge(&f[0]) < 80, "an ERR tile, not a ring");
+        assert!(
+            press_frames(&mut e, &mut rx, 4, t0).is_empty(),
+            "no press handler"
+        );
+        // goto_page repaints the whole new page without a ring on the pressed key
+        let f = press_frames(&mut e, &mut rx, 2, t0);
+        assert!(f.iter().all(|f| edge(f) < 80));
+        e.tick(t0 + Duration::from_millis(500));
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn sdc_feedback_false_disables_the_flash() {
+        let cfg = format!("sdc.feedback(false) {FLASH_PAGE}");
+        let (mut e, mut rx, _ha, _d) = setup(&cfg);
+        assert!(press_frames(&mut e, &mut rx, 0, Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn wake_press_does_not_flash() {
+        let cfg = format!("sdc.idle {{ dim_after = 10 }} {FLASH_PAGE}");
+        let (mut e, mut rx, _ha, _d) = setup(&cfg);
+        let t0 = Instant::now();
+        e.tick(t0 + secs(11));
+        drain_out(&mut rx);
+        assert!(press_frames(&mut e, &mut rx, 0, t0 + secs(12)).is_empty());
     }
 }

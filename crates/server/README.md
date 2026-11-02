@@ -94,11 +94,16 @@ sdc.page("home", {                -- list index = key index, row-major, key 1 (L
 sdc.default_page("home")          -- optional; default is the first page defined
 sdc.brightness(60)                -- optional; active brightness 0-100 (sent on connect and on wake)
 sdc.key_gap(18)                   -- optional; gap between keys for spans (px at 72 px keys, default 0)
+sdc.feedback(true)                -- optional; flash a key briefly after its press ran OK (default true)
 sdc.idle { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }   -- optional, seconds
 ```
 
 - Render descriptor: `text` (`\n` allowed; wraps and auto-shrinks), `bg`/`fg` (`#rgb`, `#rrggbb`),
-  `icon` and `image` (see [Icons and images](#icons-and-images)), `font_size` (px at a 72 px key, scaled with the key's size; auto-fit when absent).
+  `icon` and `image` (see [Icons and images](#icons-and-images)), `font_size` (px at a 72 px key, scaled with the key's size; auto-fit when absent),
+  `chevron = true` (a small, subtle "›" in the top-right corner to mark a key that changes page; it does not affect the layout).
+- Press feedback: after a `press` handler finishes without a Lua error, the key shows a white ring for 400 ms (physical, browser and
+  Elgato plugin keys). Not shown for presses that only wake the display, that call `ctx.goto_page`, for buttons without `press`, for
+  spans, or when turned off globally with `sdc.feedback(false)` or per button with `feedback = false` in `sdc.button{}`.
 - `ctx`: `client_id`, `key` (0-based), `page`, `rows`, `cols`, `goto_page(name)`; for spans also
   `span_cols`, `span_rows` and, in `press`/`release`, `span_index` (see [Spans](#spans)).
 - `ha` (also `sdc.ha`): `ha.state(entity_id)` and fire-and-forget `ha.call(domain, service, data)`.

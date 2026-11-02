@@ -42,8 +42,17 @@ pub struct ButtonDef {
     render: Value,
     press: Option<Function>,
     release: Option<Function>,
+    /// `feedback = false` turns the press flash off for this button.
+    pub feedback: bool,
     /// Set for `sdc.span{...}`: the button covers a rectangle of keys.
     pub span: Option<SpanDef>,
+}
+
+impl ButtonDef {
+    /// Whether the button has a press handler (a press without one is not worth a flash).
+    pub fn has_press(&self) -> bool {
+        self.press.is_some()
+    }
 }
 
 /// `sdc.dial{...}`: a Stream Deck + dial (plugin only, see [`Export`]).
@@ -155,6 +164,8 @@ pub struct Settings {
     pub brightness: Option<u8>,
     /// `sdc.key_gap`: default gap between keys for spans (px at 72 px keys).
     pub key_gap: Option<u32>,
+    /// `sdc.feedback`: flash a key after its press handler ran (default true).
+    pub feedback: bool,
 }
 
 impl Settings {
@@ -175,6 +186,7 @@ impl Default for Settings {
             },
             brightness: None,
             key_gap: None,
+            feedback: true,
         }
     }
 }
@@ -613,6 +625,15 @@ fn install(
 
     let reg = registry.clone();
     sdc.set(
+        "feedback",
+        lua.create_function(move |_, on: bool| {
+            reg.borrow_mut().settings.feedback = on;
+            Ok(())
+        })?,
+    )?;
+
+    let reg = registry.clone();
+    sdc.set(
         "key_gap",
         lua.create_function(move |_, px: i64| {
             let px = u32::try_from(px).ok().filter(|p| *p <= 72).ok_or_else(|| {
@@ -789,6 +810,7 @@ fn button_def(t: &Table) -> mlua::Result<ButtonDef> {
         render: t.get("render")?,
         press: t.get("press")?,
         release: t.get("release")?,
+        feedback: t.get::<Option<bool>>("feedback")?.unwrap_or(true),
         span: is_span
             .then(|| -> mlua::Result<SpanDef> {
                 Ok(SpanDef {
@@ -874,6 +896,11 @@ fn check_button_table(t: &Table, what: &str) -> mlua::Result<()> {
             )));
         }
     }
+    if !matches!(t.get::<Value>("feedback")?, Value::Nil | Value::Boolean(_)) {
+        return Err(mlua::Error::runtime(format!(
+            "{what}: 'feedback' must be true or false"
+        )));
+    }
     let r: Value = t.get("render")?;
     if !matches!(
         r,
@@ -924,6 +951,7 @@ fn parse_spec(v: &Value) -> mlua::Result<RenderSpec> {
     spec.icon = t.get("icon")?;
     spec.image = t.get("image")?;
     spec.font_size = t.get("font_size")?;
+    spec.chevron = t.get::<Option<bool>>("chevron")?.unwrap_or(false);
     Ok(spec)
 }
 

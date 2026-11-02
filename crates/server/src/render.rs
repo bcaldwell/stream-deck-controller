@@ -83,6 +83,10 @@ pub struct RenderSpec {
     /// Full-bleed picture (scaled to cover the key); text is drawn on top of it.
     pub image: Option<String>,
     pub font_size: Option<f32>,
+    /// Small "›" in the top-right corner, marking a key that changes page.
+    pub chevron: bool,
+    /// Press feedback: a white ring around the key (set by the engine, not by Lua).
+    pub flash: bool,
 }
 
 impl Default for RenderSpec {
@@ -94,6 +98,8 @@ impl Default for RenderSpec {
             icon: None,
             image: None,
             font_size: None,
+            chevron: false,
+            flash: false,
         }
     }
 }
@@ -758,6 +764,14 @@ impl Painter {
             };
             self.draw_text(&mut img, text, area, spec.fg, font_size, text_max, bottom);
         }
+        if job.span.is_none() {
+            if spec.chevron {
+                draw_chevron(&mut img);
+            }
+            if spec.flash {
+                draw_ring(&mut img);
+            }
+        }
         img
     }
 
@@ -1003,6 +1017,60 @@ fn resize_premul(src: &RgbaImage, w: u32, h: u32, straight: bool) -> RgbaImage {
 }
 
 /// Alpha-composites `over` onto `img` with its top-left corner at (`ox`, `oy`).
+/// Distance from `(px, py)` to the segment `a`-`b`.
+fn segment_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+    ((p.0 - a.0 - t * dx).powi(2) + (p.1 - a.1 - t * dy).powi(2)).sqrt()
+}
+
+/// A subtle "›" (about 12% of the key, semi-transparent white) in the top-right corner.
+fn draw_chevron(img: &mut RgbImage) {
+    let s = img.width().min(img.height()) as f32;
+    let h = s * 0.12;
+    let (x1, y0) = (img.width() as f32 - s * 0.07, s * 0.06);
+    let x0 = x1 - h * 0.5;
+    let (a, tip, b) = ((x0, y0), (x1, y0 + h / 2.0), (x0, y0 + h));
+    let half = (s * 0.025).max(0.8);
+    let (xs, xe) = ((x0 - half - 1.0).max(0.0) as u32, (x1 + half + 1.0) as u32);
+    let (ys, ye) = (
+        (y0 - half - 1.0).max(0.0) as u32,
+        (y0 + h + half + 1.0) as u32,
+    );
+    for y in ys..=ye.min(img.height() - 1) {
+        for x in xs..=xe.min(img.width() - 1) {
+            let p = (x as f32 + 0.5, y as f32 + 0.5);
+            let d = segment_dist(p, a, tip).min(segment_dist(p, tip, b));
+            let cover = (half + 0.5 - d).clamp(0.0, 1.0);
+            if cover > 0.0 {
+                blend(img.get_pixel_mut(x, y), [255, 255, 255], cover * 0.6);
+            }
+        }
+    }
+}
+
+/// White rounded ring along the key's edge (3 px at a 72 px key): the press flash.
+fn draw_ring(img: &mut RgbImage) {
+    let s = img.width().min(img.height()) as f32;
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let (thick, r) = (3.0 * s / 72.0, 9.0 * s / 72.0);
+    for y in 0..img.height() {
+        for x in 0..img.width() {
+            let (px, py) = (
+                (x as f32 + 0.5 - w / 2.0).abs(),
+                (y as f32 + 0.5 - h / 2.0).abs(),
+            );
+            let (qx, qy) = (px - (w / 2.0 - r), py - (h / 2.0 - r));
+            // signed distance to the rounded rectangle: negative inside
+            let d = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+            let cover = (0.5 - d).clamp(0.0, 1.0) * (d + thick + 0.5).clamp(0.0, 1.0);
+            if cover > 0.0 {
+                blend(img.get_pixel_mut(x, y), [255, 255, 255], cover * 0.95);
+            }
+        }
+    }
+}
+
 fn composite(img: &mut RgbImage, over: &RgbaImage, ox: i64, oy: i64) {
     for (x, y, p) in over.enumerate_pixels() {
         let (dx, dy) = (ox + x as i64, oy + y as i64);
@@ -1664,5 +1732,45 @@ mod tests {
         let (_, bottom) = y_extent(&img, |p| p.0[1] > 150 && p.0[0] < 60).unwrap();
         let (t_top, t_bottom) = y_extent(&img, |p| p.0[0] > 150 && p.0[1] > 150).unwrap();
         assert!(t_top > bottom && t_bottom < 72);
+    }
+
+    fn lit(img: &RgbImage, x0: u32, y0: u32, x1: u32, y1: u32) -> bool {
+        (y0..y1).any(|y| (x0..x1).any(|x| img.get_pixel(x, y).0[0] > 100))
+    }
+
+    #[test]
+    fn chevron_draws_in_the_top_right_corner_only() {
+        let mut r = Renderer::new(PathBuf::from("/nonexistent"));
+        let plain = RenderSpec {
+            bg: Color::BLACK,
+            ..Default::default()
+        };
+        let img = r.render_image(&plain, 72);
+        assert!(!lit(&img, 0, 0, 72, 72));
+        let img = r.render_image(
+            &RenderSpec {
+                chevron: true,
+                ..plain
+            },
+            72,
+        );
+        assert!(lit(&img, 56, 3, 70, 16), "chevron in the corner");
+        assert!(!lit(&img, 0, 0, 50, 72) && !lit(&img, 0, 20, 72, 72));
+    }
+
+    #[test]
+    fn flash_draws_a_ring_on_the_edge() {
+        let mut r = Renderer::new(PathBuf::from("/nonexistent"));
+        let spec = RenderSpec {
+            bg: Color::BLACK,
+            flash: true,
+            ..Default::default()
+        };
+        let img = r.render_image(&spec, 72);
+        assert!(
+            img.get_pixel(36, 1).0[0] > 200 && img.get_pixel(1, 36).0[0] > 200,
+            "ring on the edge"
+        );
+        assert!(img.get_pixel(36, 36).0[0] < 10, "centre untouched");
     }
 }
