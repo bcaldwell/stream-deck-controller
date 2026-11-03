@@ -1,6 +1,9 @@
-//! WebSocket server for clients (`/ws`, bearer token), the Elgato plugin (`/plugin/ws`, same
-//! token) and browser decks (`/deck/ws`, SSO).
+//! WebSocket server for clients (`/ws`), the Elgato plugin (`/plugin/ws`) and browser decks
+//! (`/deck/ws`). Authentication happens in `http.rs`; these handlers are the trust boundary for
+//! what a connection says: the hello is validated here, and so is every key index and plugin
+//! slot id, so the engine can trust the events it gets.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,60 +12,41 @@ use anyhow::{anyhow, bail, Result};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Extension, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, Stream, StreamExt};
 use sdc_protocol::{
     ClientMessage, ImageFrame, PluginClientMessage, PluginServerMessage, ServerMessage,
     PROTOCOL_VERSION,
 };
-use tokio::sync::mpsc::{self, UnboundedSender};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::clients::ClientBinaries;
 use crate::engine::{EngineEvent, Out, PluginOut};
-use crate::http::{self, DeckAuth, DeckUser};
+use crate::http::{AppState, DeckUser};
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Clone)]
-pub struct WsState {
-    pub engine: UnboundedSender<EngineEvent>,
-    pub binaries: Arc<ClientBinaries>,
-    /// Shared client token; `None` accepts everyone.
-    pub token: Option<Arc<str>>,
-    pub deck_auth: DeckAuth,
-}
+/// Slots a single plugin connection may hold.
+const MAX_SLOTS: usize = 256;
+/// Largest image a plugin slot may ask for, in px.
+const MAX_SLOT_PX: u32 = 1024;
 
 /// Upgrade handler for `/ws`.
-pub async fn upgrade(
-    State(state): State<WsState>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    if let Err(denied) = http::authorize(state.token.as_deref(), &headers) {
-        tracing::warn!("rejected websocket connection: missing or invalid client token");
-        return denied;
-    }
+pub async fn upgrade(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_conn(socket, state, None).await {
+        if let Err(e) = handle_deck(socket, state.engine, state.binaries, None).await {
             tracing::warn!("connection ended: {e:#}");
         }
     })
 }
 
-/// Upgrade handler for `/plugin/ws`: the Elgato plugin, authenticated like `/ws`.
-pub async fn plugin_upgrade(
-    State(state): State<WsState>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    if let Err(denied) = http::authorize(state.token.as_deref(), &headers) {
-        tracing::warn!("rejected plugin websocket connection: missing or invalid client token");
-        return denied;
-    }
+/// Upgrade handler for `/plugin/ws`: the Elgato plugin.
+pub async fn plugin_upgrade(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| async move {
         if let Err(e) = handle_plugin(socket, state.engine).await {
             tracing::warn!("plugin connection ended: {e:#}");
@@ -70,9 +54,9 @@ pub async fn plugin_upgrade(
     })
 }
 
-/// Upgrade handler for `/deck/ws` (already past the SSO check). Never looks at the client token.
+/// Upgrade handler for `/deck/ws` (already past the SSO check).
 pub async fn deck_upgrade(
-    State(state): State<WsState>,
+    State(state): State<AppState>,
     Extension(user): Extension<DeckUser>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -83,7 +67,7 @@ pub async fn deck_upgrade(
         return (StatusCode::FORBIDDEN, "cross-origin websocket refused\n").into_response();
     }
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_conn(socket, state, Some(user.0)).await {
+        if let Err(e) = handle_deck(socket, state.engine, state.binaries, Some(user.0)).await {
             tracing::warn!("deck connection ended: {e:#}");
         }
     })
@@ -113,10 +97,14 @@ fn web_client_id(raw: &str) -> String {
     }
 }
 
+fn text(msg: &impl Serialize) -> Result<Message> {
+    Ok(Message::Text(serde_json::to_string(msg)?.into()))
+}
+
 /// The first text message of a connection, parsed; errors if it takes longer than
 /// [`HELLO_TIMEOUT`] or the socket closes first.
-async fn read_hello<T: serde::de::DeserializeOwned>(
-    stream: &mut (impl futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin),
+async fn read_hello<T: DeserializeOwned>(
+    stream: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
 ) -> Result<T> {
     tokio::time::timeout(HELLO_TIMEOUT, async {
         loop {
@@ -132,11 +120,48 @@ async fn read_hello<T: serde::de::DeserializeOwned>(
     .map_err(|_| anyhow!("timed out waiting for hello"))?
 }
 
-/// `deck`: the SSO user of a browser connection (`/deck/ws`); `None` for a normal client.
-async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Result<()> {
-    let WsState {
-        engine, binaries, ..
-    } = state;
+/// The error to tell a client whose hello has the wrong protocol version.
+fn version_error(version: u32) -> Option<String> {
+    (version != PROTOCOL_VERSION).then(|| {
+        format!("unsupported protocol version {version}, server speaks {PROTOCOL_VERSION}")
+    })
+}
+
+/// Runs a connection after its hello: sends what arrives on `rx` (as `encode` says) and hands
+/// every message from the socket to `on_msg`, until either side closes.
+async fn pump<O, M: DeserializeOwned>(
+    mut sink: SplitSink<WebSocket, Message>,
+    mut stream: SplitStream<WebSocket>,
+    mut rx: UnboundedReceiver<O>,
+    encode: impl Fn(O) -> Result<Message>,
+    mut on_msg: impl FnMut(M),
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            out = rx.recv() => match out {
+                Some(out) => sink.send(encode(out)?).await?,
+                None => return Ok(()),
+            },
+            msg = stream.next() => match msg {
+                None | Some(Ok(Message::Close(_))) => return Ok(()),
+                Some(Err(e)) => return Err(e.into()),
+                Some(Ok(Message::Text(t))) => match serde_json::from_str(&t) {
+                    Ok(msg) => on_msg(msg),
+                    Err(e) => tracing::warn!("bad message: {e}"),
+                },
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+}
+
+/// A deck: a physical one on `/ws`, or (`web`: the SSO user) a browser on `/deck/ws`.
+async fn handle_deck(
+    ws: WebSocket,
+    engine: UnboundedSender<EngineEvent>,
+    binaries: Arc<ClientBinaries>,
+    web: Option<String>,
+) -> Result<()> {
     let (mut sink, mut stream) = ws.split();
 
     let ClientMessage::Hello {
@@ -150,56 +175,45 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
     else {
         bail!("first message was not hello");
     };
-    if protocol_version != PROTOCOL_VERSION {
-        let msg = ServerMessage::Error {
-            message: format!(
-                "unsupported protocol version {protocol_version}, server speaks {PROTOCOL_VERSION}"
-            ),
-        };
-        sink.send(Message::Text(serde_json::to_string(&msg)?.into()))
-            .await?;
-        let _ = sink.close().await;
-        bail!("client {client_id} protocol version {protocol_version} unsupported");
+    let invalid = version_error(protocol_version).or_else(|| {
+        (device.rows == 0
+            || device.cols == 0
+            || device.key_size_px == 0
+            || device.key_size_px > 1024)
+            .then(|| "invalid device info".to_string())
+    });
+    if let Some(message) = invalid {
+        sink.send(text(&ServerMessage::Error {
+            message: message.clone(),
+        })?)
+        .await?;
+        bail!("client {client_id}: {message}");
     }
-    if device.rows == 0 || device.cols == 0 || device.key_size_px == 0 || device.key_size_px > 1024
-    {
-        let msg = ServerMessage::Error {
-            message: "invalid device info".into(),
-        };
-        sink.send(Message::Text(serde_json::to_string(&msg)?.into()))
-            .await?;
-        bail!("client {client_id} sent invalid device info");
-    }
-    let client_id = if deck.is_some() {
-        web_client_id(&client_id)
-    } else {
-        client_id
+    let client_id = match &web {
+        Some(email) => {
+            let id = web_client_id(&client_id);
+            tracing::info!("{email} opened browser deck {id}");
+            id
+        }
+        None => client_id,
     };
-    if let Some(email) = &deck {
-        tracing::info!("{email} opened browser deck {client_id}");
-    }
     let key_count = device.key_count();
     // Device-ready frames only for a physical deck whose format we can produce; everyone else
     // keeps getting upright JPEGs.
-    if deck.is_some()
+    if web.is_some()
         || !device
             .native
             .is_some_and(|n| n.server_can_produce(device.key_size_px))
     {
         device.native = None;
     }
-    let native_frames = device.native.is_some();
 
-    sink.send(Message::Text(
-        serde_json::to_string(&ServerMessage::Welcome {
-            protocol_version: PROTOCOL_VERSION,
-            native_frames,
-        })?
-        .into(),
-    ))
+    sink.send(text(&ServerMessage::Welcome {
+        protocol_version: PROTOCOL_VERSION,
+        native_frames: device.native.is_some(),
+    })?)
     .await?;
-
-    let update = deck
+    let update = web
         .is_none()
         .then(|| binaries.update_for(client_target.as_deref(), client_sha256.as_deref()))
         .flatten();
@@ -208,62 +222,54 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
             "client {client_id} ({}) runs a stale binary, telling it to update",
             client_target.as_deref().unwrap_or("?")
         );
-        sink.send(Message::Text(serde_json::to_string(&update)?.into()))
-            .await?;
+        sink.send(text(&update)?).await?;
     }
 
     let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
+    let (tx, rx) = mpsc::unbounded_channel();
     let _ = engine.send(EngineEvent::ClientConnected {
-        web: deck.is_some(),
+        web: web.is_some(),
         id,
         client_id,
         device,
         want_device: device_name.filter(|d| !d.is_empty()),
         tx,
     });
-
-    let result: Result<()> = async {
-        loop {
-            tokio::select! {
-                out = rx.recv() => match out {
-                    Some(Out::Frame(f)) => sink.send(Message::Binary(ImageFrame::encode(f.key, &f.jpeg).into())).await?,
-                    Some(Out::Brightness(percent)) => {
-                        let msg = ServerMessage::Brightness { percent };
-                        sink.send(Message::Text(serde_json::to_string(&msg)?.into())).await?
-                    }
-                    None => return Ok(()),
+    let result = pump(
+        sink,
+        stream,
+        rx,
+        |out| match out {
+            Out::Frame(f) => Ok(Message::Binary(ImageFrame::encode(f.key, &f.jpeg).into())),
+            Out::Brightness(percent) => text(&ServerMessage::Brightness { percent }),
+        },
+        |msg: ClientMessage| {
+            let ev = match msg {
+                ClientMessage::KeyDown { key } if key < key_count => EngineEvent::Key {
+                    id,
+                    key,
+                    down: true,
                 },
-                msg = stream.next() => match msg {
-                    None | Some(Ok(Message::Close(_))) => return Ok(()),
-                    Some(Err(e)) => return Err(e.into()),
-                    Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMessage>(&t) {
-                        Ok(ClientMessage::KeyDown { key }) if key < key_count => {
-                            let _ = engine.send(EngineEvent::KeyDown { id, key });
-                        }
-                        Ok(ClientMessage::KeyUp { key }) if key < key_count => {
-                            let _ = engine.send(EngineEvent::KeyUp { id, key });
-                        }
-                        Ok(ClientMessage::Wake) => {
-                            let _ = engine.send(EngineEvent::Wake { id });
-                        }
-                        Ok(_) => tracing::debug!("ignoring unexpected client message"),
-                        Err(e) => tracing::warn!("bad client message: {e}"),
-                    },
-                    Some(Ok(_)) => {}
+                ClientMessage::KeyUp { key } if key < key_count => EngineEvent::Key {
+                    id,
+                    key,
+                    down: false,
                 },
-            }
-        }
-    }
+                ClientMessage::Wake => EngineEvent::Wake { id },
+                // another hello, or a key the deck does not have
+                _ => return,
+            };
+            let _ = engine.send(ev);
+        },
+    )
     .await;
-
     let _ = engine.send(EngineEvent::ClientDisconnected(id));
     result
 }
 
-fn plugin_json(out: PluginOut) -> serde_json::Result<String> {
+fn plugin_json(out: PluginOut) -> Result<Message> {
     let b64 = |png: Vec<u8>| BASE64.encode(png);
-    serde_json::to_string(&match out {
+    text(&match out {
         PluginOut::Exports(items) => PluginServerMessage::Exports { items },
         PluginOut::KeyImage { slot, png } => PluginServerMessage::KeyImage {
             slot,
@@ -288,7 +294,6 @@ fn plugin_json(out: PluginOut) -> serde_json::Result<String> {
 
 async fn handle_plugin(ws: WebSocket, engine: UnboundedSender<EngineEvent>) -> Result<()> {
     let (mut sink, mut stream) = ws.split();
-    let send = |m: &PluginServerMessage| serde_json::to_string(m).map(|j| Message::Text(j.into()));
 
     let PluginClientMessage::PluginHello {
         protocol_version,
@@ -297,49 +302,73 @@ async fn handle_plugin(ws: WebSocket, engine: UnboundedSender<EngineEvent>) -> R
     else {
         bail!("first message was not plugin_hello");
     };
-    if protocol_version != PROTOCOL_VERSION {
-        let msg = PluginServerMessage::Error {
-            message: format!(
-                "unsupported protocol version {protocol_version}, server speaks {PROTOCOL_VERSION}"
-            ),
-        };
-        sink.send(send(&msg)?).await?;
-        let _ = sink.close().await;
-        bail!("plugin {client_id} protocol version {protocol_version} unsupported");
+    if let Some(message) = version_error(protocol_version) {
+        sink.send(text(&PluginServerMessage::Error {
+            message: message.clone(),
+        })?)
+        .await?;
+        bail!("plugin {client_id}: {message}");
     }
-    sink.send(send(&PluginServerMessage::PluginWelcome {
+    sink.send(text(&PluginServerMessage::PluginWelcome {
         protocol_version: PROTOCOL_VERSION,
     })?)
     .await?;
 
     let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
-    let (tx, mut rx) = mpsc::unbounded_channel::<PluginOut>();
-    let _ = engine.send(EngineEvent::PluginConnected { id, client_id, tx });
-
-    let result: Result<()> = async {
-        loop {
-            tokio::select! {
-                out = rx.recv() => match out {
-                    Some(out) => sink.send(Message::Text(plugin_json(out)?.into())).await?,
-                    None => return Ok(()),
-                },
-                msg = stream.next() => match msg {
-                    None | Some(Ok(Message::Close(_))) => return Ok(()),
-                    Some(Err(e)) => return Err(e.into()),
-                    Some(Ok(Message::Text(t))) => match serde_json::from_str::<PluginClientMessage>(&t) {
-                        Ok(PluginClientMessage::PluginHello { .. }) => {}
-                        Ok(msg) => {
-                            let _ = engine.send(EngineEvent::Plugin { id, msg });
-                        }
-                        Err(e) => tracing::warn!("bad plugin message: {e}"),
-                    },
-                    Some(Ok(_)) => {}
-                },
+    let (tx, rx) = mpsc::unbounded_channel();
+    let _ = engine.send(EngineEvent::PluginConnected {
+        id,
+        client_id,
+        tx: tx.clone(),
+    });
+    // The slots this connection subscribed: input for any other slot is dropped here.
+    let mut slots = HashSet::new();
+    let result = pump(sink, stream, rx, plugin_json, |msg: PluginClientMessage| {
+        use PluginClientMessage as M;
+        match &msg {
+            M::PluginHello { .. } => return,
+            M::ListExports => {}
+            M::Subscribe { slot, size_px, .. } => {
+                let reject = if !(1..=MAX_SLOT_PX).contains(size_px) {
+                    Some(format!("size_px {size_px} is not 1-{MAX_SLOT_PX}"))
+                } else if slots.len() >= MAX_SLOTS && !slots.contains(slot) {
+                    Some(format!("more than {MAX_SLOTS} slots"))
+                } else {
+                    None
+                };
+                if let Some(message) = reject {
+                    // The rejected slot loses whatever it showed before.
+                    if slots.remove(slot) {
+                        let msg = M::Unsubscribe { slot: slot.clone() };
+                        let _ = engine.send(EngineEvent::Plugin { id, msg });
+                    }
+                    let _ = tx.send(PluginOut::SlotError {
+                        slot: slot.clone(),
+                        message,
+                    });
+                    return;
+                }
+                slots.insert(slot.clone());
+            }
+            M::Unsubscribe { slot } => {
+                if !slots.remove(slot) {
+                    return;
+                }
+            }
+            M::SlotDown { slot }
+            | M::SlotUp { slot }
+            | M::DialRotate { slot, .. }
+            | M::DialDown { slot }
+            | M::DialUp { slot }
+            | M::TouchTap { slot } => {
+                if !slots.contains(slot) {
+                    return;
+                }
             }
         }
-    }
+        let _ = engine.send(EngineEvent::Plugin { id, msg });
+    })
     .await;
-
     let _ = engine.send(EngineEvent::PluginDisconnected(id));
     result
 }

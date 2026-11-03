@@ -167,14 +167,13 @@
   // ---- layout ----
   let caps = [], imgs = [];
   function build() {
-    const r = OWN_ROWS, c = OWN_COLS;
     keysEl.textContent = "";
     caps = []; imgs = [];
-    keysEl.style.gridTemplate = `repeat(${r}, ${KEY}px) / repeat(${c}, ${KEY}px)`;
+    keysEl.style.gridTemplate = `repeat(${OWN_ROWS}, ${KEY}px) / repeat(${OWN_COLS}, ${KEY}px)`;
     keysEl.style.gap = GAP + "px";
     keysEl.style.left = PAD + "px";
     keysEl.style.top = PAD + "px";
-    for (let i = 0; i < r * c; i++) {
+    for (let i = 0; i < OWN_ROWS * OWN_COLS; i++) {
       const well = document.createElement("div");
       well.className = "well key";
       const cap = document.createElement("div");
@@ -185,7 +184,7 @@
       cap.appendChild(img); well.appendChild(cap); keysEl.appendChild(well);
       caps.push(well); imgs.push(img);
     }
-    const w = PAD * 2 + c * KEY + (c - 1) * GAP, h = PAD + r * KEY + (r - 1) * GAP + BEZEL;
+    const w = PAD * 2 + OWN_COLS * KEY + (OWN_COLS - 1) * GAP, h = PAD + OWN_ROWS * KEY + (OWN_ROWS - 1) * GAP + BEZEL;
     deckEl.style.width = w + "px"; deckEl.style.height = h + "px";
     deckEl.dataset.w = w; deckEl.dataset.h = h;
     fit();
@@ -222,7 +221,7 @@
     if (!pressed.has(e.pointerId)) return;
     const k = pressed.get(e.pointerId);
     pressed.delete(e.pointerId);
-    if (caps[k]) caps[k].classList.remove("down");
+    caps[k].classList.remove("down");
     send({ type: "key_up", key: k });
   }
   function releaseAll() { for (const id of [...pressed.keys()]) up({ pointerId: id }); }
@@ -265,14 +264,13 @@
     sock.onmessage = (ev) => {
       if (my !== gen) return;
       if (typeof ev.data === "string") {
-        let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+        const m = JSON.parse(ev.data);
         if (m.type === "welcome") { retry = 0; setStatus(true); }
         else if (m.type === "brightness") setBrightness(m.percent);
         else if (m.type === "error") toast(m.message);
         return;
       }
       const buf = new Uint8Array(ev.data);
-      if (buf.length < 2) return;
       showFrame(buf[0], new Blob([buf.subarray(1)], { type: "image/jpeg" }));
     };
     sock.onclose = () => {
@@ -292,11 +290,9 @@
   }
 
   function showFrame(k, blob) {
-    const img = imgs[k];
-    if (!img) return;
     const url = URL.createObjectURL(blob), old = urls[k];
     urls[k] = url;
-    img.src = url;
+    imgs[k].src = url;
     if (old) URL.revokeObjectURL(old);
   }
   function setBrightness(p) {

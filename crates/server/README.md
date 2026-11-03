@@ -30,10 +30,11 @@ states (or the fake ones from `--states`, a JSON list of `{entity_id, state, att
 | `SDC_ASSETS_S3_ACCESS_KEY_ID` / `SDC_ASSETS_S3_SECRET_ACCESS_KEY` | - | Credentials (read access is enough). All four non-region vars are needed to enable S3 |
 | `RUST_LOG`   | `info`           | tracing filter |
 
-Without `HA_URL`/`HA_TOKEN` (or if HA is down) the server still serves clients; `ha.state` returns
-`nil` and `ha.call` is dropped. The HA connection reconnects with backoff and reseeds all states.
-The config file is hot-reloaded on save; a config that fails to load is logged and the previous one
-stays active.
+The server refuses to start without `HA_URL`/`HA_TOKEN` or with a config that does not load (so a bad
+deploy never replaces a working one). If HA goes down later the server keeps serving clients;
+`ha.state` returns `nil` and `ha.call` is dropped. The HA connection reconnects with backoff and
+reseeds all states. The config file is hot-reloaded on save; a config that fails to load is logged
+and the previous one stays active.
 
 ## HTTP endpoints and client updates
 
@@ -149,6 +150,5 @@ shows the red `ERR` tile on its keys (as does a Lua error in its `render`). Pres
 
 ## Layout
 
-`ha.rs` HA websocket client (channel boundary), `engine.rs` event loop / per-client state /
-dependency map, `lua_api.rs` Lua bindings, `render.rs` JPEG key renderer (embedded Open Sans, OFL;
-see `assets/OFL.txt`), `assets.rs` image sources (files, URLs, S3 presigning) and the background fetcher, `ws.rs` client and plugin WebSockets, `engine/plugin.rs` plugin slots (subscriptions, per-slot dependencies), `http.rs` routes (client downloads, health) and token check, `clients.rs` distributed binaries, `watch.rs` hot reload, `preview.rs` `render` command.
+`ha.rs` HA websocket client (channel boundary), `engine.rs` event loop / clients, `engine/target.rs` render targets (decks' keys and plugin slots: rendering, dependency map, change detection, flash, presses), `lua_api.rs` Lua bindings, `render.rs` JPEG key renderer (embedded Open Sans, OFL;
+see `assets/OFL.txt`), `assets.rs` image sources (files, URLs, S3 presigning) and the background fetcher, `ws.rs` client and plugin WebSockets, `engine/plugin.rs` plugin connections and slots, `http.rs` routes (client downloads, health) and token check, `clients.rs` distributed binaries, `watch.rs` hot reload, `preview.rs` `render` command.

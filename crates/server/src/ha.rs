@@ -54,11 +54,15 @@ impl HaConfig {
         }
     }
 
-    /// Reads `HA_URL` / `HA_TOKEN`; `None` if either is unset.
-    pub fn from_env() -> Option<Self> {
-        let url = std::env::var("HA_URL").ok().filter(|s| !s.is_empty())?;
-        let token = std::env::var("HA_TOKEN").ok().filter(|s| !s.is_empty())?;
-        Some(Self::new(&url, &token))
+    /// Reads `HA_URL` / `HA_TOKEN`; both are required.
+    pub fn from_env() -> Result<Self> {
+        let var = |name| {
+            std::env::var(name)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .with_context(|| format!("{name} is not set"))
+        };
+        Ok(Self::new(&var("HA_URL")?, &var("HA_TOKEN")?))
     }
 }
 

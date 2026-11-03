@@ -1,7 +1,7 @@
 //! `sdc-server render`: render a page to PNGs without any hardware.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use image::{Rgb, RgbImage};
@@ -28,8 +28,7 @@ pub async fn run(
     let (ha_cmd_tx, ha_cmd_rx) = mpsc::unbounded_channel();
     // Image downloads report back here; unlike the server, we wait for them below.
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
-    let mut engine = Engine::new(config, ha_cmd_tx, Handle::current(), &ev_tx);
-    engine.reload()?;
+    let mut engine = Engine::new(config, ha_cmd_tx, Handle::current(), &ev_tx)?;
 
     if let Some(cfg) = ha_cfg {
         tokio::spawn(ha::run(cfg, ha_cmd_rx, ev_tx.clone()));
@@ -37,7 +36,7 @@ pub async fn run(
         let seeded = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(ev) = ev_rx.recv().await {
                 let is_seed = matches!(ev, EngineEvent::Ha(HaEvent::Seed(_)));
-                engine.handle(ev);
+                engine.handle(ev, Instant::now());
                 if is_seed {
                     return true;
                 }
@@ -52,7 +51,7 @@ pub async fn run(
 
     if let Some(f) = states {
         let states: Vec<ha::EntityState> = serde_json::from_slice(&std::fs::read(&f)?)?;
-        engine.handle(EngineEvent::Ha(HaEvent::Seed(states)));
+        engine.handle(EngineEvent::Ha(HaEvent::Seed(states)), Instant::now());
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -64,14 +63,17 @@ pub async fn run(
         key_size_px: KEY_PX,
         native: None,
     };
-    engine.handle(EngineEvent::ClientConnected {
-        web: false,
-        id: 1,
-        client_id: "preview".into(),
-        device,
-        want_device: None,
-        tx,
-    });
+    engine.handle(
+        EngineEvent::ClientConnected {
+            web: false,
+            id: 1,
+            client_id: "preview".into(),
+            device,
+            want_device: None,
+            tx,
+        },
+        Instant::now(),
+    );
     if let Some(p) = &page {
         engine.show_page(1, p);
     }
@@ -79,7 +81,7 @@ pub async fn run(
     let waited = tokio::time::timeout(FETCH_WAIT, async {
         while engine.pending_fetches() > 0 {
             match ev_rx.recv().await {
-                Some(ev) => engine.handle(ev),
+                Some(ev) => engine.handle(ev, Instant::now()),
                 None => break,
             }
         }

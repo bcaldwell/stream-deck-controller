@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
             config_path(config)?,
             &out,
             page,
-            HaConfig::from_env(),
+            HaConfig::from_env().ok(),
             states,
         )
         .await;
@@ -79,18 +79,12 @@ async fn main() -> Result<()> {
     let config = config_path(cli.config)?;
     let listen = std::env::var("SDC_LISTEN").unwrap_or_else(|_| "0.0.0.0:7700".into());
 
+    // Without Home Assistant there is nothing to show: fail like a bad config would.
+    let ha_cfg = HaConfig::from_env()?;
     let (ha_tx, ha_rx) = mpsc::unbounded_channel();
-    let engine_tx = engine::spawn(config.clone(), ha_tx);
-    match HaConfig::from_env() {
-        Some(cfg) => {
-            // Bridge HA events into the engine; the HA task reconnects on its own.
-            tokio::spawn(ha::run(cfg, ha_rx, engine_tx.clone()));
-        }
-        None => {
-            tracing::warn!("HA_URL/HA_TOKEN not set: running without home assistant");
-            drop(ha_rx);
-        }
-    }
+    let engine_tx = engine::spawn(config.clone(), ha_tx)?;
+    // Bridge HA events into the engine; the HA task reconnects on its own.
+    tokio::spawn(ha::run(ha_cfg, ha_rx, engine_tx.clone()));
     let _watcher = watch::spawn(&config, engine_tx.clone())
         .inspect_err(|e| tracing::warn!("config hot reload disabled: {e:#}"))
         .ok();

@@ -83,49 +83,49 @@ fn device() -> DeviceInfo {
     }
 }
 
+/// How a test server differs from the default: the default config, no client binaries, no token.
+struct Server<'a> {
+    config: &'a str,
+    binaries: ClientBinaries,
+    token: Option<&'a str>,
+    deck_auth: http::DeckAuth,
+}
+
+impl Default for Server<'_> {
+    fn default() -> Self {
+        Server {
+            config: CONFIG,
+            binaries: ClientBinaries::default(),
+            token: None,
+            deck_auth: http::DeckAuth::Sso,
+        }
+    }
+}
+
 async fn start_server(
     tag: &str,
     ha_tx: UnboundedSender<HaCommand>,
 ) -> (UnboundedSender<EngineEvent>, String, TempDir) {
-    start_server_with(tag, ha_tx, ClientBinaries::default()).await
+    start_server_with(tag, ha_tx, Server::default()).await
 }
 
 async fn start_server_with(
     tag: &str,
     ha_tx: UnboundedSender<HaCommand>,
-    binaries: ClientBinaries,
-) -> (UnboundedSender<EngineEvent>, String, TempDir) {
-    start_server_full(tag, ha_tx, binaries, None).await
-}
-
-async fn start_server_full(
-    tag: &str,
-    ha_tx: UnboundedSender<HaCommand>,
-    binaries: ClientBinaries,
-    token: Option<&str>,
-) -> (UnboundedSender<EngineEvent>, String, TempDir) {
-    start_server_deck(tag, ha_tx, binaries, token, http::DeckAuth::Sso).await
-}
-
-async fn start_server_deck(
-    tag: &str,
-    ha_tx: UnboundedSender<HaCommand>,
-    binaries: ClientBinaries,
-    token: Option<&str>,
-    deck_auth: http::DeckAuth,
+    server: Server<'_>,
 ) -> (UnboundedSender<EngineEvent>, String, TempDir) {
     let dir = TempDir::new(tag);
     let cfg = dir.0.join("config.lua");
-    std::fs::write(&cfg, CONFIG).unwrap();
-    let engine_tx = engine::spawn(cfg, ha_tx);
+    std::fs::write(&cfg, server.config).unwrap();
+    let engine_tx = engine::spawn(cfg, ha_tx).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
     tokio::spawn(http::serve(
         listener,
         engine_tx.clone(),
-        Arc::new(binaries),
-        token.map(Into::into),
-        deck_auth,
+        Arc::new(server.binaries),
+        server.token.map(Into::into),
+        server.deck_auth,
     ));
     (engine_tx, url, dir)
 }
@@ -333,8 +333,15 @@ async fn http_get_auth(ws_url: &str, path: &str, auth: Option<&str>) -> (u16, Ve
 async fn serves_clients_and_health() {
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
     let bin = b"\x7fELF fake client";
-    let (_e, url, _dir) =
-        start_server_with("http", ha_tx, ClientBinaries::with("aarch64-linux", bin)).await;
+    let (_e, url, _dir) = start_server_with(
+        "http",
+        ha_tx,
+        Server {
+            binaries: ClientBinaries::with("aarch64-linux", bin),
+            ..Server::default()
+        },
+    )
+    .await;
 
     let (st, body) = http_get(&url, "/client/aarch64-linux").await;
     assert_eq!((st, body.as_slice()), (200, &bin[..]));
@@ -368,11 +375,14 @@ async fn ws_handshake_status(url: &str, auth: Option<&str>) -> u16 {
 async fn client_token_guards_ws_and_client_downloads() {
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
     let bin = b"\x7fELF fake client";
-    let (_e, url, _dir) = start_server_full(
+    let (_e, url, _dir) = start_server_with(
         "token",
         ha_tx,
-        ClientBinaries::with("aarch64-linux", bin),
-        Some("s3cret"),
+        Server {
+            binaries: ClientBinaries::with("aarch64-linux", bin),
+            token: Some("s3cret"),
+            ..Server::default()
+        },
     )
     .await;
 
@@ -437,8 +447,15 @@ async fn no_token_configured_allows_everyone() {
 async fn stale_client_gets_update_after_welcome() {
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
     let bin = b"new client";
-    let (_e, url, _dir) =
-        start_server_with("stale", ha_tx, ClientBinaries::with("aarch64-linux", bin)).await;
+    let (_e, url, _dir) = start_server_with(
+        "stale",
+        ha_tx,
+        Server {
+            binaries: ClientBinaries::with("aarch64-linux", bin),
+            ..Server::default()
+        },
+    )
+    .await;
 
     let mut c = connect_as(&url, Some("aarch64-linux"), Some("deadbeef")).await;
     match next_msg(&mut c).await {
@@ -459,8 +476,15 @@ async fn stale_client_gets_update_after_welcome() {
 async fn up_to_date_unknown_and_old_clients_get_no_update() {
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
     let bin = b"new client";
-    let (_e, url, _dir) =
-        start_server_with("fresh", ha_tx, ClientBinaries::with("aarch64-linux", bin)).await;
+    let (_e, url, _dir) = start_server_with(
+        "fresh",
+        ha_tx,
+        Server {
+            binaries: ClientBinaries::with("aarch64-linux", bin),
+            ..Server::default()
+        },
+    )
+    .await;
 
     let same = sha256_hex(bin);
     for (target, sha) in [
@@ -638,20 +662,14 @@ async fn start_deck_server_with(
     token: Option<&str>,
     deck_auth: http::DeckAuth,
 ) -> (String, TempDir) {
-    let dir = TempDir::new(tag);
-    let cfg = dir.0.join("config.lua");
-    std::fs::write(&cfg, config).unwrap();
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
-    let engine_tx = engine::spawn(cfg, ha_tx);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    tokio::spawn(http::serve(
-        listener,
-        engine_tx,
-        Arc::new(ClientBinaries::default()),
-        token.map(Into::into),
+    let server = Server {
+        config,
+        token,
         deck_auth,
-    ));
+        ..Server::default()
+    };
+    let (_engine, url, dir) = start_server_with(tag, ha_tx, server).await;
     (url, dir)
 }
 
@@ -924,11 +942,13 @@ fn png_size(b64: &str) -> (u32, u32) {
 #[tokio::test]
 async fn plugin_ws_uses_the_client_token() {
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
-    let (_e, url, _dir) = start_server_full(
+    let (_e, url, _dir) = start_server_with(
         "plugin-token",
         ha_tx,
-        ClientBinaries::default(),
-        Some("s3cret"),
+        Server {
+            token: Some("s3cret"),
+            ..Server::default()
+        },
     )
     .await;
     let url = plugin_url(&url);

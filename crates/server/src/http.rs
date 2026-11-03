@@ -19,19 +19,19 @@
 
 use std::sync::Arc;
 
-use axum::extract::Request;
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Path, Request, State};
+use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::clients::ClientBinaries;
-use crate::engine::{DeviceListing, EngineEvent};
-use crate::ws::{self, WsState};
+use crate::engine::EngineEvent;
+use crate::ws;
 
 /// How `/deck` routes are authenticated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +57,18 @@ impl DeckAuth {
 pub struct DeckUser(pub String);
 
 const AUTH_EMAIL_HEADER: &str = "x-auth-request-email";
+const NO_STORE: (header::HeaderName, &str) = (header::CACHE_CONTROL, "no-store");
+
+#[derive(Clone)]
+pub struct AppState {
+    pub engine: UnboundedSender<EngineEvent>,
+    pub binaries: Arc<ClientBinaries>,
+}
+
+/// A static page served as is.
+fn page(content_type: &'static str, body: &'static str) -> axum::routing::MethodRouter<AppState> {
+    get(move || async move { ([(header::CONTENT_TYPE, content_type), NO_STORE], body) })
+}
 
 /// `token`: the shared client token (`None` allows everyone).
 pub fn router(
@@ -65,26 +77,42 @@ pub fn router(
     token: Option<String>,
     deck_auth: DeckAuth,
 ) -> Router {
+    let html = || {
+        page(
+            "text/html; charset=utf-8",
+            include_str!("../assets/deck.html"),
+        )
+    };
     let deck = Router::new()
-        .route("/deck", get(deck_page))
-        .route("/deck/", get(deck_page))
-        .route("/deck/manifest.webmanifest", get(deck_manifest))
-        .route("/deck/icon.svg", get(deck_icon))
+        .route("/deck", html())
+        .route("/deck/", html())
+        .route(
+            "/deck/manifest.webmanifest",
+            page(
+                "application/manifest+json",
+                include_str!("../assets/deck.webmanifest"),
+            ),
+        )
+        .route(
+            "/deck/icon.svg",
+            page("image/svg+xml", include_str!("../assets/deck-icon.svg")),
+        )
         .route("/deck/ws", get(ws::deck_upgrade))
         .route("/deck/api/devices", get(deck_devices))
         .route_layer(middleware::from_fn_with_state(deck_auth, deck_guard));
-    Router::new()
+    let clients = Router::new()
         .route("/ws", get(ws::upgrade))
         .route("/plugin/ws", get(ws::plugin_upgrade))
         .route("/client/{file}", get(client_file))
+        .route_layer(middleware::from_fn_with_state(
+            token.map(Arc::<str>::from),
+            client_guard,
+        ));
+    Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .merge(clients)
         .merge(deck)
-        .with_state(WsState {
-            engine,
-            binaries,
-            token: token.map(Into::into),
-            deck_auth,
-        })
+        .with_state(AppState { engine, binaries })
 }
 
 pub async fn serve(
@@ -99,24 +127,29 @@ pub async fn serve(
     }
 }
 
-/// `Ok` if no token is required or `headers` carry `Authorization: Bearer <token>`;
-/// otherwise the 401 response to send.
-#[allow(clippy::result_large_err)]
-pub fn authorize(token: Option<&str>, headers: &HeaderMap) -> Result<(), Response> {
-    let Some(want) = token else { return Ok(()) };
-    let got = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if got.is_some_and(|g| constant_time_eq(g.as_bytes(), want.as_bytes())) {
-        return Ok(());
+/// Requires `Authorization: Bearer <token>` on `/ws`, `/plugin/ws` and `/client/*` when a token
+/// is configured.
+async fn client_guard(State(token): State<Option<Arc<str>>>, req: Request, next: Next) -> Response {
+    if let Some(want) = &token {
+        let got = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if !got.is_some_and(|g| constant_time_eq(g.as_bytes(), want.as_bytes())) {
+            tracing::warn!(
+                "rejected {}: missing or invalid client token",
+                req.uri().path()
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                "missing or invalid client token\n",
+            )
+                .into_response();
+        }
     }
-    Err((
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
-        "missing or invalid client token\n",
-    )
-        .into_response())
+    next.run(req).await
 }
 
 /// Requires the SSO header on `/deck` routes and records the user for the handlers.
@@ -138,50 +171,24 @@ async fn deck_guard(State(auth): State<DeckAuth>, mut req: Request, next: Next) 
     next.run(req).await
 }
 
-const NO_STORE: (header::HeaderName, &str) = (header::CACHE_CONTROL, "no-store");
-
-async fn deck_page() -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            NO_STORE,
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-        ],
-        include_str!("../assets/deck.html"),
-    )
-        .into_response()
-}
-
-async fn deck_manifest() -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "application/manifest+json"),
-            NO_STORE,
-        ],
-        include_str!("../assets/deck.webmanifest"),
-    )
-        .into_response()
-}
-
-async fn deck_icon() -> Response {
-    (
-        [(header::CONTENT_TYPE, "image/svg+xml")],
-        include_str!("../assets/deck-icon.svg"),
-    )
-        .into_response()
-}
-
 /// The config's `sdc.device`s for the browser deck's layout choice.
-async fn deck_devices(State(state): State<WsState>) -> Response {
+async fn deck_devices(State(state): State<AppState>) -> Response {
     let (tx, rx) = tokio::sync::oneshot::channel();
     if state.engine.send(EngineEvent::ListDevices(tx)).is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let devices: Vec<DeviceListing> = rx.await.unwrap_or_default();
-    match serde_json::to_string(&devices) {
-        Ok(body) => ([(header::CONTENT_TYPE, "application/json"), NO_STORE], body).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    let Ok(devices) = rx.await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let devices: Vec<_> = devices
+        .into_iter()
+        .map(|d| json!({ "name": d.name, "pages": d.pages, "home": d.home }))
+        .collect();
+    (
+        [(header::CONTENT_TYPE, "application/json"), NO_STORE],
+        json!(devices).to_string(),
+    )
+        .into_response()
 }
 
 /// Equality that does not stop at the first differing byte (the length is not secret).
@@ -189,14 +196,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
-async fn client_file(
-    State(state): State<WsState>,
-    headers: HeaderMap,
-    Path(file): Path<String>,
-) -> Response {
-    if let Err(denied) = authorize(state.token.as_deref(), &headers) {
-        return denied;
-    }
+async fn client_file(State(state): State<AppState>, Path(file): Path<String>) -> Response {
     let (target, want_hash) = match file.strip_suffix(".sha256") {
         Some(t) => (t, true),
         None => (file.as_str(), false),
@@ -222,19 +222,5 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(constant_time_eq(b"", b""));
-    }
-
-    #[test]
-    fn authorize_requires_exact_bearer() {
-        let with = |v: &str| {
-            let mut h = HeaderMap::new();
-            h.insert(header::AUTHORIZATION, v.parse().unwrap());
-            h
-        };
-        assert!(authorize(None, &HeaderMap::new()).is_ok());
-        assert!(authorize(Some("s3cret"), &with("Bearer s3cret")).is_ok());
-        assert!(authorize(Some("s3cret"), &with("Bearer nope")).is_err());
-        assert!(authorize(Some("s3cret"), &with("s3cret")).is_err());
-        assert!(authorize(Some("s3cret"), &HeaderMap::new()).is_err());
     }
 }

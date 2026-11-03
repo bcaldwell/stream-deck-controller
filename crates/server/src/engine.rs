@@ -1,6 +1,11 @@
-//! The engine: owns the Lua state (which is `!Send`), per-client state and the
-//! entity -> key dependency map. It runs on a dedicated thread and is driven by
-//! [`EngineEvent`]s; rendered frames go out through per-client channels.
+//! The engine: owns the Lua state (which is `!Send`) and everything shown. It runs on a dedicated
+//! thread and is driven by [`EngineEvent`]s. Three parts:
+//!
+//! - connections: decks ([`Client`]s, with power and page state) and Elgato plugins
+//!   ([`plugin`]), each with a channel its output goes out on;
+//! - render targets ([`target`]): the keys of every deck and the slots of every plugin share one
+//!   implementation of rendering, dependency tracking, change detection, flash and presses;
+//! - events: what happened (a key, a Home Assistant change, a reload, time passing).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,17 +16,20 @@ use anyhow::Result;
 use image::RgbaImage;
 use sdc_protocol::{device_type, DeviceInfo, PluginClientMessage};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedSender, WeakUnboundedSender};
 
 use crate::assets::{Assets, Fetcher, HaApi, S3Config};
 use crate::ha::{HaCommand, HaEvent};
-use crate::lua_api::{Cell, CtxInfo, DeviceDef, Host, IdleConfig, LuaRuntime, SpanCell};
-use crate::render::{encode_all, Color, Encoding, Grid, RenderSpec, Renderer};
+use crate::lua_api::{Cell, DeviceDef, Host, LuaRuntime};
+use crate::render::Renderer;
 
 mod plugin;
+mod target;
 
+use plugin::Plugin;
 pub use plugin::PluginOut;
-use plugin::{Plugin, SlotDeps};
+pub use target::TargetId;
+use target::{Deps, Target};
 
 pub type ClientId = u64;
 
@@ -40,18 +48,8 @@ pub enum Out {
     Brightness(u8),
 }
 
-/// A configured device, for the browser deck's layout choice (`GET /deck/api/devices`).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct DeviceListing {
-    pub name: String,
-    pub pages: Vec<String>,
-    pub home: String,
-}
-
 /// How often the engine checks clients for idleness.
 const TICK: Duration = Duration::from_secs(1);
-/// How long a key shows the press flash.
-const FLASH: Duration = Duration::from_millis(400);
 
 /// Display state of a client; only ever left by a tick (dim/off) or a key press (wake).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +59,8 @@ enum Power {
     Off,
 }
 
+/// Everything the engine reacts to. Connections are trusted to have checked their input: the
+/// client or plugin exists, key indices are in range, plugin slots are subscribed.
 pub enum EngineEvent {
     ClientConnected {
         /// A browser deck rather than a physical one (only shown differently in listings).
@@ -73,10 +73,14 @@ pub enum EngineEvent {
         tx: UnboundedSender<Out>,
     },
     ClientDisconnected(ClientId),
-    /// Redraw one plugin slot (a dial whose turn has settled, see [`crate::lua_api::DIAL_SETTLE`]).
-    RedrawSlot {
+    Key {
         id: ClientId,
-        slot: String,
+        key: u8,
+        down: bool,
+    },
+    /// The client woke from USB suspend: a wake-only key press (no button runs).
+    Wake {
+        id: ClientId,
     },
     /// An Elgato plugin connected on `/plugin/ws`; it gets the export list right away.
     PluginConnected {
@@ -90,20 +94,11 @@ pub enum EngineEvent {
         id: ClientId,
         msg: PluginClientMessage,
     },
+    /// Render a target again (a flash is over, a dial's turn has settled). The target may have
+    /// gone away since this was scheduled.
+    Redraw(TargetId),
     /// The config's `sdc.device`s, for the browser deck's layout choice.
-    ListDevices(tokio::sync::oneshot::Sender<Vec<DeviceListing>>),
-    KeyDown {
-        id: ClientId,
-        key: u8,
-    },
-    KeyUp {
-        id: ClientId,
-        key: u8,
-    },
-    /// The client woke from USB suspend: a wake-only key press (no button runs).
-    Wake {
-        id: ClientId,
-    },
+    ListDevices(tokio::sync::oneshot::Sender<Vec<DeviceDef>>),
     Ha(HaEvent),
     /// A background image download finished (key: the renderer's cache key).
     ImageFetched {
@@ -118,41 +113,12 @@ pub enum EngineEvent {
 /// What is kept of a client that went away: page, last key press, device name.
 type Remembered = (String, Instant, String);
 
-/// What a client's `sdc.device` allows.
-#[derive(Clone)]
-struct Policy {
-    /// Start page, also where `home_after` leads.
-    home: String,
-    /// Pages the client may show.
-    pages: Vec<String>,
-    idle: IdleConfig,
-    brightness: u8,
-    /// Name of the `sdc.device`.
-    device: String,
-}
-
-impl Policy {
-    fn allows(&self, page: &str) -> bool {
-        self.pages.iter().any(|n| n == page)
-    }
-
+impl DeviceDef {
     fn level(&self, power: Power) -> u8 {
         match power {
             Power::Active => self.brightness,
             Power::Dim => self.idle.dim_brightness,
             Power::Off => 0,
-        }
-    }
-}
-
-impl From<DeviceDef> for Policy {
-    fn from(d: DeviceDef) -> Self {
-        Policy {
-            home: d.home,
-            pages: d.pages,
-            idle: d.idle,
-            brightness: d.brightness,
-            device: d.name,
         }
     }
 }
@@ -173,9 +139,13 @@ struct Client {
     /// `Hello.device_name`; kept to re-resolve the device on config reload.
     want_device: Option<String>,
     /// The `sdc.device` in effect.
-    policy: Policy,
+    def: DeviceDef,
     tx: UnboundedSender<Out>,
     page: String,
+    /// What each key shows on `page`.
+    cells: Vec<Cell>,
+    /// One render target per key.
+    keys: Vec<Target>,
     /// Last key press (or connect): drives dim/off.
     last_activity: Instant,
     /// Last key press, carried across reconnects: drives `home_after`.
@@ -183,77 +153,86 @@ struct Client {
     power: Power,
     /// Keys whose press woke the display: their release is swallowed too.
     swallow_up: HashSet<u8>,
-    /// Last image bytes sent per key, to suppress identical frames.
-    sent: Vec<Option<Vec<u8>>>,
+}
+
+impl Client {
+    /// Recomputes `cells` (after the page or the config changed).
+    fn layout(&mut self, rt: &LuaRuntime) {
+        self.cells = rt.layout(&self.page, self.device.rows, self.device.cols);
+    }
+
+    fn set_page(&mut self, rt: &LuaRuntime, page: &str) {
+        self.page = page.to_string();
+        self.layout(rt);
+        for key in &mut self.keys {
+            key.flash_until = None;
+        }
+    }
+
+    fn key_ids(&self, id: ClientId) -> impl Iterator<Item = TargetId> {
+        (0..self.keys.len() as u8).map(move |k| TargetId::Key(id, k))
+    }
 }
 
 pub struct Engine {
     config_path: PathBuf,
     host: Rc<Host>,
-    runtime: Option<LuaRuntime>,
+    rt: LuaRuntime,
     renderer: Renderer,
     clients: BTreeMap<ClientId, Client>,
     /// Page and last key press of clients that went away, by client_id, so a reconnect (deploy,
     /// client update) resumes where they were. Expires after the device's `home_after`; lost on
     /// restart.
     remembered: HashMap<String, Remembered>,
-    key_deps: HashMap<(ClientId, u8), HashSet<String>>,
-    /// dependency -> keys whose last render read it: an entity id, or `img:<cache key>` for a
-    /// remote image (so keys re-render when their download completes)
-    rev_deps: HashMap<String, HashSet<(ClientId, u8)>>,
     /// Elgato plugin connections and the slots they subscribed.
     plugins: BTreeMap<ClientId, Plugin>,
-    /// The same dependency tracking as `key_deps`/`rev_deps`, for plugin slots.
-    slot_deps: SlotDeps,
-    /// Keys and plugin slots showing the press flash, with when it ends.
-    flashes: HashMap<(ClientId, FlashKey), Instant>,
-    /// Wakes the event loop when a flash is due (set by [`Engine::new`]).
-    timer: Option<(Handle, mpsc::WeakUnboundedSender<EngineEvent>)>,
-}
-
-/// What a press flash is on: a key of a client, or a plugin slot.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum FlashKey {
-    Key(u8),
-    Slot(String),
+    /// What every key and slot read when it was last rendered.
+    deps: Deps,
+    /// For work later (redraws): the runtime, and the engine's own event queue (held weakly, so
+    /// it does not keep the event loop alive).
+    handle: Handle,
+    events: WeakUnboundedSender<EngineEvent>,
 }
 
 impl Engine {
-    /// Remote images download in the background on `handle`; results come back as
-    /// [`EngineEvent::ImageFetched`] on `events` (held weakly, so it does not keep the event loop
-    /// alive).
+    /// Loads the config (an error if it does not load). Remote images download on `handle`;
+    /// their results, and delayed redraws, come back as events on `events`.
     pub fn new(
         config_path: PathBuf,
         ha_tx: UnboundedSender<HaCommand>,
         handle: Handle,
         events: &UnboundedSender<EngineEvent>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let host = Host::new(ha_tx);
+        let rt = LuaRuntime::load(&config_path, host.clone())?;
         let base = config_path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
         let ha =
             HaApi::from_env().unwrap_or_else(|| HaApi::new("http://homeassistant.invalid", ""));
-        let fetch_events = events.downgrade();
+        let weak = events.downgrade();
+        let fetched = weak.clone();
         let fetcher = Fetcher::new(handle.clone(), move |(key, result)| {
-            if let Some(tx) = fetch_events.upgrade() {
+            if let Some(tx) = fetched.upgrade() {
                 let _ = tx.send(EngineEvent::ImageFetched { key, result });
             }
         });
-        Self {
+        let renderer = Renderer::new(Assets::new(base, S3Config::from_env(), ha), fetcher);
+        let mut engine = Self {
             config_path,
-            host: Host::new(ha_tx),
-            runtime: None,
-            renderer: Renderer::new(Assets::new(base, S3Config::from_env(), ha), fetcher),
+            host,
+            rt,
+            renderer,
             clients: BTreeMap::new(),
             remembered: HashMap::new(),
-            key_deps: HashMap::new(),
-            rev_deps: HashMap::new(),
             plugins: BTreeMap::new(),
-            slot_deps: SlotDeps::default(),
-            flashes: HashMap::new(),
-            timer: Some((handle, events.downgrade())),
-        }
+            deps: Deps::default(),
+            handle,
+            events: weak,
+        };
+        engine.config_loaded();
+        Ok(engine)
     }
 
     /// Remote images still downloading.
@@ -261,16 +240,21 @@ impl Engine {
         self.renderer.pending()
     }
 
-    /// (Re)loads the config. On failure the previous config stays active.
+    /// Reloads the config. On failure the previous config stays active.
     pub fn reload(&mut self) -> Result<()> {
-        let rt = LuaRuntime::load(&self.config_path, self.host.clone())?;
+        let new = LuaRuntime::load(&self.config_path, self.host.clone())?;
+        // The old runtime outlives the clients' cells that still point into it.
+        let _old = std::mem::replace(&mut self.rt, new);
+        self.config_loaded();
+        Ok(())
+    }
+
+    /// Brings everything in line with the (new) `self.rt`.
+    fn config_loaded(&mut self) {
         tracing::info!("loaded {}", self.config_path.display());
-        let rt = &*self.runtime.insert(rt);
         self.renderer.reload();
-        self.key_deps.clear();
-        self.rev_deps.clear();
-        self.slot_deps.clear();
-        for name in rt.static_image_names() {
+        self.deps.clear();
+        for name in self.rt.static_image_names() {
             self.renderer.prefetch(&name);
         }
         // Re-resolve every deck's device; a changed device or a page it no longer allows sends
@@ -278,32 +262,26 @@ impl Engine {
         // does that if the idle settings now say so), but is told about a changed brightness.
         let mut rebrightened = Vec::new();
         for (id, c) in &mut self.clients {
-            let policy = Policy::from(
-                rt.resolve_device(c.want_device.as_deref(), client_kind(c.web, &c.device)),
-            );
-            if c.policy.device != policy.device || !rt.has_page(&c.page) || !policy.allows(&c.page)
-            {
-                c.page = policy.home.clone();
+            let def = self
+                .rt
+                .resolve_device(c.want_device.as_deref(), client_kind(c.web, &c.device));
+            if c.def.name != def.name || !def.pages.contains(&c.page) {
+                c.page = def.home.clone();
             }
-            if c.policy.level(c.power) != policy.level(c.power) {
+            if c.def.level(c.power) != def.level(c.power) {
                 rebrightened.push(*id);
             }
-            c.policy = policy;
+            c.def = def;
+            c.layout(&self.rt);
         }
         self.push_exports();
-        self.render_all_clients();
+        self.render_all();
         for id in rebrightened {
             self.send_brightness(id);
         }
-        Ok(())
     }
 
-    pub fn handle(&mut self, ev: EngineEvent) {
-        self.handle_at(ev, Instant::now());
-    }
-
-    /// Like [`Engine::handle`] with an explicit clock (tests).
-    pub fn handle_at(&mut self, ev: EngineEvent, now: Instant) {
+    pub fn handle(&mut self, ev: EngineEvent, now: Instant) {
         match ev {
             EngineEvent::ClientConnected {
                 web,
@@ -312,147 +290,126 @@ impl Engine {
                 device,
                 want_device,
                 tx,
-            } => {
-                let Some(rt) = &self.runtime else {
-                    tracing::warn!("client {client_id} connected before a config was loaded");
-                    return;
-                };
-                let policy = Policy::from(
-                    rt.resolve_device(want_device.as_deref(), client_kind(web, &device)),
-                );
-                tracing::info!(
-                    "client {client_id} connected ({}x{} @ {}px, device {})",
-                    device.rows,
-                    device.cols,
-                    device.key_size_px,
-                    policy.device
-                );
-                let sent = vec![None; device.key_count() as usize];
-                // Resume the page of the previous connection (still listed if its disconnect
-                // has not arrived yet), unless it is gone from the config, not on this
-                // device, or home_after passed.
-                let prev = self
-                    .clients
-                    .values()
-                    .find(|c| c.client_id == client_id)
-                    .map(|c| (c.page.clone(), c.last_press, c.policy.device.clone()))
-                    .or_else(|| self.remembered.remove(&client_id));
-                let (page, last_press) = match prev {
-                    Some((page, at, dev))
-                        if dev == policy.device
-                            && rt.has_page(&page)
-                            && policy.allows(&page)
-                            && !home_due(policy.idle.home_after, at, now) =>
-                    {
-                        (page, at)
-                    }
-                    _ => (policy.home.clone(), now),
-                };
-                self.clients.insert(
-                    id,
-                    Client {
-                        client_id: client_id.clone(),
-                        web,
-                        device,
-                        want_device,
-                        policy,
-                        tx,
-                        page,
-                        last_activity: now,
-                        last_press,
-                        power: Power::Active,
-                        swallow_up: HashSet::new(),
-                        sent,
-                    },
-                );
-                self.send_brightness(id);
-                self.render_client(id);
+            } => self.client_connected(id, web, client_id, device, want_device, tx, now),
+            EngineEvent::ClientDisconnected(id) => {
+                let c = self.clients.remove(&id).expect("a connected client");
+                tracing::info!("client {} disconnected", c.client_id);
+                // A newer connection of the same client already took over its page.
+                if !self.clients.values().any(|o| o.client_id == c.client_id) {
+                    self.remembered
+                        .insert(c.client_id, (c.page, c.last_press, c.def.name));
+                }
+                self.deps.remove_conn(id);
             }
+            EngineEvent::Key { id, key, down } => self.key_event(id, key, down, now),
+            EngineEvent::Wake { id } => self.wake(id, now),
             EngineEvent::PluginConnected { id, client_id, tx } => {
                 self.plugin_connected(id, client_id, tx)
             }
             EngineEvent::PluginDisconnected(id) => self.plugin_disconnected(id),
-            EngineEvent::RedrawSlot { id, slot } => self.render_slot(id, &slot),
-            EngineEvent::Plugin { id, msg } => self.plugin_message(id, msg),
+            EngineEvent::Plugin { id, msg } => self.plugin_message(id, msg, now),
+            EngineEvent::Redraw(target) => self.redraw(target, now),
             EngineEvent::ListDevices(reply) => {
-                let _ = reply.send(
-                    self.runtime
-                        .as_ref()
-                        .map(|rt| {
-                            rt.devices()
-                                .into_iter()
-                                .map(|d| DeviceListing {
-                                    name: d.name,
-                                    pages: d.pages,
-                                    home: d.home,
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                );
+                let _ = reply.send(self.rt.devices());
             }
-            EngineEvent::ClientDisconnected(id) => {
-                if let Some(c) = self.clients.remove(&id) {
-                    tracing::info!("client {} disconnected", c.client_id);
-                    // A newer connection of the same client already took over its page.
-                    if !self.clients.values().any(|o| o.client_id == c.client_id) {
-                        self.remembered
-                            .insert(c.client_id, (c.page, c.last_press, c.policy.device));
-                    }
-                }
-                self.drop_deps(|(cid, _)| *cid == id);
-            }
-            EngineEvent::KeyDown { id, key } => self.key_event(id, key, true, now),
-            EngineEvent::KeyUp { id, key } => self.key_event(id, key, false, now),
-            EngineEvent::Wake { id } => self.wake(id, now),
-            EngineEvent::Tick => self.tick(now),
             EngineEvent::Ha(e) => self.ha_event(e),
             EngineEvent::ImageFetched { key, result } => {
                 self.renderer.finish_fetch(&key, result);
-                self.entity_changed(&format!("img:{key}"));
+                self.dep_changed(&format!("img:{key}"));
             }
             EngineEvent::Reload => {
                 if let Err(e) = self.reload() {
                     tracing::error!("config reload failed, keeping previous config: {e:#}");
                 }
             }
+            EngineEvent::Tick => self.tick(now),
         }
     }
 
     /// Blocking event loop; returns when all senders are dropped.
     pub fn run(mut self, mut rx: mpsc::UnboundedReceiver<EngineEvent>) {
         while let Some(ev) = rx.blocking_recv() {
-            self.handle(ev);
+            self.handle(ev, Instant::now());
         }
     }
 
-    /// Switches a client to `page` (no-op with a warning if it doesn't exist or its device does
-    /// not include it).
-    pub fn goto_page(&mut self, id: ClientId, page: &str) {
-        if let Some(c) = self.clients.get(&id) {
-            if !c.policy.allows(page) {
-                tracing::warn!(
-                    "goto_page: page '{page}' is not on device '{}'",
-                    c.policy.device
-                );
-                return;
+    #[allow(clippy::too_many_arguments)]
+    fn client_connected(
+        &mut self,
+        id: ClientId,
+        web: bool,
+        client_id: String,
+        device: DeviceInfo,
+        want_device: Option<String>,
+        tx: UnboundedSender<Out>,
+        now: Instant,
+    ) {
+        let def = self
+            .rt
+            .resolve_device(want_device.as_deref(), client_kind(web, &device));
+        tracing::info!(
+            "client {client_id} connected ({}x{} @ {}px, device {})",
+            device.rows,
+            device.cols,
+            device.key_size_px,
+            def.name
+        );
+        // Resume the page of the previous connection (still listed if its disconnect has not
+        // arrived yet), unless it is not on this device any more or home_after passed.
+        let prev = self
+            .clients
+            .values()
+            .find(|c| c.client_id == client_id)
+            .map(|c| (c.page.clone(), c.last_press, c.def.name.clone()))
+            .or_else(|| self.remembered.remove(&client_id));
+        let (page, last_press) = match prev {
+            Some((page, at, dev))
+                if dev == def.name
+                    && def.pages.contains(&page)
+                    && !home_due(def.idle.home_after, at, now) =>
+            {
+                (page, at)
             }
+            _ => (def.home.clone(), now),
+        };
+        let mut client = Client {
+            client_id,
+            web,
+            keys: (0..device.key_count()).map(|_| Target::default()).collect(),
+            cells: Vec::new(),
+            device,
+            want_device,
+            def,
+            tx,
+            page,
+            last_activity: now,
+            last_press,
+            power: Power::Active,
+            swallow_up: HashSet::new(),
+        };
+        client.layout(&self.rt);
+        let keys: Vec<_> = client.key_ids(id).collect();
+        self.clients.insert(id, client);
+        self.send_brightness(id);
+        self.render(keys);
+    }
+
+    /// Switches a client to `page` if its device includes it.
+    fn goto_page(&mut self, id: ClientId, page: &str) {
+        let c = &self.clients[&id];
+        if !c.def.pages.iter().any(|p| p == page) {
+            tracing::warn!("goto_page: page '{page}' is not on device '{}'", c.def.name);
+            return;
         }
         self.show_page(id, page);
     }
 
-    /// Like [`Engine::goto_page`] but ignoring the client's device (the page preview).
+    /// Switches a client to `page` whatever its device includes (the page preview).
     pub fn show_page(&mut self, id: ClientId, page: &str) {
-        if !self.runtime.as_ref().is_some_and(|rt| rt.has_page(page)) {
-            tracing::warn!("goto_page: no such page '{page}'");
-            return;
-        }
-        if let Some(c) = self.clients.get_mut(&id) {
-            c.page = page.to_string();
-            self.flashes
-                .retain(|(cid, k), _| *cid != id || !matches!(k, FlashKey::Key(_)));
-            self.render_client(id);
-        }
+        let c = self.clients.get_mut(&id).expect("a connected client");
+        c.set_page(&self.rt, page);
+        let keys = c.key_ids(id).collect();
+        self.render(keys);
     }
 
     fn ha_event(&mut self, e: HaEvent) {
@@ -463,79 +420,72 @@ impl Engine {
                     .map(|s| (s.entity_id.clone(), s))
                     .collect();
                 // Everything may have changed while we were away.
-                self.render_all_clients();
+                self.render_all();
             }
             HaEvent::Changed(s) => {
                 let id = s.entity_id.clone();
                 let prev = self.host.states.borrow_mut().insert(id.clone(), s.clone());
                 if prev.as_ref() != Some(&s) {
-                    self.entity_changed(&id);
+                    self.dep_changed(&id);
                 }
             }
             HaEvent::Removed(id) => {
                 if self.host.states.borrow_mut().remove(&id).is_some() {
-                    self.entity_changed(&id);
+                    self.dep_changed(&id);
                 }
             }
         }
     }
 
-    fn entity_changed(&mut self, entity: &str) {
-        let mut keys: Vec<_> = self
-            .rev_deps
-            .get(entity)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect();
-        keys.sort_unstable();
-        for chunk in keys.chunk_by(|a, b| a.0 == b.0) {
-            let ids: Vec<u8> = chunk.iter().map(|(_, k)| *k).collect();
-            self.render_keys(chunk[0].0, &ids);
-        }
-        self.slots_depending_on(entity);
-    }
-
-    fn feedback(&self) -> bool {
-        self.runtime.as_ref().is_some_and(|rt| rt.feedback())
+    fn render_all(&mut self) {
+        let keys = self.clients.iter().flat_map(|(id, c)| c.key_ids(*id));
+        let slots = self
+            .plugins
+            .iter()
+            .flat_map(|(id, p)| p.slots.keys().map(|s| TargetId::Slot(*id, s.clone())));
+        let all = keys.chain(slots).collect();
+        self.render(all);
     }
 
     /// Sends the brightness that matches the client's current power state.
-    fn send_brightness(&mut self, id: ClientId) {
-        let Some(c) = self.clients.get(&id) else {
-            return;
-        };
-        let _ = c.tx.send(Out::Brightness(c.policy.level(c.power)));
+    fn send_brightness(&self, id: ClientId) {
+        let c = &self.clients[&id];
+        let _ = c.tx.send(Out::Brightness(c.def.level(c.power)));
     }
 
     /// Dims, then switches off, clients that have been idle for the configured time, and sends
     /// them (and forgets disconnected ones) home after `home_after`.
-    pub fn tick(&mut self, now: Instant) {
-        self.end_flashes(now);
-        let Some(rt) = &self.runtime else { return };
+    fn tick(&mut self, now: Instant) {
         self.remembered.retain(|_, (_, at, dev)| {
-            !home_due(rt.device(dev).and_then(|d| d.idle.home_after), *at, now)
+            !home_due(
+                self.rt.device(dev).and_then(|d| d.idle.home_after),
+                *at,
+                now,
+            )
         });
         let home: Vec<_> = self
             .clients
             .iter()
             .filter(|(_, c)| {
-                let p = &c.policy;
-                c.page != p.home && home_due(p.idle.home_after, c.last_press, now)
+                c.page != c.def.home && home_due(c.def.idle.home_after, c.last_press, now)
             })
-            .map(|(id, c)| (*id, c.policy.home.clone()))
+            .map(|(id, c)| (*id, c.def.home.clone()))
             .collect();
         for (id, page) in home {
             // Rendered even while the display is off, so waking shows home.
             tracing::info!(client = id, page = %page, "idle for home_after, going home");
-            self.goto_page(id, &page);
+            self.show_page(id, &page);
         }
         let mut changed = Vec::new();
         for (id, c) in &mut self.clients {
-            let want = power_after(
-                &c.policy.idle,
-                now.saturating_duration_since(c.last_activity),
-            );
+            let idle = now.saturating_duration_since(c.last_activity);
+            let want = if c.def.idle.off_after.is_some_and(|t| idle >= t) {
+                Power::Off
+            } else if c.def.idle.dim_after.is_some_and(|t| idle >= t) {
+                Power::Dim
+            } else {
+                Power::Active
+            };
             if want != c.power {
                 tracing::info!(client = %c.client_id, from = ?c.power, to = ?want, "power");
                 c.power = want;
@@ -550,9 +500,7 @@ impl Engine {
     /// A deck woke from USB suspend. Same as a wake-only press: restore the brightness of an
     /// idle client, restart the idle clocks, run nothing.
     fn wake(&mut self, id: ClientId, now: Instant) {
-        let Some(c) = self.clients.get_mut(&id) else {
-            return;
-        };
+        let c = self.clients.get_mut(&id).expect("a connected client");
         c.last_activity = now;
         c.last_press = now;
         if c.power != Power::Active {
@@ -563,9 +511,7 @@ impl Engine {
     }
 
     fn key_event(&mut self, id: ClientId, key: u8, down: bool, now: Instant) {
-        let Some(c) = self.clients.get_mut(&id) else {
-            return;
-        };
+        let c = self.clients.get_mut(&id).expect("a connected client");
         if down {
             c.last_activity = now;
             c.last_press = now;
@@ -580,285 +526,13 @@ impl Engine {
         } else if c.swallow_up.remove(&key) {
             return;
         }
-        let Some(c) = self.clients.get(&id) else {
-            return;
-        };
-        let Some(rt) = &self.runtime else { return };
-        let (btn, info) = match rt
-            .layout(&c.page, c.device.rows, c.device.cols)
-            .into_iter()
-            .nth(key as usize)
-        {
-            Some(Cell::Button(b)) => (b, ctx_info(c, key)),
-            Some(Cell::Span(sp)) if sp.error.is_none() => {
-                let mut info = ctx_info(c, key);
-                info.span = Some((sp.size.cols, sp.size.rows));
-                info.span_index = Some(sp.index);
-                (sp.def, info)
-            }
-            _ => return,
-        };
         tracing::debug!(client = %c.client_id, page = %c.page, key, down, "key event");
-        match rt.press(&btn, &info, down) {
-            Ok(Some(page)) => self.goto_page(id, &page),
-            Ok(None) => {
-                if down && btn.has_press() && btn.feedback && info.span.is_none() {
-                    self.flash_key(id, key, now);
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    "{} key {key} {}: {e:#}",
-                    info.page,
-                    if down { "press" } else { "release" }
-                );
-                let jpeg = self.renderer.render(
-                    &RenderSpec::error(),
-                    c.device.key_size_px,
-                    Encoding::Jpeg(c.device.native.as_ref()),
-                );
-                self.send_if_changed(id, key, jpeg);
-            }
-        }
-    }
-
-    /// Shows the press flash on `key` of deck `id` for [`FLASH`].
-    fn flash_key(&mut self, id: ClientId, key: u8, now: Instant) {
-        if !self.feedback() {
-            return;
-        }
-        self.flashes.insert((id, FlashKey::Key(key)), now + FLASH);
-        self.render_keys(id, &[key]);
-        self.schedule_flash_end();
-    }
-
-    /// Shows the press flash on a plugin slot for [`FLASH`].
-    fn flash_slot(&mut self, id: ClientId, slot: &str, now: Instant) {
-        if !self.feedback() {
-            return;
-        }
-        self.flashes
-            .insert((id, FlashKey::Slot(slot.to_string())), now + FLASH);
-        self.render_slot(id, slot);
-        self.schedule_flash_end();
-    }
-
-    /// Sends a [`EngineEvent::Tick`] once the flash is over (the regular tick is too coarse).
-    fn schedule_flash_end(&self) {
-        if let Some((handle, events)) = &self.timer {
-            let events = events.clone();
-            handle.spawn(async move {
-                tokio::time::sleep(FLASH).await;
-                if let Some(tx) = events.upgrade() {
-                    let _ = tx.send(EngineEvent::Tick);
-                }
-            });
-        }
-    }
-
-    /// Re-renders the keys and slots whose flash is over.
-    fn end_flashes(&mut self, now: Instant) {
-        let due: Vec<_> = self
-            .flashes
-            .iter()
-            .filter(|(_, until)| **until <= now)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in due {
-            self.flashes.remove(&k);
-            match k {
-                (id, FlashKey::Key(key)) => self.render_keys(id, &[key]),
-                (id, FlashKey::Slot(slot)) => self.render_slot(id, &slot),
-            }
-        }
-    }
-
-    fn render_all_clients(&mut self) {
-        let ids: Vec<_> = self.clients.keys().copied().collect();
-        for id in ids {
-            self.render_client(id);
-        }
-        self.render_all_slots();
-    }
-
-    fn render_client(&mut self, id: ClientId) {
-        let Some(c) = self.clients.get(&id) else {
-            return;
-        };
-        let keys: Vec<u8> = (0..c.device.key_count()).collect();
-        self.render_keys(id, &keys);
-    }
-
-    /// Renders `keys` of a client: Lua render functions run one after the other on this thread,
-    /// then the resulting descriptors are rasterized and encoded in parallel. A span is rendered
-    /// once for all of its keys, whichever of them was asked for.
-    fn render_keys(&mut self, id: ClientId, keys: &[u8]) {
-        let Some(c) = self.clients.get(&id) else {
-            return;
-        };
-        let started = Instant::now();
-        let size = c.device.key_size_px;
-        let rt = self.runtime.as_ref().expect("a client implies a config");
-        let cells = rt.layout(&c.page, c.device.rows, c.device.cols);
-        // keys each job produces a tile for, in order, with the entities their render read
-        let mut groups: Vec<(Vec<u8>, HashSet<String>)> = Vec::with_capacity(keys.len());
-        let mut jobs = Vec::with_capacity(keys.len());
-        let mut spans_done = HashSet::new();
-        let black = RenderSpec {
-            bg: Color::BLACK,
-            ..RenderSpec::default()
-        };
-        for &key in keys {
-            let cell = cells.get(key as usize).cloned().unwrap_or(Cell::Empty);
-            let (spec, deps) = match &cell {
-                Cell::Button(btn) => {
-                    let info = ctx_info(c, key);
-                    let out = rt.render(btn, &info);
-                    if let Some(e) = &out.error {
-                        tracing::error!("render {} key {key} for {}: {e}", info.page, c.client_id);
-                    }
-                    let mut spec = out.spec;
-                    spec.flash = self.flashes.contains_key(&(id, FlashKey::Key(key)));
-                    (spec, out.deps)
-                }
-                Cell::Span(sp) => {
-                    if !spans_done.insert(sp.origin) {
-                        continue;
-                    }
-                    let members: Vec<u8> = cells
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| matches!(c, Cell::Span(o) if o.origin == sp.origin))
-                        .map(|(k, _)| k as u8)
-                        .collect();
-                    let (spec, deps, failed) = self.render_span(rt, c, sp);
-                    let deps: HashSet<String> = deps
-                        .into_iter()
-                        .chain(
-                            self.renderer
-                                .remote_keys(&spec)
-                                .into_iter()
-                                .map(|k| format!("img:{k}")),
-                        )
-                        .collect();
-                    if failed {
-                        // the red ERR tile on every key of the span
-                        for k in members {
-                            jobs.push(self.renderer.prepare(&RenderSpec::error(), Grid::one(size)));
-                            groups.push((vec![k], deps.clone()));
-                        }
-                    } else {
-                        let grid = Grid {
-                            cols: sp.size.cols as u32,
-                            rows: sp.size.rows as u32,
-                            key: size,
-                        };
-                        jobs.push(self.renderer.prepare(&spec, grid));
-                        groups.push((members, deps));
-                    }
-                    continue;
-                }
-                Cell::Empty => (black.clone(), HashSet::new()),
-            };
-            let mut deps = deps;
-            deps.extend(
-                self.renderer
-                    .remote_keys(&spec)
-                    .into_iter()
-                    .map(|k| format!("img:{k}")),
-            );
-            jobs.push(self.renderer.prepare(&spec, Grid::one(size)));
-            groups.push((vec![key], deps));
-        }
-        let page = c.page.clone();
-        let mut jpegs = encode_all(jobs, Encoding::Jpeg(c.device.native.as_ref())).into_iter();
-        tracing::debug!(
-            client = id,
-            page,
-            keys = keys.len(),
-            ms = started.elapsed().as_secs_f64() * 1000.0,
-            "rendered keys"
-        );
-        for (group, deps) in groups {
-            for key in group {
-                let Some(jpeg) = jpegs.next() else { return };
-                self.set_deps(id, key, deps.clone());
-                self.send_if_changed(id, key, jpeg);
-            }
-        }
-    }
-
-    /// Runs a span's render. Returns the descriptor, the entities it read and whether the span
-    /// cannot be shown (layout problem or a Lua error), in which case its keys show ERR.
-    fn render_span(
-        &self,
-        rt: &LuaRuntime,
-        c: &Client,
-        sp: &SpanCell,
-    ) -> (RenderSpec, HashSet<String>, bool) {
-        if let Some(e) = &sp.error {
-            tracing::error!("render {} for {}: {e}", c.page, c.client_id);
-            return (RenderSpec::error(), HashSet::new(), true);
-        }
-        let mut info = ctx_info(c, sp.origin);
-        info.span = Some((sp.size.cols, sp.size.rows));
-        let out = rt.render(&sp.def, &info);
-        if let Some(e) = &out.error {
-            tracing::error!(
-                "render {} span at key {} for {}: {e}",
-                info.page,
-                sp.origin,
-                c.client_id
-            );
-        }
-        (out.spec, out.deps, out.error.is_some())
-    }
-
-    fn send_if_changed(&mut self, id: ClientId, key: u8, jpeg: Vec<u8>) {
-        let Some(c) = self.clients.get_mut(&id) else {
-            return;
-        };
-        let Some(slot) = c.sent.get_mut(key as usize) else {
-            return;
-        };
-        if slot.as_ref() == Some(&jpeg) {
-            return;
-        }
-        *slot = Some(jpeg.clone());
-        // A closed receiver just means the client is on its way out.
-        let _ = c.tx.send(Out::Frame(Frame { key, jpeg }));
-    }
-
-    fn set_deps(&mut self, id: ClientId, key: u8, deps: HashSet<String>) {
-        if let Some(old) = self.key_deps.remove(&(id, key)) {
-            for e in old {
-                if let Some(set) = self.rev_deps.get_mut(&e) {
-                    set.remove(&(id, key));
-                }
-            }
-        }
-        for e in &deps {
-            self.rev_deps
-                .entry(e.clone())
-                .or_default()
-                .insert((id, key));
-        }
-        if !deps.is_empty() {
-            self.key_deps.insert((id, key), deps);
-        }
-    }
-
-    fn drop_deps(&mut self, pred: impl Fn(&(ClientId, u8)) -> bool) {
-        self.key_deps.retain(|k, _| !pred(k));
-        for set in self.rev_deps.values_mut() {
-            set.retain(|k| !pred(k));
-        }
-        self.rev_deps.retain(|_, s| !s.is_empty());
+        self.press(&TargetId::Key(id, key), down, now);
     }
 
     #[cfg(test)]
     fn dep_count(&self, entity: &str) -> usize {
-        self.rev_deps.get(entity).map_or(0, HashSet::len)
+        self.deps.reader_count(entity)
     }
 }
 
@@ -867,40 +541,14 @@ fn home_due(home_after: Option<Duration>, last_press: Instant, now: Instant) -> 
     home_after.is_some_and(|t| now.saturating_duration_since(last_press) >= t)
 }
 
-/// The power state a client is in after being idle for `idle`.
-fn power_after(cfg: &IdleConfig, idle: Duration) -> Power {
-    if cfg.off_after.is_some_and(|t| idle >= t) {
-        Power::Off
-    } else if cfg.dim_after.is_some_and(|t| idle >= t) {
-        Power::Dim
-    } else {
-        Power::Active
-    }
-}
-
-fn ctx_info(c: &Client, key: u8) -> CtxInfo {
-    CtxInfo {
-        client_id: c.client_id.clone(),
-        key,
-        page: c.page.clone(),
-        rows: c.device.rows,
-        cols: c.device.cols,
-        span: None,
-        span_index: None,
-        slot: None,
-    }
-}
-
 /// Spawns the engine thread (Lua is `!Send`, so it is constructed on that thread); call it
-/// inside a tokio runtime. A failing initial config load is logged; the engine keeps running so a
-/// subsequent hot reload can fix it.
+/// inside a tokio runtime. Fails if the config does not load.
 pub fn spawn(
     config_path: PathBuf,
     ha_tx: UnboundedSender<HaCommand>,
-) -> UnboundedSender<EngineEvent> {
+) -> Result<UnboundedSender<EngineEvent>> {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = Handle::current();
-    let events = tx.clone();
     let ticks = tx.downgrade();
     handle.spawn(async move {
         let mut every = tokio::time::interval(TICK);
@@ -912,25 +560,35 @@ pub fn spawn(
             }
         }
     });
+    let (started, ready) = std::sync::mpsc::sync_channel(1);
+    let events = tx.clone();
     std::thread::Builder::new()
         .name("sdc-engine".into())
-        .spawn(move || {
-            let mut engine = Engine::new(config_path, ha_tx, handle, &events);
-            drop(events);
-            if let Err(e) = engine.reload() {
-                tracing::error!("failed to load config: {e:#}");
-            }
-            engine.run(rx);
-        })
+        .spawn(
+            move || match Engine::new(config_path, ha_tx, handle, &events) {
+                Ok(engine) => {
+                    drop(events);
+                    let _ = started.send(Ok(()));
+                    engine.run(rx);
+                }
+                Err(e) => {
+                    let _ = started.send(Err(e));
+                }
+            },
+        )
         .expect("spawn engine thread");
-    tx
+    ready.recv().expect("engine thread reports its start")?;
+    Ok(tx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ha::EntityState;
+    use crate::lua_api::DialInput;
+    use crate::render::{Encoding, RenderSpec};
     use image::RgbaImage;
+    use sdc_protocol::SlotKind;
     use serde_json::json;
     use std::io::Write;
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -1004,38 +662,14 @@ mod tests {
             .collect()
     }
 
-    /// An engine on a shared test runtime (image downloads report to a dropped channel).
-    fn new_engine(path: PathBuf, ha_tx: UnboundedSender<HaCommand>) -> Engine {
-        static RT: std::sync::LazyLock<tokio::runtime::Runtime> =
-            std::sync::LazyLock::new(|| tokio::runtime::Runtime::new().unwrap());
-        let (events, _) = mpsc::unbounded_channel();
-        Engine::new(path, ha_tx, RT.handle().clone(), &events)
+    fn keys(frames: &[Frame]) -> Vec<u8> {
+        let mut k: Vec<u8> = frames.iter().map(|f| f.key).collect();
+        k.sort_unstable();
+        k
     }
 
-    fn setup(
-        src: &str,
-    ) -> (
-        Engine,
-        UnboundedReceiver<Out>,
-        UnboundedReceiver<HaCommand>,
-        tempdir::Dir,
-    ) {
-        let dir = tempdir::Dir::new();
-        let path = write_config(dir.path(), src);
-        let (ha_tx, ha_rx) = mpsc::unbounded_channel();
-        let mut e = new_engine(path, ha_tx);
-        e.reload().unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        e.handle(EngineEvent::ClientConnected {
-            web: false,
-            id: 1,
-            client_id: "c1".into(),
-            device: device(),
-            want_device: None,
-            tx,
-        });
-        assert_eq!(drain(&mut rx).len(), 15);
-        (e, rx, ha_rx, dir)
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
     }
 
     /// Minimal self-cleaning temp dir (avoids a dev-dependency).
@@ -1064,97 +698,156 @@ mod tests {
         }
     }
 
-    #[test]
-    fn state_change_rerenders_only_dependents() {
-        let (mut e, mut rx, _ha, _d) = setup(CONFIG);
-        assert_eq!(e.dep_count("light.a"), 1);
-        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
+    /// An engine on a config in a temp dir. Events are handled `at` whole seconds after `t0`.
+    struct Rig {
+        e: Engine,
+        ha: UnboundedReceiver<HaCommand>,
+        dir: tempdir::Dir,
+        t0: Instant,
+    }
+
+    impl Rig {
+        fn without_client(src: &str) -> Self {
+            let dir = tempdir::Dir::new();
+            let path = write_config(dir.path(), src);
+            let (ha_tx, ha) = mpsc::unbounded_channel();
+            let (events, _) = mpsc::unbounded_channel();
+            let e = Engine::new(path, ha_tx, Handle::current(), &events).unwrap();
+            Rig {
+                e,
+                ha,
+                dir,
+                t0: Instant::now(),
+            }
+        }
+
+        /// A rig with client 1 ("c1", a 3x5 deck) connected at `t0`.
+        fn new(src: &str) -> (Self, UnboundedReceiver<Out>) {
+            let mut rig = Self::without_client(src);
+            let rx = rig.connect(1, "c1", "t", false, None, 0);
+            (rig, rx)
+        }
+
+        fn connect(
+            &mut self,
+            id: ClientId,
+            name: &str,
+            model: &str,
+            web: bool,
+            want: Option<&str>,
+            at: u64,
+        ) -> UnboundedReceiver<Out> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.at(
+                EngineEvent::ClientConnected {
+                    web,
+                    id,
+                    client_id: name.into(),
+                    device: DeviceInfo {
+                        model: model.into(),
+                        ..device()
+                    },
+                    want_device: want.map(Into::into),
+                    tx,
+                },
+                at,
+            );
+            rx
+        }
+
+        fn at(&mut self, ev: EngineEvent, at: u64) {
+            self.e.handle(ev, self.t0 + secs(at));
+        }
+
+        fn key(&mut self, key: u8, down: bool, at: u64) {
+            self.at(EngineEvent::Key { id: 1, key, down }, at);
+        }
+
+        fn tick(&mut self, at: u64) {
+            self.at(EngineEvent::Tick, at);
+        }
+
+        fn ha_calls(&mut self) -> usize {
+            std::iter::from_fn(|| self.ha.try_recv().ok()).count()
+        }
+
+        fn page(&self, id: ClientId) -> &str {
+            &self.e.clients[&id].page
+        }
+
+        fn rewrite(&self, src: &str) {
+            write_config(self.dir.path(), src);
+        }
+
+        fn device_and_page(&self, id: ClientId) -> (&str, &str) {
+            let c = &self.e.clients[&id];
+            (&c.def.name, &c.page)
+        }
+    }
+
+    #[tokio::test]
+    async fn state_changes_rerender_only_dependents() {
+        let (mut r, mut rx) = Rig::new(CONFIG);
         let frames = drain(&mut rx);
-        assert_eq!(frames.iter().map(|f| f.key).collect::<Vec<_>>(), [0]);
-        // identical change: no frame
-        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
+        assert_eq!(frames.len(), 15);
+        // key 3 errored at connect and shows the error tile
+        let err =
+            r.e.renderer
+                .render(&RenderSpec::error(), 72, Encoding::Jpeg(None));
+        assert_eq!(frames[3].jpeg, err);
+        assert_eq!(r.e.dep_count("light.a"), 1);
+
+        r.at(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))), 1);
+        assert_eq!(keys(&drain(&mut rx)), [0]);
+        // identical change, unrelated entity, unchanged reload: nothing
+        r.at(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))), 2);
+        r.at(EngineEvent::Ha(HaEvent::Changed(st("light.zzz", "on"))), 3);
+        r.at(EngineEvent::Reload, 4);
         assert!(drain(&mut rx).is_empty());
-        // unrelated entity: no frame
-        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.zzz", "on"))));
-        assert!(drain(&mut rx).is_empty());
-        // light.b -> key 1 only
-        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.b", "on"))));
-        assert_eq!(
-            drain(&mut rx).iter().map(|f| f.key).collect::<Vec<_>>(),
-            [1]
-        );
+        // a snapshot only sends what looks different
+        r.at(EngineEvent::Ha(HaEvent::Seed(vec![st("light.b", "on")])), 5);
+        assert_eq!(keys(&drain(&mut rx)), [0, 1]);
     }
 
-    #[test]
-    fn seed_only_sends_visibly_changed_keys() {
-        let (mut e, mut rx, _ha, _d) = setup(CONFIG);
-        e.handle(EngineEvent::Ha(HaEvent::Seed(vec![st("light.b", "on")])));
-        assert_eq!(
-            drain(&mut rx).iter().map(|f| f.key).collect::<Vec<_>>(),
-            [1]
-        );
-    }
-
-    #[test]
-    fn error_tile_on_render_error() {
-        let (mut e, mut rx, _ha, _d) = setup(CONFIG);
-        // key 3 errored at connect; its frame equals the error tile
-        let err = e
-            .renderer
-            .render(&RenderSpec::error(), 72, Encoding::Jpeg(None));
-        e.handle(EngineEvent::Reload);
-        assert!(drain(&mut rx).is_empty()); // unchanged => nothing re-sent
-        let c = e.clients.get(&1).unwrap();
-        assert_eq!(c.sent[3].as_ref().unwrap(), &err);
-    }
-
-    #[test]
-    fn press_calls_ha_and_goto_switches_page() {
-        let (mut e, mut rx, mut ha, _d) = setup(CONFIG);
-        e.handle(EngineEvent::KeyDown { id: 1, key: 0 });
+    #[tokio::test]
+    async fn presses_call_ha_and_switch_pages_and_disconnect_drops_deps() {
+        let (mut r, mut rx) = Rig::new(CONFIG);
+        r.key(0, true, 1);
         assert!(
-            matches!(ha.try_recv().unwrap(), HaCommand::CallService { service, .. } if service == "toggle")
+            matches!(r.ha.try_recv().unwrap(), HaCommand::CallService { service, .. } if service == "toggle")
         );
-        e.handle(EngineEvent::KeyDown { id: 1, key: 2 });
-        assert_eq!(e.clients[&1].page, "two");
-        let frames = drain(&mut rx);
-        assert!(!frames.is_empty());
-        // light.a dependency gone with the page change
-        assert_eq!(e.dep_count("light.a"), 0);
-        e.handle(EngineEvent::KeyDown { id: 1, key: 0 });
-        assert_eq!(e.clients[&1].page, "home");
+        r.key(2, true, 2);
+        assert_eq!(r.page(1), "two");
+        // light.a is no longer read once the page changed
+        assert_eq!(r.e.dep_count("light.a"), 0);
+        r.key(0, true, 3);
+        assert_eq!(r.page(1), "home");
+        drain(&mut rx);
+        r.at(EngineEvent::ClientDisconnected(1), 4);
+        assert!(r.e.deps.is_empty());
     }
 
-    #[test]
-    fn disconnect_drops_deps() {
-        let (mut e, _rx, _ha, _d) = setup(CONFIG);
-        e.handle(EngineEvent::ClientDisconnected(1));
-        assert_eq!(e.dep_count("light.a"), 0);
-        assert!(e.key_deps.is_empty());
-    }
-
-    #[test]
-    fn reload_keeps_page_and_survives_bad_config() {
-        let (mut e, mut rx, _ha, d) = setup(CONFIG);
-        e.goto_page(1, "two");
+    #[tokio::test]
+    async fn reload_keeps_page_and_survives_bad_config() {
+        let (mut r, mut rx) = Rig::new(CONFIG);
+        r.e.goto_page(1, "two");
         drain(&mut rx);
         // bad config: previous kept
-        write_config(d.path(), "this is not lua (");
-        e.handle(EngineEvent::Reload);
-        assert!(e.runtime.as_ref().unwrap().has_page("two"));
+        r.rewrite("this is not lua (");
+        r.at(EngineEvent::Reload, 1);
+        assert!(r.e.rt.has_page("two"));
         assert!(drain(&mut rx).is_empty());
         // good config that still has "two"
-        write_config(
-            d.path(),
+        r.rewrite(
             r##"sdc.page("home", {}) sdc.page("two", { sdc.button{ render = { text = "New" } } })"##,
         );
-        e.handle(EngineEvent::Reload);
-        assert_eq!(e.clients[&1].page, "two");
+        r.at(EngineEvent::Reload, 2);
+        assert_eq!(r.page(1), "two");
         assert!(!drain(&mut rx).is_empty());
         // config without "two": back to default
-        write_config(d.path(), r##"sdc.page("home", {})"##);
-        e.handle(EngineEvent::Reload);
-        assert_eq!(e.clients[&1].page, "home");
+        r.rewrite(r##"sdc.page("home", {})"##);
+        r.at(EngineEvent::Reload, 3);
+        assert_eq!(r.page(1), "home");
     }
 
     const IDLE_CONFIG: &str = r##"
@@ -1167,121 +860,72 @@ mod tests {
         })
     "##;
 
-    fn secs(n: u64) -> Duration {
-        Duration::from_secs(n)
-    }
-
-    #[test]
-    fn idle_dims_then_turns_off() {
-        let (mut e, rx, _ha, _d) = setup(IDLE_CONFIG);
-        drop(rx);
-        // reconnect so the idle clock starts at a known instant
-        let t0 = Instant::now();
-        let (tx, mut rx2) = mpsc::unbounded_channel();
-        e.handle_at(
-            EngineEvent::ClientConnected {
-                web: false,
-                id: 2,
-                client_id: "c2".into(),
-                device: device(),
-                want_device: None,
-                tx,
-            },
-            t0,
-        );
+    #[tokio::test]
+    async fn idle_dims_then_turns_off_and_a_press_wakes_without_running() {
+        let (mut r, mut rx) = Rig::new(IDLE_CONFIG);
         // the configured brightness is sent on connect
-        assert_eq!(brightness(&drain_out(&mut rx2)), [80]);
-        e.tick(t0 + secs(119));
-        assert!(drain_out(&mut rx2).is_empty());
-        e.tick(t0 + secs(120));
-        assert_eq!(brightness(&drain_out(&mut rx2)), [10]);
-        e.tick(t0 + secs(500)); // still dim: nothing more to say
-        assert!(drain_out(&mut rx2).is_empty());
-        e.tick(t0 + secs(600));
-        assert_eq!(brightness(&drain_out(&mut rx2)), [0]);
-        e.tick(t0 + secs(9000));
-        assert!(drain_out(&mut rx2).is_empty());
-    }
-
-    #[test]
-    fn key_press_wakes_and_is_consumed() {
-        let (mut e, mut rx, mut ha, _d) = setup(IDLE_CONFIG);
-        drain_out(&mut rx);
-        let t0 = Instant::now();
-        let down = |e: &mut Engine, t| e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t);
-        let up = |e: &mut Engine, t| e.handle_at(EngineEvent::KeyUp { id: 1, key: 0 }, t);
-        let calls = |ha: &mut UnboundedReceiver<HaCommand>| {
-            std::iter::from_fn(|| ha.try_recv().ok()).count()
-        };
-
-        // dimmed: the press restores brightness, runs nothing; its release is swallowed too
-        e.tick(t0 + secs(130));
-        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
-        down(&mut e, t0 + secs(131));
         assert_eq!(brightness(&drain_out(&mut rx)), [80]);
-        up(&mut e, t0 + secs(131));
-        assert_eq!(calls(&mut ha), 0);
+        r.tick(119);
+        assert!(drain_out(&mut rx).is_empty());
+        r.tick(120);
+        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
+        r.tick(500); // still dim: nothing more to say
+        assert!(drain_out(&mut rx).is_empty());
+        r.tick(600);
+        assert_eq!(brightness(&drain_out(&mut rx)), [0]);
+
+        // off: the press restores brightness and runs nothing; its release is swallowed too
+        r.key(0, true, 1000);
+        assert_eq!(brightness(&drain_out(&mut rx)), [80]);
+        r.key(0, false, 1000);
+        assert_eq!(r.ha_calls(), 0);
 
         // awake: presses run, and each one restarts the idle clock
-        down(&mut e, t0 + secs(200));
-        up(&mut e, t0 + secs(200));
-        assert_eq!(calls(&mut ha), 2);
-        e.tick(t0 + secs(200 + 119));
+        r.key(0, true, 1001);
+        r.key(0, false, 1001);
+        assert_eq!(r.ha_calls(), 2);
+        r.tick(1001 + 119);
         assert!(brightness(&drain_out(&mut rx)).is_empty());
-        e.tick(t0 + secs(200 + 120));
+        r.tick(1001 + 120);
         assert_eq!(brightness(&drain_out(&mut rx)), [10]);
 
-        // off: same
-        e.tick(t0 + secs(200 + 600));
-        assert_eq!(brightness(&drain_out(&mut rx)), [0]);
-        down(&mut e, t0 + secs(1000));
+        // a wake message does the same without a key
+        r.at(EngineEvent::Wake { id: 1 }, 1200);
         assert_eq!(brightness(&drain_out(&mut rx)), [80]);
-        up(&mut e, t0 + secs(1000));
-        assert_eq!(calls(&mut ha), 0);
-        down(&mut e, t0 + secs(1001));
-        assert_eq!(calls(&mut ha), 1);
-    }
-
-    #[test]
-    fn without_idle_config_never_idles() {
-        let (mut e, mut rx, mut ha, _d) = setup(CONFIG);
-        let t0 = Instant::now();
-        e.tick(t0 + secs(100_000));
-        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0 + secs(100_001));
+        assert_eq!(r.ha_calls(), 0);
+        // awake already: no brightness message, but the idle clock restarts
+        r.at(EngineEvent::Wake { id: 1 }, 1300);
+        r.tick(1300 + 119);
         assert!(brightness(&drain_out(&mut rx)).is_empty());
-        assert!(ha.try_recv().is_ok(), "the press runs normally");
+        r.tick(1300 + 120);
+        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
     }
 
-    #[test]
-    fn default_wake_brightness_and_reload_keep_idle_state() {
+    #[tokio::test]
+    async fn default_brightness_and_reload_keep_idle_state() {
         let cfg = r##"sdc.page("home", {}) sdc.device("d", { pages = { "home" }, idle = { dim_after = 10 } })"##;
-        let (mut e, mut rx, _ha, d) = setup(cfg);
-        let t0 = Instant::now();
-        e.tick(t0 + secs(11));
+        let (mut r, mut rx) = Rig::new(cfg);
+        drain_out(&mut rx);
+        r.tick(11);
         assert_eq!(brightness(&drain_out(&mut rx)), [10]);
         // reloading the same config leaves a dimmed client alone
-        e.handle_at(EngineEvent::Reload, t0 + secs(12));
+        r.at(EngineEvent::Reload, 12);
         assert!(brightness(&drain_out(&mut rx)).is_empty());
-        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0 + secs(13));
-        assert_eq!(
-            brightness(&drain_out(&mut rx)),
-            [60],
-            "default active brightness"
-        );
+        r.key(0, true, 13);
+        assert_eq!(brightness(&drain_out(&mut rx)), [60], "default brightness");
         // dropping the idle setting while dimmed wakes the client on the next tick
-        e.tick(t0 + secs(30));
+        r.tick(30);
         assert_eq!(brightness(&drain_out(&mut rx)), [10]);
-        write_config(d.path(), r##"sdc.page("home", {})"##);
-        e.handle_at(EngineEvent::Reload, t0 + secs(31));
+        r.rewrite(r##"sdc.page("home", {})"##);
+        r.at(EngineEvent::Reload, 31);
         assert!(brightness(&drain_out(&mut rx)).is_empty());
-        e.tick(t0 + secs(32));
+        r.tick(32);
         assert_eq!(brightness(&drain_out(&mut rx)), [60]);
         // a changed brightness reaches an awake client right away
-        write_config(
-            d.path(),
+        r.rewrite(
             r##"sdc.page("home", {}) sdc.device("d", { pages = { "home" }, brightness = 30 })"##,
         );
-        e.handle_at(EngineEvent::Reload, t0 + secs(33));
+        r.at(EngineEvent::Reload, 33);
         assert_eq!(brightness(&drain_out(&mut rx)), [30]);
     }
 
@@ -1292,136 +936,86 @@ mod tests {
         sdc.page("two", { sdc.button{ render = { text = "T" } } })
     "##;
 
-    fn connect_at(e: &mut Engine, id: ClientId, name: &str, t: Instant) -> UnboundedReceiver<Out> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        e.handle_at(
-            EngineEvent::ClientConnected {
-                web: false,
-                id,
-                client_id: name.into(),
-                device: device(),
-                want_device: None,
-                tx,
-            },
-            t,
-        );
-        rx
-    }
-
-    #[test]
-    fn page_is_remembered_across_reconnect() {
-        let (mut e, rx, _ha, _d) = setup(HOME_CONFIG);
+    #[tokio::test]
+    async fn page_is_remembered_across_reconnect() {
+        let (mut r, rx) = Rig::new(HOME_CONFIG);
         drop(rx);
-        let t0 = Instant::now();
-        e.goto_page(1, "two");
-        e.handle_at(EngineEvent::ClientDisconnected(1), t0);
-        let mut rx2 = connect_at(&mut e, 2, "c1", t0 + secs(10));
-        assert_eq!(e.clients[&2].page, "two");
+        r.e.goto_page(1, "two");
+        r.at(EngineEvent::ClientDisconnected(1), 0);
+        let mut rx2 = r.connect(2, "c1", "t", false, None, 10);
+        assert_eq!(r.page(2), "two");
         assert_eq!(drain(&mut rx2).len(), 15);
         // a different client_id starts at home
-        connect_at(&mut e, 3, "other", t0 + secs(10));
-        assert_eq!(e.clients[&3].page, "home");
+        r.connect(3, "other", "t", false, None, 10);
+        assert_eq!(r.page(3), "home");
         // reconnect before the old disconnect arrived keeps the page, and the stale
         // disconnect does not overwrite the memory
-        connect_at(&mut e, 4, "c1", t0 + secs(11));
-        assert_eq!(e.clients[&4].page, "two");
-        e.handle_at(EngineEvent::ClientDisconnected(2), t0 + secs(12));
-        e.handle_at(EngineEvent::ClientDisconnected(4), t0 + secs(13));
-        connect_at(&mut e, 5, "c1", t0 + secs(14));
-        assert_eq!(e.clients[&5].page, "two");
+        r.connect(4, "c1", "t", false, None, 11);
+        assert_eq!(r.page(4), "two");
+        r.at(EngineEvent::ClientDisconnected(2), 12);
+        r.at(EngineEvent::ClientDisconnected(4), 13);
+        r.connect(5, "c1", "t", false, None, 14);
+        assert_eq!(r.page(5), "two");
     }
 
-    #[test]
-    fn remembered_page_expires_after_home_after() {
-        let (mut e, rx, _ha, _d) = setup(HOME_CONFIG);
+    #[tokio::test]
+    async fn remembered_page_expires_after_home_after_or_when_the_config_drops_it() {
+        let (mut r, rx) = Rig::new(HOME_CONFIG);
         drop(rx);
-        let t0 = Instant::now();
-        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0); // goes to "two"
-        assert_eq!(e.clients[&1].page, "two");
-        e.handle_at(EngineEvent::ClientDisconnected(1), t0 + secs(1));
+        r.key(0, true, 0); // goes to "two"
+        assert_eq!(r.page(1), "two");
+        r.at(EngineEvent::ClientDisconnected(1), 1);
         // the press time survives the reconnect: 3599s after it, still "two"
-        connect_at(&mut e, 2, "c1", t0 + secs(3599));
-        assert_eq!(e.clients[&2].page, "two");
-        e.handle_at(EngineEvent::ClientDisconnected(2), t0 + secs(3599));
-        connect_at(&mut e, 3, "c1", t0 + secs(3600));
-        assert_eq!(e.clients[&3].page, "home");
+        r.connect(2, "c1", "t", false, None, 3599);
+        assert_eq!(r.page(2), "two");
+        r.at(EngineEvent::ClientDisconnected(2), 3599);
+        r.connect(3, "c1", "t", false, None, 3600);
+        assert_eq!(r.page(3), "home");
         // tick forgets expired entries
-        e.handle_at(EngineEvent::ClientDisconnected(3), t0 + secs(3600));
-        assert!(e.remembered.contains_key("c1"));
-        e.tick(t0 + secs(3600 + 3600));
-        assert!(e.remembered.is_empty());
+        r.at(EngineEvent::ClientDisconnected(3), 3600);
+        assert!(r.e.remembered.contains_key("c1"));
+        r.tick(3600 + 3600);
+        assert!(r.e.remembered.is_empty());
+
+        // a page removed by a reload is not resumed
+        r.connect(4, "c2", "t", false, None, 8000);
+        r.e.goto_page(4, "two");
+        r.at(EngineEvent::ClientDisconnected(4), 8001);
+        r.rewrite(r##"sdc.page("home", {})"##);
+        r.at(EngineEvent::Reload, 8002);
+        r.connect(5, "c2", "t", false, None, 8005);
+        assert_eq!(r.page(5), "home");
     }
 
-    #[test]
-    fn home_after_returns_to_default_even_when_off() {
-        let (mut e, mut rx, _ha, _d) = setup(HOME_CONFIG);
+    #[tokio::test]
+    async fn home_after_returns_home_even_when_off_and_wakes_restart_the_clock() {
+        let (mut r, mut rx) = Rig::new(HOME_CONFIG);
         drain_out(&mut rx);
-        let t0 = Instant::now();
-        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0);
-        assert_eq!(e.clients[&1].page, "two");
+        r.key(0, true, 0);
+        assert_eq!(r.page(1), "two");
         drain_out(&mut rx);
-        e.tick(t0 + secs(600));
+        r.tick(600);
         assert_eq!(brightness(&drain_out(&mut rx)), [0]);
-        e.tick(t0 + secs(3599));
-        assert_eq!(e.clients[&1].page, "two");
-        e.tick(t0 + secs(3600));
-        assert_eq!(e.clients[&1].page, "home");
+        r.tick(3599);
+        assert_eq!(r.page(1), "two");
+        r.tick(3600);
+        assert_eq!(r.page(1), "home");
         assert!(!drain(&mut rx).is_empty(), "home is rendered while off");
         // waking keeps it on home; the waking press does nothing else
-        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0 + secs(4000));
-        assert_eq!(e.clients[&1].page, "home");
+        r.key(0, true, 4000);
+        assert_eq!(r.page(1), "home");
         assert_eq!(brightness(&drain_out(&mut rx)), [60]);
-    }
 
-    #[test]
-    fn wake_message_wakes_without_running_buttons() {
-        let (mut e, mut rx, mut ha, _d) = setup(IDLE_CONFIG);
-        drain_out(&mut rx);
-        let t0 = Instant::now();
-        e.tick(t0 + secs(130));
-        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
-        e.handle_at(EngineEvent::Wake { id: 1 }, t0 + secs(131));
-        assert_eq!(brightness(&drain_out(&mut rx)), [80]);
-        assert!(ha.try_recv().is_err(), "no button ran");
-        // awake already: no brightness message, but the idle clock restarts
-        e.handle_at(EngineEvent::Wake { id: 1 }, t0 + secs(200));
-        assert!(brightness(&drain_out(&mut rx)).is_empty());
-        e.tick(t0 + secs(200 + 119));
-        assert!(brightness(&drain_out(&mut rx)).is_empty());
-        e.tick(t0 + secs(200 + 130));
-        assert_eq!(brightness(&drain_out(&mut rx)), [10]);
-        // a Wake for an unknown client is ignored
-        e.handle_at(EngineEvent::Wake { id: 99 }, t0 + secs(400));
-    }
-
-    #[test]
-    fn waking_before_home_after_keeps_page() {
-        let (mut e, mut rx, _ha, _d) = setup(HOME_CONFIG);
-        drain_out(&mut rx);
-        let t0 = Instant::now();
-        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0);
-        e.tick(t0 + secs(700)); // off
-        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0 + secs(1000)); // wakes only
-        e.handle_at(EngineEvent::KeyUp { id: 1, key: 0 }, t0 + secs(1000));
-        assert_eq!(e.clients[&1].page, "two");
-        // the wake press restarted the home clock
-        e.tick(t0 + secs(1000 + 3599));
-        assert_eq!(e.clients[&1].page, "two");
-        e.tick(t0 + secs(1000 + 3600));
-        assert_eq!(e.clients[&1].page, "home");
-    }
-
-    #[test]
-    fn remembered_page_removed_by_reload_falls_back_to_default() {
-        let (mut e, rx, _ha, d) = setup(HOME_CONFIG);
-        drop(rx);
-        let t0 = Instant::now();
-        e.goto_page(1, "two");
-        e.handle_at(EngineEvent::ClientDisconnected(1), t0);
-        write_config(d.path(), r##"sdc.page("home", {})"##);
-        e.handle_at(EngineEvent::Reload, t0);
-        connect_at(&mut e, 2, "c1", t0 + secs(5));
-        assert_eq!(e.clients[&2].page, "home");
+        // a wake-only press restarted the home clock
+        r.key(0, true, 4001); // -> two
+        r.tick(4001 + 700); // off
+        r.key(0, true, 5000); // wakes only
+        r.key(0, false, 5000);
+        assert_eq!(r.page(1), "two");
+        r.tick(5000 + 3599);
+        assert_eq!(r.page(1), "two");
+        r.tick(5000 + 3600);
+        assert_eq!(r.page(1), "home");
     }
 
     const DEVICES_CONFIG: &str = r##"
@@ -1431,170 +1025,91 @@ mod tests {
         sdc.device("a", { pages = { "home", "lights" }, home = "home",
                           idle = { home_after = 100 } })
         sdc.device("b", { pages = { "tv", "home" }, home = "tv", brightness = 30 })
-        sdc.default_device { mk2 = "a", browser = "b" }
+        sdc.default_device { mk2 = "a", browser = "b", xl = "b" }
     "##;
 
-    fn device_engine(src: &str) -> (Engine, tempdir::Dir) {
-        let dir = tempdir::Dir::new();
-        let path = write_config(dir.path(), src);
-        let mut e = new_engine(path, mpsc::unbounded_channel().0);
-        e.reload().unwrap();
-        (e, dir)
-    }
-
-    fn connect_dev(
-        e: &mut Engine,
-        id: ClientId,
-        model: &str,
-        web: bool,
-        want: Option<&str>,
-        t: Instant,
-    ) -> UnboundedReceiver<Out> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        e.handle_at(
-            EngineEvent::ClientConnected {
-                web,
-                id,
-                client_id: format!("c{id}"),
-                device: DeviceInfo {
-                    model: model.into(),
-                    ..device()
-                },
-                want_device: want.map(Into::into),
-                tx,
-            },
-            t,
-        );
-        rx
-    }
-
-    fn dev_of(e: &Engine, id: ClientId) -> (String, String) {
-        (
-            e.clients[&id].policy.device.clone(),
-            e.clients[&id].page.clone(),
-        )
-    }
-
-    #[test]
-    fn device_resolution_order() {
-        let (mut e, d) = device_engine(DEVICES_CONFIG);
-        let t = Instant::now();
+    #[tokio::test]
+    async fn device_resolution_order_and_brightness() {
+        let mut r = Rig::without_client(DEVICES_CONFIG);
+        let conn = |r: &mut Rig, id, model, web, want| {
+            r.connect(id, &format!("c{id}"), model, web, want, 0)
+        };
         // explicit name beats the type default
-        connect_dev(&mut e, 1, "Mk2", false, Some("b"), t);
-        assert_eq!(dev_of(&e, 1), ("b".into(), "tv".into()));
+        let mut rx = conn(&mut r, 1, "Mk2", false, Some("b"));
+        assert_eq!(r.device_and_page(1), ("b", "tv"));
+        assert_eq!(brightness(&drain_out(&mut rx)), [30]);
         // type default
-        connect_dev(&mut e, 2, "Mk2Scissor", false, None, t);
-        assert_eq!(dev_of(&e, 2), ("a".into(), "home".into()));
+        let mut rx = conn(&mut r, 2, "Mk2Scissor", false, None);
+        assert_eq!(r.device_and_page(2), ("a", "home"));
+        assert_eq!(brightness(&drain_out(&mut rx)), [60], "default brightness");
         // an unknown name falls through to the type default
-        connect_dev(&mut e, 3, "Mk2", false, Some("nope"), t);
-        assert_eq!(dev_of(&e, 3), ("a".into(), "home".into()));
-        // a type without an entry gets the first device
-        connect_dev(&mut e, 4, "XlV2", false, None, t);
-        assert_eq!(dev_of(&e, 4), ("a".into(), "home".into()));
-        // browser type
-        connect_dev(&mut e, 5, "Web Deck", true, None, t);
-        assert_eq!(dev_of(&e, 5), ("b".into(), "tv".into()));
-
-        // no matching type: the first device
-        write_config(d.path(), &DEVICES_CONFIG.replace(r#", browser = "b""#, ""));
-        e.handle_at(EngineEvent::Reload, t);
-        connect_dev(&mut e, 6, "XlV2", false, None, t);
-        assert_eq!(dev_of(&e, 6), ("a".into(), "home".into()));
+        conn(&mut r, 3, "Mk2", false, Some("nope"));
+        assert_eq!(r.device_and_page(3), ("a", "home"));
+        conn(&mut r, 4, "XlV2", false, None);
+        assert_eq!(r.device_and_page(4), ("b", "tv"));
+        conn(&mut r, 5, "Web Deck", true, None);
+        assert_eq!(r.device_and_page(5), ("b", "tv"));
+        // no entry for the type: the first device
+        conn(&mut r, 6, "Neo", false, None);
+        assert_eq!(r.device_and_page(6), ("a", "home"));
     }
 
-    #[test]
-    fn goto_page_outside_the_device_is_ignored() {
-        let (mut e, _d) = device_engine(DEVICES_CONFIG);
-        let t = Instant::now();
-        let mut rx = connect_dev(&mut e, 1, "Mk2", false, None, t); // device a
+    #[tokio::test]
+    async fn device_limits_pages_and_sets_home() {
+        let mut r = Rig::without_client(DEVICES_CONFIG);
+        let mut rx = r.connect(1, "c1", "Mk2", false, None, 0); // device a
         drain(&mut rx);
-        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t); // home -> lights
-        assert_eq!(e.clients[&1].page, "lights");
+        r.key(0, true, 0); // home -> lights
+        assert_eq!(r.page(1), "lights");
         drain(&mut rx);
-        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t); // lights -> tv: not on a
-        assert_eq!(e.clients[&1].page, "lights");
+        r.key(0, true, 0); // lights -> tv: not on a
+        assert_eq!(r.page(1), "lights");
         assert!(drain(&mut rx).is_empty());
-        e.goto_page(1, "nonexistent");
-        assert_eq!(e.clients[&1].page, "lights");
-    }
-
-    #[test]
-    fn home_after_goes_to_the_device_home() {
-        let (mut e, _d) = device_engine(DEVICES_CONFIG);
-        let t0 = Instant::now();
-        // device a: home_after 100, home "home"
-        connect_dev(&mut e, 1, "Mk2", false, None, t0);
-        e.handle_at(EngineEvent::KeyDown { id: 1, key: 0 }, t0);
-        assert_eq!(e.clients[&1].page, "lights");
-        e.tick(t0 + secs(99));
-        assert_eq!(e.clients[&1].page, "lights");
-        e.tick(t0 + secs(100));
-        assert_eq!(e.clients[&1].page, "home");
+        // home_after 100 leads to the device's home
+        r.tick(99);
+        assert_eq!(r.page(1), "lights");
+        r.tick(100);
+        assert_eq!(r.page(1), "home");
         // device b sets no idle: never goes home
-        connect_dev(&mut e, 2, "XlV2", false, None, t0);
-        e.goto_page(2, "home");
-        e.tick(t0 + secs(100_000));
-        assert_eq!(e.clients[&2].page, "home");
+        r.connect(2, "c2", "XlV2", false, None, 0);
+        r.e.goto_page(2, "home");
+        r.tick(100_000);
+        assert_eq!(r.page(2), "home");
     }
 
-    #[test]
-    fn device_brightness_and_default() {
-        let (mut e, _d) = device_engine(DEVICES_CONFIG);
-        let t = Instant::now();
-        let mut b = connect_dev(&mut e, 1, "Web Deck", true, None, t);
-        assert_eq!(brightness(&drain_out(&mut b)), [30]);
-        let mut a = connect_dev(&mut e, 2, "Mk2", false, None, t);
-        assert_eq!(brightness(&drain_out(&mut a)), [60], "default brightness");
-    }
-
-    #[test]
-    fn reload_re_resolves_devices_and_remembered_page_follows_the_device() {
-        let (mut e, d) = device_engine(DEVICES_CONFIG);
-        let t = Instant::now();
-        connect_dev(&mut e, 1, "Mk2", false, None, t); // a
-        e.goto_page(1, "lights");
+    #[tokio::test]
+    async fn reload_re_resolves_devices_and_a_remembered_page_follows_the_device() {
+        let mut r = Rig::without_client(DEVICES_CONFIG);
+        r.connect(1, "c1", "Mk2", false, None, 0); // a
+        r.e.goto_page(1, "lights");
         // default for mk2 now b: the client moves to b's home
-        write_config(
-            d.path(),
-            &DEVICES_CONFIG.replace(r#"mk2 = "a""#, r#"mk2 = "b""#),
-        );
-        e.handle_at(EngineEvent::Reload, t);
-        assert_eq!(dev_of(&e, 1), ("b".into(), "tv".into()));
+        r.rewrite(&DEVICES_CONFIG.replace(r#"mk2 = "a""#, r#"mk2 = "b""#));
+        r.at(EngineEvent::Reload, 0);
+        assert_eq!(r.device_and_page(1), ("b", "tv"));
         // same device but the page was dropped from it: home
-        write_config(
-            d.path(),
+        r.rewrite(
             &DEVICES_CONFIG
                 .replace(r#"mk2 = "a""#, r#"mk2 = "b""#)
                 .replace(r#"{ "tv", "home" }"#, r#"{ "home" }"#)
                 .replace(r#"home = "tv""#, r#"home = "home""#),
         );
-        e.handle_at(EngineEvent::Reload, t);
-        assert_eq!(dev_of(&e, 1), ("b".into(), "home".into()));
+        r.at(EngineEvent::Reload, 0);
+        assert_eq!(r.device_and_page(1), ("b", "home"));
         // an invalid device config keeps the old one
-        write_config(
-            d.path(),
-            r#"sdc.page("p", {}) sdc.device("x", { pages = { "q" } })"#,
-        );
-        e.handle_at(EngineEvent::Reload, t);
-        assert_eq!(dev_of(&e, 1), ("b".into(), "home".into()));
-    }
+        r.rewrite(r#"sdc.page("p", {}) sdc.device("x", { pages = { "q" } })"#);
+        r.at(EngineEvent::Reload, 0);
+        assert_eq!(r.device_and_page(1), ("b", "home"));
 
-    #[test]
-    fn reconnect_on_another_device_starts_at_its_home() {
-        let (mut e, d) = device_engine(DEVICES_CONFIG);
-        let t = Instant::now();
-        connect_dev(&mut e, 1, "Mk2", false, None, t); // a
-        e.goto_page(1, "home");
-        e.goto_page(1, "lights");
-        e.handle_at(EngineEvent::ClientDisconnected(1), t);
-        // same device: resumes
-        connect_dev(&mut e, 1, "Mk2", false, None, t + secs(1));
-        assert_eq!(dev_of(&e, 1), ("a".into(), "lights".into()));
-        e.handle_at(EngineEvent::ClientDisconnected(1), t + secs(2));
-        // another device (asked for by name): home of that device
-        connect_dev(&mut e, 1, "Mk2", false, Some("b"), t + secs(3));
-        assert_eq!(dev_of(&e, 1), ("b".into(), "tv".into()));
-        drop(d);
+        // a reconnect resumes on the same device, but starts at home on another one
+        r.rewrite(DEVICES_CONFIG);
+        r.at(EngineEvent::Reload, 1);
+        r.e.goto_page(1, "lights");
+        r.at(EngineEvent::ClientDisconnected(1), 1);
+        r.connect(2, "c1", "Mk2", false, None, 2);
+        assert_eq!(r.device_and_page(2), ("a", "lights"));
+        r.at(EngineEvent::ClientDisconnected(2), 3);
+        r.connect(3, "c1", "Mk2", false, Some("b"), 4);
+        assert_eq!(r.device_and_page(3), ("b", "tv"));
     }
 
     /// Serves a solid red PNG at /ok.png and 404 elsewhere; returns its base URL.
@@ -1646,19 +1161,23 @@ mod tests {
             ),
         );
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
-        let mut e = Engine::new(cfg, mpsc::unbounded_channel().0, Handle::current(), &ev_tx);
-        e.reload().unwrap(); // prefetches both static images
+        let (ha_tx, _ha) = mpsc::unbounded_channel();
+        // loading prefetches both static images
+        let mut e = Engine::new(cfg, ha_tx, Handle::current(), &ev_tx).unwrap();
         assert_eq!(e.pending_fetches(), 2);
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        e.handle(EngineEvent::ClientConnected {
-            web: false,
-            id: 1,
-            client_id: "c1".into(),
-            device: device(),
-            want_device: None,
-            tx,
-        });
+        e.handle(
+            EngineEvent::ClientConnected {
+                web: false,
+                id: 1,
+                client_id: "c1".into(),
+                device: device(),
+                want_device: None,
+                tx,
+            },
+            Instant::now(),
+        );
         // cache miss: the key renders right away, without the picture
         let first = drain(&mut rx);
         assert_eq!(first.len(), 15);
@@ -1670,13 +1189,11 @@ mod tests {
         for _ in 0..2 {
             let ev = next_event(&mut ev_rx).await;
             assert!(matches!(ev, EngineEvent::ImageFetched { .. }));
-            e.handle(ev);
+            e.handle(ev, Instant::now());
         }
         assert_eq!(e.pending_fetches(), 0);
         let after = drain(&mut rx);
-        let mut keys: Vec<_> = after.iter().map(|f| f.key).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, [0, 1]);
+        assert_eq!(keys(&after), [0, 1]);
         let ok = after.iter().find(|f| f.key == 0).unwrap();
         let bad = after.iter().find(|f| f.key == 1).unwrap();
         assert!(center(&ok.jpeg)[0] > 200, "fetched picture fills the key");
@@ -1686,10 +1203,9 @@ mod tests {
         );
 
         // a reload keeps downloaded images but retries failed ones
-        e.handle(EngineEvent::Reload);
+        e.handle(EngineEvent::Reload, Instant::now());
         assert_eq!(e.pending_fetches(), 1);
-        let resent = drain(&mut rx);
-        assert_eq!(resent.iter().map(|f| f.key).collect::<Vec<_>>(), [1]);
+        assert_eq!(keys(&drain(&mut rx)), [1]);
     }
 
     const SPAN_CONFIG: &str = r##"
@@ -1713,35 +1229,22 @@ mod tests {
                             sdc.button{ render = { text = "B" } } })
     "##;
 
-    fn key_set(frames: &[Frame]) -> Vec<u8> {
-        let mut k: Vec<u8> = frames.iter().map(|f| f.key).collect();
-        k.sort_unstable();
-        k
-    }
-
-    #[test]
-    fn span_dependency_rerenders_every_key_of_the_span() {
-        let (mut e, mut rx, _ha, _d) = setup(SPAN_CONFIG);
-        e.goto_page(1, "music");
+    #[tokio::test]
+    async fn spans_render_once_for_all_keys_and_report_the_pressed_key() {
+        let (mut r, mut rx) = Rig::new(SPAN_CONFIG);
+        r.e.goto_page(1, "music");
         drain(&mut rx);
         // a 2x2 span at slot 1 covers keys 1, 2, 6, 7
-        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
-        assert_eq!(key_set(&drain(&mut rx)), [1, 2, 6, 7]);
-        assert_eq!(e.dep_count("light.a"), 4);
-        // unchanged state -> nothing
-        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
+        r.at(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))), 0);
+        assert_eq!(keys(&drain(&mut rx)), [1, 2, 6, 7]);
+        assert_eq!(r.e.dep_count("light.a"), 4);
+        r.at(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))), 0);
         assert!(drain(&mut rx).is_empty());
-    }
 
-    #[test]
-    fn press_on_any_span_key_reports_key_and_index() {
-        let (mut e, mut rx, mut ha, _d) = setup(SPAN_CONFIG);
-        e.goto_page(1, "music");
-        drain(&mut rx);
         let mut got = Vec::new();
         for key in [1u8, 2, 6, 7] {
-            e.handle(EngineEvent::KeyDown { id: 1, key });
-            match ha.try_recv().unwrap() {
+            r.key(key, true, 0);
+            match r.ha.try_recv().unwrap() {
                 HaCommand::CallService { data, .. } => got.push((
                     data["key"].as_u64().unwrap(),
                     data["index"].as_u64().unwrap(),
@@ -1750,38 +1253,28 @@ mod tests {
         }
         assert_eq!(got, [(1, 0), (2, 1), (6, 2), (7, 3)]);
         // outside the span nothing is called
-        e.handle(EngineEvent::KeyDown { id: 1, key: 0 });
-        assert!(ha.try_recv().is_err());
+        r.key(0, true, 0);
+        assert_eq!(r.ha_calls(), 0);
     }
 
-    #[test]
-    fn span_off_grid_or_overlapping_shows_err_on_its_keys() {
-        let (mut e, mut rx, mut ha, _d) = setup(SPAN_CONFIG);
-        let err = e
-            .renderer
-            .render(&RenderSpec::error(), 72, Encoding::Jpeg(None));
-        e.goto_page(1, "off");
+    #[tokio::test]
+    async fn span_off_grid_or_overlapping_shows_err_on_its_keys() {
+        let (mut r, mut rx) = Rig::new(SPAN_CONFIG);
+        let err =
+            r.e.renderer
+                .render(&RenderSpec::error(), 72, Encoding::Jpeg(None));
+        drain(&mut rx);
+        r.e.goto_page(1, "off");
         let f = drain(&mut rx);
         // only the key that is on the grid exists; it shows ERR, and pressing it does nothing
         assert_eq!(f.iter().find(|f| f.key == 4).unwrap().jpeg, err);
-        e.handle(EngineEvent::KeyDown { id: 1, key: 4 });
-        assert!(ha.try_recv().is_err());
-        e.goto_page(1, "clash");
+        r.key(4, true, 0);
+        assert_eq!(r.ha_calls(), 0);
+        r.e.goto_page(1, "clash");
         let f = drain(&mut rx);
         for k in [0u8, 5] {
             assert_eq!(f.iter().find(|f| f.key == k).unwrap().jpeg, err, "key {k}");
         }
-    }
-
-    #[test]
-    fn span_tiles_differ_for_an_image_and_share_the_dependency() {
-        // regular buttons and a span on the same page keep their frames when only the span changes
-        let (mut e, mut rx, _ha, _d) = setup(SPAN_CONFIG);
-        e.goto_page(1, "music");
-        drain(&mut rx);
-        e.handle(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))));
-        let f = drain(&mut rx);
-        assert!(f.iter().all(|f| [1, 2, 6, 7].contains(&f.key)));
     }
 
     /// Dimmest channel of the top-edge pixel of a key image: the flash ring is white there.
@@ -1801,74 +1294,149 @@ mod tests {
         sdc.page("two", {})
     "#;
 
-    fn press_frames(
-        e: &mut Engine,
-        rx: &mut UnboundedReceiver<Out>,
-        key: u8,
-        t: Instant,
-    ) -> Vec<Frame> {
-        e.handle_at(EngineEvent::KeyDown { id: 1, key }, t);
-        drain(rx)
-    }
-
-    #[test]
-    fn press_flashes_the_key_then_clears_it() {
-        let (mut e, mut rx, _ha, _d) = setup(FLASH_PAGE);
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        let f = press_frames(&mut e, &mut rx, 0, t0);
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0].key, 0);
+    #[tokio::test]
+    async fn press_flashes_the_key_then_clears_it() {
+        let (mut r, mut rx) = Rig::new(FLASH_PAGE);
+        drain(&mut rx);
+        let redraw = |r: &mut Rig, ms: u64| {
+            r.e.handle(
+                EngineEvent::Redraw(TargetId::Key(1, 0)),
+                r.t0 + Duration::from_millis(ms),
+            )
+        };
+        r.key(0, true, 0);
+        let f = drain(&mut rx);
+        assert_eq!(keys(&f), [0]);
         assert!(edge(&f[0]) > 200, "ring while flashing");
-        e.tick(t0 + ms(399));
+        redraw(&mut r, 399);
         assert!(drain(&mut rx).is_empty(), "still flashing");
         // nothing else changed: the flash still ends and the key goes back to normal
-        e.tick(t0 + ms(400));
+        redraw(&mut r, 400);
         let f = drain(&mut rx);
-        assert_eq!(f.len(), 1);
+        assert_eq!(keys(&f), [0]);
         assert!(edge(&f[0]) < 80, "ring gone");
-        e.tick(t0 + ms(1400));
+        redraw(&mut r, 1400);
         assert!(drain(&mut rx).is_empty(), "no frame once settled");
         // a second press restarts the flash
-        assert_eq!(press_frames(&mut e, &mut rx, 0, t0 + ms(2000)).len(), 1);
+        r.key(0, true, 2);
+        assert_eq!(drain(&mut rx).len(), 1);
     }
 
-    #[test]
-    fn no_flash_for_errors_goto_opt_out_or_missing_press() {
-        let (mut e, mut rx, _ha, _d) = setup(FLASH_PAGE);
-        let t0 = Instant::now();
-        let f = press_frames(&mut e, &mut rx, 1, t0);
-        assert!(f.is_empty(), "feedback = false");
-        let f = press_frames(&mut e, &mut rx, 3, t0);
+    #[tokio::test]
+    async fn no_flash_for_errors_goto_opt_out_or_missing_press() {
+        let (mut r, mut rx) = Rig::new(FLASH_PAGE);
+        drain(&mut rx);
+        r.key(1, true, 0);
+        assert!(drain(&mut rx).is_empty(), "feedback = false");
+        r.key(3, true, 0);
+        let f = drain(&mut rx);
         assert_eq!(f.len(), 1);
         assert!(edge(&f[0]) < 80, "an ERR tile, not a ring");
-        assert!(
-            press_frames(&mut e, &mut rx, 4, t0).is_empty(),
-            "no press handler"
-        );
+        r.key(4, true, 0);
+        assert!(drain(&mut rx).is_empty(), "no press handler");
         // goto_page repaints the whole new page without a ring on the pressed key
-        let f = press_frames(&mut e, &mut rx, 2, t0);
-        assert!(f.iter().all(|f| edge(f) < 80));
-        e.tick(t0 + Duration::from_millis(500));
+        r.key(2, true, 0);
+        assert!(drain(&mut rx).iter().all(|f| edge(f) < 80));
+    }
+
+    #[tokio::test]
+    async fn feedback_off_and_wake_presses_do_not_flash() {
+        let (mut r, mut rx) = Rig::new(&format!("sdc.feedback(false) {FLASH_PAGE}"));
+        drain(&mut rx);
+        r.key(0, true, 0);
         assert!(drain(&mut rx).is_empty());
-    }
 
-    #[test]
-    fn sdc_feedback_false_disables_the_flash() {
-        let cfg = format!("sdc.feedback(false) {FLASH_PAGE}");
-        let (mut e, mut rx, _ha, _d) = setup(&cfg);
-        assert!(press_frames(&mut e, &mut rx, 0, Instant::now()).is_empty());
-    }
-
-    #[test]
-    fn wake_press_does_not_flash() {
         let cfg = format!(
             r#"{FLASH_PAGE} sdc.device("d", {{ pages = {{ "home", "two" }}, idle = {{ dim_after = 10 }} }})"#
         );
-        let (mut e, mut rx, _ha, _d) = setup(&cfg);
-        let t0 = Instant::now();
-        e.tick(t0 + secs(11));
+        let (mut r, mut rx) = Rig::new(&cfg);
+        r.tick(11);
         drain_out(&mut rx);
-        assert!(press_frames(&mut e, &mut rx, 0, t0 + secs(12)).is_empty());
+        r.key(0, true, 12);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    const PLUGIN_CONFIG: &str = r##"
+        sdc.page("home", {})
+        sdc.export("lamp", sdc.button{
+          render = function()
+            local l = ha.state("light.a")
+            return { text = "Lamp", bg = (l and l.state == "on") and "#f5b400" or "#222222" }
+          end,
+          press = function() ha.call("light", "toggle", { entity_id = "light.a" }) end })
+        local mode = {}
+        sdc.export("dimmer", sdc.dial{
+          render = function(ctx) return { title = mode[ctx.slot] or "Dim", value = "1", indicator = 5 } end,
+          press = function(ctx) mode[ctx.slot] = "Warm" end })
+    "##;
+
+    fn subscribe(slot: &str, export: &str, kind: SlotKind) -> PluginClientMessage {
+        PluginClientMessage::Subscribe {
+            slot: slot.into(),
+            export: export.into(),
+            kind,
+            size_px: 72,
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_slots_share_the_deck_behaviour() {
+        let mut r = Rig::without_client(PLUGIN_CONFIG);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        r.at(
+            EngineEvent::PluginConnected {
+                id: 7,
+                client_id: "p".into(),
+                tx,
+            },
+            0,
+        );
+        let plugin = |r: &mut Rig, msg| r.at(EngineEvent::Plugin { id: 7, msg }, 0);
+        let outs = |rx: &mut UnboundedReceiver<PluginOut>| -> Vec<PluginOut> {
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        };
+        assert!(matches!(&outs(&mut rx)[..], [PluginOut::Exports(items)] if items.len() == 2));
+
+        plugin(&mut r, subscribe("k", "lamp", SlotKind::Key));
+        plugin(&mut r, subscribe("d", "dimmer", SlotKind::Dial));
+        plugin(&mut r, subscribe("bad", "dimmer", SlotKind::Key));
+        let o = outs(&mut rx);
+        assert!(matches!(&o[0], PluginOut::KeyImage { slot, .. } if slot == "k"));
+        assert!(
+            matches!(&o[1], PluginOut::DialFeedback { slot, title, .. } if slot == "d" && title == "Dim")
+        );
+        assert!(matches!(&o[2], PluginOut::SlotError { slot, .. } if slot == "bad"));
+
+        // dependency tracking and change suppression
+        assert_eq!(r.e.dep_count("light.a"), 1);
+        r.at(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))), 1);
+        assert!(matches!(&outs(&mut rx)[..], [PluginOut::KeyImage { slot, .. }] if slot == "k"));
+        r.at(EngineEvent::Ha(HaEvent::Changed(st("light.a", "on"))), 2);
+        assert!(outs(&mut rx).is_empty());
+
+        // a press calls Lua and flashes; the scheduled redraw ends the flash
+        plugin(&mut r, PluginClientMessage::SlotDown { slot: "k".into() });
+        assert_eq!(r.ha_calls(), 1);
+        assert!(matches!(&outs(&mut rx)[..], [PluginOut::KeyImage { .. }]));
+        r.at(EngineEvent::Redraw(TargetId::Slot(7, "k".into())), 3);
+        assert!(matches!(&outs(&mut rx)[..], [PluginOut::KeyImage { .. }]));
+
+        // a dial handler may change what it renders; input for the wrong kind does nothing
+        plugin(&mut r, PluginClientMessage::DialDown { slot: "d".into() });
+        assert!(
+            matches!(&outs(&mut rx)[..], [PluginOut::DialFeedback { title, .. }] if title == "Warm")
+        );
+        r.e.turn(&TargetId::Slot(7, "k".into()), DialInput::Press);
+        assert!(outs(&mut rx).is_empty());
+
+        // unsubscribing and disconnecting forget the dependencies; a late redraw is ignored
+        plugin(
+            &mut r,
+            PluginClientMessage::Unsubscribe { slot: "k".into() },
+        );
+        assert_eq!(r.e.dep_count("light.a"), 0);
+        r.at(EngineEvent::PluginDisconnected(7), 4);
+        r.at(EngineEvent::Redraw(TargetId::Slot(7, "d".into())), 5);
+        assert!(r.e.deps.is_empty());
     }
 }

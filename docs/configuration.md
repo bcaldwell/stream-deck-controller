@@ -96,8 +96,8 @@ end
   key. When Home Assistant reports a change, only the keys that read that entity are re-rendered, and a frame is
   sent only if the image changed. There is nothing to subscribe to and no polling. Read the entities inside the
   `render` function, not at the top of the file, or they will not be tracked.
-- Without `HA_URL`/`HA_TOKEN`, or while Home Assistant is down, the server still runs: `ha.state` returns `nil` and
-  `ha.call` is dropped. The connection reconnects with backoff and re-reads all states.
+- `HA_URL`/`HA_TOKEN` are required to start the server. While Home Assistant is down it still runs: `ha.state`
+  returns `nil` and `ha.call` is dropped. The connection reconnects with backoff and re-reads all states.
 
 ## Pages
 

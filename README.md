@@ -16,7 +16,7 @@ Control Home Assistant from a Stream Deck, with the key layout and behaviour wri
 
 ```sh
 nix develop                      # pinned toolchain (or install Rust + task yourself)
-export HA_URL=https://homeassistant.local:8123 HA_TOKEN=...    # optional: without them keys just show no state
+export HA_URL=https://homeassistant.local:8123 HA_TOKEN=...    # required by the server
 task run-server                  # runs ./config.lua on :7700
 SDC_DECK_AUTH=none task run-server    # same, and lets you open http://127.0.0.1:7700/deck in a browser
 ```
