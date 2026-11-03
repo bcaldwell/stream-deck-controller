@@ -54,14 +54,7 @@ installable on a phone). It speaks the normal client protocol over `/deck/ws`.
 - **Own deck** (default): the browser is a client of its own (`client_id` `web-<random>`, kept in
   localStorage) with its own page, idle state and brightness, rendered at 144 or 192 px per key
   depending on `devicePixelRatio`.
-- **Mirror**: the dot on the bezel opens a device menu (`GET /deck/api/clients`: connected decks as
-  `[{client_id, model, rows, cols, page, web}]`; `web: true` marks other browsers' own decks, mirror
-  viewers are not listed). Picking a deck sends `Hello.mirror = <client_id>`: the browser then shows
-  that deck's page at its own key size and its presses act on the real deck (page changes, idle
-  wake). The real deck's brightness/idle messages are not sent to the viewer. If the deck is not
-  connected the server answers `Error` and the UI shows its own deck instead. The choice is kept in
-  localStorage.
-- **Layout** (own-deck mode only): when the config has `sdc.device`s, the menu also lists "Default" plus
+- **Layout**: when the config has `sdc.device`s, the dot on the bezel opens a menu listing "Default" plus
   every device name (`GET /deck/api/devices`: `[{name, pages, home}]`, same SSO auth, `[]` without
   devices). The choice is kept in localStorage and sent as `Hello.device_name`; changing it reconnects.
 - Phones: a portrait viewport rotates the deck 90 degrees; the bezel has a fullscreen button
@@ -141,17 +134,14 @@ red ERR tile until its next render. A connection may hold 256 slots; `size_px` m
 
 ## Spans
 
-A span (`sdc.span { cols, rows, render, press, release, gap }`, see
+A span (`sdc.span { cols, rows, render, press, release }`, see
 [Spans](../../docs/configuration.md#spans)) is placed when a client renders, because the grid size is per client:
 a span that runs off the client's rows/cols, or covers a slot holding a button or another span, is logged and
 shows the red `ERR` tile on its keys (as does a Lua error in its `render`). Pressing an ERR span does nothing.
 
-- `render` returns the usual descriptor, laid out once on a canvas of `cols*key + (cols-1)*gap` by
-  `rows*key + (rows-1)*gap` px, which then is cut into one tile per key (tile (c, r) starts at
-  `(c*(key+gap), r*(key+gap))`). `image` covers the whole canvas (center-cropped to its aspect); `icon`/`text`
-  are placed on the whole canvas, with padding and text size following its shorter side.
-- `gap` (per span) or `sdc.key_gap(px)` (global) is in px at 72 px keys and scales with the client's key size;
-  the default is 0 (plain tiles).
+- `render` returns the usual descriptor, laid out once on a canvas of `cols*key` by `rows*key` px and cut into one
+  tile per key. `image` covers the whole canvas (center-cropped to its aspect); `icon`/`text` are placed on the
+  whole canvas, with padding and text size following its shorter side.
 - Entities read by a span's `render` and its image downloads re-render all of its keys. Each tile is still only
   sent when its JPEG changed. Scaled pictures are cached per canvas size.
 - `ctx` in `render` has `key` = the span's top-left key; in `press`/`release`, `key` is the pressed key and

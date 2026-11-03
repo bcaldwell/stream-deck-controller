@@ -55,11 +55,11 @@ reconnects and can send an idle deck back home.
 ![The media page: album art spans four keys](images/page-media.png)
 
 **Spans.** A `sdc.span` covers a rectangle of keys and draws one picture across all of them, such as album art
-over 2x2 keys, optionally continuing across the physical gap between keys.
+over 2x2 keys.
 See [Spans](configuration.md#spans).
 
-**Browser deck.** `/deck` is a Stream Deck in a web page, usable as a deck of its own or as a live mirror of a
-physical one. See [Browser deck](browser.md).
+**Browser deck.** `/deck` is a Stream Deck in a web page, a deck of its own with the same pages and
+buttons. See [Browser deck](browser.md).
 
 ![The browser deck](images/deck-desktop.png)
 

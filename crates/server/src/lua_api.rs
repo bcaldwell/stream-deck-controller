@@ -140,12 +140,11 @@ pub struct DialOutcome {
     pub error: Option<String>,
 }
 
-/// Size of an `sdc.span`, and its own gap between keys (px at 72 px keys) if it sets one.
+/// Size of an `sdc.span`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpanDef {
     pub cols: u8,
     pub rows: u8,
-    pub gap: Option<u32>,
 }
 
 /// What a physical key shows on a page of a given grid size (see [`LuaRuntime::layout`]).
@@ -197,21 +196,16 @@ impl Default for IdleConfig {
 pub const DEFAULT_BRIGHTNESS: u8 = 60;
 const DEFAULT_DIM_BRIGHTNESS: u8 = 10;
 
-/// Config-wide settings (`sdc.key_gap`, `sdc.feedback`).
+/// Config-wide settings (`sdc.feedback`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
-    /// `sdc.key_gap`: default gap between keys for spans (px at 72 px keys).
-    pub key_gap: Option<u32>,
     /// `sdc.feedback`: flash a key after its press handler ran (default true).
     pub feedback: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self {
-            key_gap: None,
-            feedback: true,
-        }
+        Self { feedback: true }
     }
 }
 
@@ -705,16 +699,9 @@ fn install(
                     )))
                 }
             };
-            let gap: Option<u32> = field(&t, what, "gap")?;
-            if gap.is_some_and(|g| g > 72) {
-                return Err(mlua::Error::runtime(format!(
-                    "{what}: 'gap' must be an integer 0-72 (px at 72 px keys)"
-                )));
-            }
             let size = SpanDef {
                 cols: size("cols")?,
                 rows: size("rows")?,
-                gap,
             };
             button_def(&t, what, Some(size))
         })?,
@@ -774,18 +761,6 @@ fn install(
         "feedback",
         lua.create_function(move |_, on: bool| {
             reg.borrow_mut().settings.feedback = on;
-            Ok(())
-        })?,
-    )?;
-
-    let reg = registry.clone();
-    sdc.set(
-        "key_gap",
-        lua.create_function(move |_, px: i64| {
-            let px = u32::try_from(px).ok().filter(|p| *p <= 72).ok_or_else(|| {
-                mlua::Error::runtime(format!("sdc.key_gap: {px} is not 0-72 (px at 72 px keys)"))
-            })?;
-            reg.borrow_mut().settings.key_gap = Some(px);
             Ok(())
         })?,
     )?;
@@ -1502,31 +1477,29 @@ mod tests {
     fn span_layout_and_validation() {
         let rt = LuaRuntime::load_str(
             r#"
-            sdc.key_gap(10)
-            sdc.page("p", { false, sdc.span{ cols = 2, rows = 2, gap = 5, render = { text = "S" } },
+            sdc.page("p", { false, sdc.span{ cols = 2, rows = 2, render = { text = "S" } },
                             false, false, sdc.button{ render = { text = "B" } } })
             "#,
             Host::new(None),
         )
         .unwrap();
-        assert_eq!(rt.settings().key_gap, Some(10));
         let cells = rt.layout("p", 3, 5);
         assert_eq!(cells.len(), 15);
         let spans: Vec<_> = cells
             .iter()
             .enumerate()
             .filter_map(|(k, c)| match c {
-                Cell::Span(s) => Some((k, s.origin, s.index, s.error.is_some(), s.size.gap)),
+                Cell::Span(s) => Some((k, s.origin, s.index, s.error.is_some())),
                 _ => None,
             })
             .collect();
         assert_eq!(
             spans,
             [
-                (1, 1, 0, false, Some(5)),
-                (2, 1, 1, false, Some(5)),
-                (6, 1, 2, false, Some(5)),
-                (7, 1, 3, false, Some(5))
+                (1, 1, 0, false),
+                (2, 1, 1, false),
+                (6, 1, 2, false),
+                (7, 1, 3, false)
             ]
         );
         assert!(matches!(cells[4], Cell::Button(_)));
@@ -1552,9 +1525,7 @@ mod tests {
         for bad in [
             "sdc.span{ rows = 2 }",
             "sdc.span{ cols = 0, rows = 1 }",
-            "sdc.span{ cols = 1, rows = 1, gap = -1 }",
             "sdc.span{ cols = 1, rows = 1, press = 1 }",
-            "sdc.key_gap(-3)",
         ] {
             assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
         }

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -91,7 +91,9 @@ async fn main() -> Result<()> {
             drop(ha_rx);
         }
     }
-    let _watcher = watch_config(&config, &engine_tx);
+    let _watcher = watch::spawn(&config, engine_tx.clone())
+        .inspect_err(|e| tracing::warn!("config hot reload disabled: {e:#}"))
+        .ok();
 
     let listener = TcpListener::bind(&listen)
         .await
@@ -122,17 +124,4 @@ async fn main() -> Result<()> {
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
     }
     Ok(())
-}
-
-fn watch_config(
-    config: &Path,
-    engine_tx: &mpsc::UnboundedSender<engine::EngineEvent>,
-) -> Option<impl Sized> {
-    match watch::spawn(config, engine_tx.clone()) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            tracing::warn!("config hot reload disabled: {e:#}");
-            None
-        }
-    }
 }

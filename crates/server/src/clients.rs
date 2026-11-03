@@ -87,9 +87,7 @@ impl ClientBinaries {
             sha256: ours.sha256.clone(),
         })
     }
-}
 
-impl ClientBinaries {
     /// A single in-memory binary (for tests).
     pub fn with(target: &str, bytes: &[u8]) -> Self {
         let mut me = Self::default();

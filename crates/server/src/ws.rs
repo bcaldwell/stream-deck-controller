@@ -113,20 +113,15 @@ fn web_client_id(raw: &str) -> String {
     }
 }
 
-/// `deck`: the SSO user of a browser connection (`/deck/ws`); `None` for a normal client.
-async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Result<()> {
-    let WsState {
-        engine, binaries, ..
-    } = state;
-    let (mut sink, mut stream) = ws.split();
-
-    // Hello
-    let hello = tokio::time::timeout(HELLO_TIMEOUT, async {
+/// The first text message of a connection, parsed; errors if it takes longer than
+/// [`HELLO_TIMEOUT`] or the socket closes first.
+async fn read_hello<T: serde::de::DeserializeOwned>(
+    stream: &mut (impl futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin),
+) -> Result<T> {
+    tokio::time::timeout(HELLO_TIMEOUT, async {
         loop {
             match stream.next().await {
-                Some(Ok(Message::Text(t))) => {
-                    return Ok(serde_json::from_str::<ClientMessage>(&t)?)
-                }
+                Some(Ok(Message::Text(t))) => return Ok(serde_json::from_str(&t)?),
                 Some(Ok(Message::Close(_))) | None => bail!("closed before hello"),
                 Some(Ok(_)) => continue,
                 Some(Err(e)) => return Err(e.into()),
@@ -134,7 +129,15 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
         }
     })
     .await
-    .map_err(|_| anyhow!("timed out waiting for hello"))??;
+    .map_err(|_| anyhow!("timed out waiting for hello"))?
+}
+
+/// `deck`: the SSO user of a browser connection (`/deck/ws`); `None` for a normal client.
+async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Result<()> {
+    let WsState {
+        engine, binaries, ..
+    } = state;
+    let (mut sink, mut stream) = ws.split();
 
     let ClientMessage::Hello {
         protocol_version,
@@ -142,9 +145,8 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
         mut device,
         client_target,
         client_sha256,
-        mirror,
         device_name,
-    } = hello
+    } = read_hello(&mut stream).await?
     else {
         bail!("first message was not hello");
     };
@@ -173,21 +175,13 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
     } else {
         client_id
     };
-    let mirror = mirror.filter(|_| deck.is_some());
     if let Some(email) = &deck {
-        tracing::info!(
-            "{email} opened browser deck {client_id}{}",
-            mirror
-                .as_deref()
-                .map(|m| format!(" mirroring {m}"))
-                .unwrap_or_default()
-        );
+        tracing::info!("{email} opened browser deck {client_id}");
     }
     let key_count = device.key_count();
     // Device-ready frames only for a physical deck whose format we can produce; everyone else
     // keeps getting upright JPEGs.
     if deck.is_some()
-        || mirror.is_some()
         || !device
             .native
             .is_some_and(|n| n.server_can_produce(device.key_size_px))
@@ -220,22 +214,14 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
 
     let id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
-    let _ = match mirror {
-        Some(mirror) => engine.send(EngineEvent::ViewerConnected {
-            id,
-            mirror,
-            device,
-            tx,
-        }),
-        None => engine.send(EngineEvent::ClientConnected {
-            web: deck.is_some(),
-            id,
-            client_id,
-            device,
-            want_device: device_name.filter(|d| !d.is_empty()),
-            tx,
-        }),
-    };
+    let _ = engine.send(EngineEvent::ClientConnected {
+        web: deck.is_some(),
+        id,
+        client_id,
+        device,
+        want_device: device_name.filter(|d| !d.is_empty()),
+        tx,
+    });
 
     let result: Result<()> = async {
         loop {
@@ -244,10 +230,6 @@ async fn handle_conn(ws: WebSocket, state: WsState, deck: Option<String>) -> Res
                     Some(Out::Frame(f)) => sink.send(Message::Binary(ImageFrame::encode(f.key, &f.jpeg).into())).await?,
                     Some(Out::Brightness(percent)) => {
                         let msg = ServerMessage::Brightness { percent };
-                        sink.send(Message::Text(serde_json::to_string(&msg)?.into())).await?
-                    }
-                    Some(Out::Error(message)) => {
-                        let msg = ServerMessage::Error { message };
                         sink.send(Message::Text(serde_json::to_string(&msg)?.into())).await?
                     }
                     None => return Ok(()),
@@ -308,24 +290,10 @@ async fn handle_plugin(ws: WebSocket, engine: UnboundedSender<EngineEvent>) -> R
     let (mut sink, mut stream) = ws.split();
     let send = |m: &PluginServerMessage| serde_json::to_string(m).map(|j| Message::Text(j.into()));
 
-    let hello = tokio::time::timeout(HELLO_TIMEOUT, async {
-        loop {
-            match stream.next().await {
-                Some(Ok(Message::Text(t))) => {
-                    return Ok(serde_json::from_str::<PluginClientMessage>(&t)?)
-                }
-                Some(Ok(Message::Close(_))) | None => bail!("closed before hello"),
-                Some(Ok(_)) => continue,
-                Some(Err(e)) => return Err(e.into()),
-            }
-        }
-    })
-    .await
-    .map_err(|_| anyhow!("timed out waiting for hello"))??;
     let PluginClientMessage::PluginHello {
         protocol_version,
         client_id,
-    } = hello
+    } = read_hello(&mut stream).await?
     else {
         bail!("first message was not plugin_hello");
     };
