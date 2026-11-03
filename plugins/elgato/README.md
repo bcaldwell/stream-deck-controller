@@ -9,11 +9,15 @@ same bearer token, subscribes each visible action to an export and shows what th
 input go back to the server's Lua handlers. Everything else (page switching, idle, brightness) stays with the
 Elgato app.
 
-Two actions appear in the Stream Deck app under "Stream Deck Controller":
+Three actions appear in the Stream Deck app under "Stream Deck Controller":
 
 - **SDC Button** (keys): shows the exported button's image, runs its `press`/`release`.
 - **SDC Dial** (Stream Deck + dials): shows title, value, indicator bar and icon, runs `rotate`, `press`,
   `release` and `touch` (tap on the touch strip).
+- **SDC Deck Key** (keys): a key of a whole page set. The plugin then acts as a deck client on `/ws` (one connection
+  per physical Stream Deck that shows one), so you get pages, `goto_page`, home, spans and press flash like on a Pi.
+  No per-key settings: the key index is the position on the deck. The shared **Deck layout** setting is the
+  `sdc.device` name to request (empty = the server's default for the deck type). See `docs/plugin.md`.
 
 ## Install
 
@@ -75,8 +79,9 @@ task plugin:link      # build and `streamdeck link` it into the local Stream Dec
 (or `npm run build|pack|link|watch|typecheck` in this directory.) Plugin logs are in
 `ca.bcaldwell.sdc.sdPlugin/logs/` (linked install) or the Stream Deck app's log folder.
 
-Layout: `src/hub.ts` the single websocket (reconnect, subscriptions, tick batching; no Stream Deck imports),
-`src/actions/` the two actions (a shared base subscribes them and feeds the property inspector's dropdown), `src/protocol.ts` the message types
+Layout: `src/conn.ts` the reconnecting websocket both modes share (URL normalisation, backoff, heartbeat), `src/hub.ts` the
+`/plugin/ws` side (subscriptions, tick batching), `src/deck.ts` the per-device `/ws` deck links,
+`src/actions/` the actions (a shared base subscribes them and feeds the property inspector's dropdown), `src/protocol.ts` the message types
 (mirror of `crates/protocol`), `ca.bcaldwell.sdc.sdPlugin/` manifest, property inspector pages (`ui/`, built on
 the sdpi-components script from Elgato's CDN, like Elgato's own template) and icons (`scripts/gen-icons.py`
 regenerates them, stdlib only).

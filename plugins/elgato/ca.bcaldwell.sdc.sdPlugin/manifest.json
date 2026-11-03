@@ -20,6 +20,22 @@
 			]
 		},
 		{
+			"Name": "SDC Deck Key",
+			"UUID": "ca.bcaldwell.sdc.deckkey",
+			"Icon": "imgs/actions/deckkey/icon",
+			"Tooltip": "A key of a whole page set from your stream-deck-controller server, with navigation. Place one on every key.",
+			"PropertyInspectorPath": "ui/deckkey.html",
+			"Controllers": [
+				"Keypad"
+			],
+			"States": [
+				{
+					"Image": "imgs/actions/deckkey/key",
+					"ShowTitle": false
+				}
+			]
+		},
+		{
 			"Name": "SDC Dial",
 			"UUID": "ca.bcaldwell.sdc.dial",
 			"Icon": "imgs/actions/dial/icon",
@@ -48,7 +64,7 @@
 	"Category": "Stream Deck Controller",
 	"CategoryIcon": "imgs/plugin/category-icon",
 	"CodePath": "bin/plugin.js",
-	"Description": "Use buttons and dials defined on your stream-deck-controller server next to normal Stream Deck actions.",
+	"Description": "Use buttons, dials and whole pages defined on your stream-deck-controller server next to normal Stream Deck actions.",
 	"Icon": "imgs/plugin/marketplace",
 	"SDKVersion": 3,
 	"Software": {
