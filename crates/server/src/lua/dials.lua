@@ -50,14 +50,12 @@ end
 
 local TITLE = { brightness = "", warmth = " · warmth", hue = " · hue" }
 
---- sdc.light_dial { entity, label?, icon?, modes?, step? }
+--- sdc.light_dial { entity, label?, icon? }
 --- Turn: change the current mode. Press: next mode (brightness, then warmth and
 --- hue where the light supports them). Tap the touch strip: toggle the light.
 function sdc.light_dial(opts)
   check(opts, "sdc.light_dial")
   local entity, label, icon = opts.entity, opts.label or opts.entity, opts.icon
-  local step = { brightness = 5, warmth = 100, hue = 10 }
-  for k, v in pairs(opts.step or {}) do step[k] = v end
   local slot_mode = {}
 
   local function state()
@@ -65,7 +63,7 @@ function sdc.light_dial(opts)
     return s, (s and s.state == "on"), (s and s.attributes) or {}
   end
   local function mode(ctx, a)
-    local modes = opts.modes or light_modes(a)
+    local modes = light_modes(a)
     for _, m in ipairs(modes) do
       if m == slot_mode[ctx.slot] then return m, modes end
     end
@@ -106,19 +104,19 @@ function sdc.light_dial(opts)
       if m == "warmth" then
         local lo, hi = range(a)
         local k = target(entity .. ":warmth", (on and a.color_temp_kelvin) or round((lo + hi) / 2))
-        k = clamp(k + ticks * step.warmth, lo, hi)
+        k = clamp(k + ticks * 100, lo, hi)
         set_target(entity .. ":warmth", k)
         ha.call("light", "turn_on", { entity_id = entity, color_temp_kelvin = k })
       elseif m == "hue" then
         local c = (on and hs(a)) or { 0, 0 }
-        local h = (target(entity .. ":hue", c[1]) + ticks * step.hue) % 360
+        local h = (target(entity .. ":hue", c[1]) + ticks * 10) % 360
         -- from white, jump to a saturated colour so the turn shows
         local sat = c[2] >= 30 and c[2] or 80
         set_target(entity .. ":hue", h)
         ha.call("light", "turn_on", { entity_id = entity, hs_color = { h, sat } })
       else
         local p = target(entity .. ":brightness", on and a.brightness and round(a.brightness / 2.55) or 0)
-        p = clamp(p + ticks * step.brightness, 0, 100)
+        p = clamp(p + ticks * 5, 0, 100)
         set_target(entity .. ":brightness", p)
         if p == 0 then
           ha.call("light", "turn_off", { entity_id = entity })
@@ -141,12 +139,11 @@ function sdc.light_dial(opts)
   }
 end
 
---- sdc.volume_dial { entity, label?, icon?, step? }
---- Turn: volume (step % per detent, default 2). Press: mute/unmute.
+--- sdc.volume_dial { entity, label?, icon? }
+--- Turn: volume (2% per detent). Press: mute/unmute.
 function sdc.volume_dial(opts)
   check(opts, "sdc.volume_dial")
   local entity, label, icon = opts.entity, opts.label or opts.entity, opts.icon
-  local step = opts.step or 2
   local key = entity .. ":volume"
 
   local function attrs()
@@ -164,7 +161,7 @@ function sdc.volume_dial(opts)
       return { title = label, value = muted and "mute" or (v .. "%"), indicator = muted and 0 or v, icon = icon }
     end,
     rotate = function(_, ticks)
-      local v = clamp(target(key, current(attrs())) + ticks * step, 0, 100)
+      local v = clamp(target(key, current(attrs())) + ticks * 2, 0, 100)
       set_target(key, v)
       ha.call("media_player", "volume_set", { entity_id = entity, volume_level = v / 100 })
     end,

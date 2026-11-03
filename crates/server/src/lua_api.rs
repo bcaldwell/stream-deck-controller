@@ -14,9 +14,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use sdc_protocol::{ExportItem, SlotKind, DEVICE_TYPES};
 
 use crate::ha::{EntityState, HaCommand};
-use crate::render::{Chevron, Color, RenderSpec};
+use crate::render::{Chevron, Color, RenderSpec, ERR_BG};
 
-pub fn lerr(e: mlua::Error) -> anyhow::Error {
+fn lerr(e: mlua::Error) -> anyhow::Error {
     anyhow!("{e}")
 }
 
@@ -29,11 +29,12 @@ pub const DIAL_SETTLE: Duration = Duration::from_millis(1500);
 const DIALS_LUA: &str = include_str!("lua/dials.lua");
 
 /// State shared between the engine and the Lua closures (single-threaded).
-#[derive(Default)]
 pub struct Host {
     pub states: RefCell<HashMap<String, EntityState>>,
-    pub ha_tx: Option<UnboundedSender<HaCommand>>,
+    ha_tx: UnboundedSender<HaCommand>,
+    /// The entities `ha.state` has read since a render started (None outside a render).
     tracking: RefCell<Option<HashSet<String>>>,
+    /// The page a handler asked for with `ctx.goto_page`.
     pending_goto: RefCell<Option<String>>,
     /// Tests set `sdc.now()` by hand.
     #[cfg(test)]
@@ -41,10 +42,14 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn new(ha_tx: Option<UnboundedSender<HaCommand>>) -> Rc<Self> {
+    pub fn new(ha_tx: UnboundedSender<HaCommand>) -> Rc<Self> {
         Rc::new(Self {
+            states: RefCell::default(),
             ha_tx,
-            ..Default::default()
+            tracking: RefCell::default(),
+            pending_goto: RefCell::default(),
+            #[cfg(test)]
+            now_ms: std::cell::Cell::default(),
         })
     }
 
@@ -134,12 +139,6 @@ impl Default for DialSpec {
     }
 }
 
-pub struct DialOutcome {
-    pub spec: DialSpec,
-    pub deps: HashSet<String>,
-    pub error: Option<String>,
-}
-
 /// Size of an `sdc.span`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpanDef {
@@ -196,19 +195,6 @@ impl Default for IdleConfig {
 pub const DEFAULT_BRIGHTNESS: u8 = 60;
 const DEFAULT_DIM_BRIGHTNESS: u8 = 10;
 
-/// Config-wide settings (`sdc.feedback`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Settings {
-    /// `sdc.feedback`: flash a key after its press handler ran (default true).
-    pub feedback: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self { feedback: true }
-    }
-}
-
 /// `sdc.device{...}`: which pages a deck shows, where it starts, and its own idle/brightness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceDef {
@@ -227,9 +213,10 @@ pub struct DeviceDef {
 struct Registry {
     pages: Vec<(String, Vec<Option<ButtonDef>>)>,
     devices: Vec<DeviceDef>,
-    /// `sdc.default_device`: device type (or `*`) -> device name.
+    /// `sdc.default_device`: device type -> device name.
     default_devices: Vec<(String, String)>,
-    settings: Settings,
+    /// `sdc.feedback`: flash a key after its press handler ran (default true).
+    feedback: bool,
     exports: Vec<(String, Export)>,
 }
 
@@ -249,8 +236,49 @@ pub struct CtxInfo {
     pub slot: Option<String>,
 }
 
-pub struct RenderOutcome {
-    pub spec: RenderSpec,
+/// A button or dial, which draws itself from its `render`.
+pub trait Renders {
+    /// What `render` produces.
+    type Spec;
+    fn render_value(&self) -> &Value;
+    fn parse(v: &Value) -> mlua::Result<Self::Spec>;
+    /// What is shown when `render` fails.
+    fn error_spec() -> Self::Spec;
+}
+
+impl Renders for ButtonDef {
+    type Spec = RenderSpec;
+    fn render_value(&self) -> &Value {
+        &self.render
+    }
+    fn parse(v: &Value) -> mlua::Result<RenderSpec> {
+        parse_spec(v)
+    }
+    fn error_spec() -> RenderSpec {
+        RenderSpec::error()
+    }
+}
+
+impl Renders for DialDef {
+    type Spec = DialSpec;
+    fn render_value(&self) -> &Value {
+        &self.render
+    }
+    fn parse(v: &Value) -> mlua::Result<DialSpec> {
+        parse_dial_spec(v)
+    }
+    fn error_spec() -> DialSpec {
+        DialSpec {
+            title: "ERR".into(),
+            bg: ERR_BG,
+            ..DialSpec::default()
+        }
+    }
+}
+
+/// The result of running a `render`; never a failure, a Lua error shows as the error tile.
+pub struct Rendered<S> {
+    pub spec: S,
     /// Entity ids read through `ha.state` during the render.
     pub deps: HashSet<String>,
     pub error: Option<String>,
@@ -281,45 +309,31 @@ impl LuaRuntime {
     pub fn load(path: &Path, host: Rc<Host>) -> Result<Self> {
         let src =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let rt = Self::new(host, path.parent())?;
-        rt.lua
-            .load(&src)
-            .set_name(format!("@{}", path.display()))
-            .exec()
-            .map_err(lerr)?;
-        rt.validate_devices()?;
-        Ok(rt)
+        Self::from_source(&src, &format!("@{}", path.display()), path.parent(), host)
     }
 
-    /// Loads config source from a string, exactly as written (tests of the loader itself).
-    #[cfg(test)]
-    pub(crate) fn load_raw(src: &str, host: Rc<Host>) -> Result<Self> {
-        let rt = Self::new(host, None)?;
-        rt.lua.load(src).set_name("=config").exec().map_err(lerr)?;
-        rt.validate_devices()?;
-        Ok(rt)
-    }
-
-    /// Like [`LuaRuntime::load_raw`], but a config that defines no `sdc.device` gets one named
-    /// "test" showing every page it defined (see [`test_config`]).
-    #[cfg(test)]
-    pub(crate) fn load_str(src: &str, host: Rc<Host>) -> Result<Self> {
-        Self::load_raw(&test_config(src), host)
-    }
-
-    fn new(host: Rc<Host>, dir: Option<&Path>) -> Result<Self> {
+    /// Runs config source `src` (chunk name `name`; `dir` is where relative `require`s look)
+    /// and validates what it defined.
+    fn from_source(src: &str, name: &str, dir: Option<&Path>, host: Rc<Host>) -> Result<Self> {
         let lua = Lua::new();
-        let registry = Rc::new(RefCell::new(Registry::default()));
+        let registry = Rc::new(RefCell::new(Registry {
+            feedback: true,
+            ..Registry::default()
+        }));
         install(&lua, &host, &registry, dir).map_err(lerr)?;
-        Ok(Self {
+        lua.load(src).set_name(name).exec().map_err(lerr)?;
+        let rt = Self {
             lua,
             host,
             registry,
-        })
+        };
+        rt.validate_devices()?;
+        Ok(rt)
     }
 
-    pub fn settings(&self) -> Settings {
-        self.registry.borrow().settings
+    /// `sdc.feedback`: whether a key flashes after its press handler ran.
+    pub fn feedback(&self) -> bool {
+        self.registry.borrow().feedback
     }
 
     /// Cross-checks `sdc.device` / `sdc.default_device` against the pages once the whole config
@@ -352,7 +366,7 @@ impl LuaRuntime {
     }
 
     /// The device a connecting client gets: the requested name if it exists, else
-    /// `sdc.default_device` for its `kind` then `*`, else the first `sdc.device`.
+    /// `sdc.default_device` for its `kind`, else the first `sdc.device`.
     pub fn resolve_device(&self, requested: Option<&str>, kind: &str) -> DeviceDef {
         let r = self.registry.borrow();
         let find = |name: &str| r.devices.iter().find(|d| d.name == name);
@@ -362,14 +376,10 @@ impl LuaRuntime {
                 None => tracing::warn!("requested device '{name}' is not defined, using default"),
             }
         }
-        [kind, "*"]
+        r.default_devices
             .iter()
-            .find_map(|k| {
-                r.default_devices
-                    .iter()
-                    .find(|(t, _)| t == k)
-                    .and_then(|(_, n)| find(n))
-            })
+            .find(|(t, _)| t == kind)
+            .and_then(|(_, n)| find(n))
             .or_else(|| r.devices.first())
             .cloned()
             .expect("validated: at least one device")
@@ -390,17 +400,9 @@ impl LuaRuntime {
         self.registry.borrow().devices.clone()
     }
 
+    /// Whether a page of that name was defined.
     pub fn has_page(&self, name: &str) -> bool {
         self.registry.borrow().pages.iter().any(|(n, _)| n == name)
-    }
-
-    pub fn page_names(&self) -> Vec<String> {
-        self.registry
-            .borrow()
-            .pages
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect()
     }
 
     #[cfg(test)]
@@ -420,7 +422,7 @@ impl LuaRuntime {
             .iter()
             .find(|(n, _)| n == page)
             .map(|(_, k)| k.as_slice())
-            .unwrap_or_default();
+            .expect("layout of a defined page");
         let count = rows as usize * cols as usize;
         let mut cells: Vec<Option<Cell>> = vec![None; count];
         for (k, def) in keys.iter().enumerate().take(count) {
@@ -490,62 +492,34 @@ impl LuaRuntime {
         names
     }
 
-    /// Runs a button's render, recording the entities it reads. Never fails: errors
-    /// are reported in the outcome (and the spec is the error tile).
-    pub fn render(&self, btn: &ButtonDef, info: &CtxInfo) -> RenderOutcome {
-        let (res, deps) = self.tracked(&btn.render, info, parse_spec);
-        let (spec, error) = match res {
-            Ok(spec) => (spec, None),
-            Err(e) => (RenderSpec::error(), Some(e.to_string())),
-        };
-        RenderOutcome { spec, deps, error }
-    }
-
-    /// Runs a dial's render, recording the entities it reads (like [`LuaRuntime::render`]).
-    pub fn render_dial(&self, dial: &DialDef, info: &CtxInfo) -> DialOutcome {
-        let (res, deps) = self.tracked(&dial.render, info, parse_dial_spec);
-        let (spec, error) = match res {
-            Ok(spec) => (spec, None),
-            Err(e) => (
-                DialSpec {
-                    title: "ERR".into(),
-                    bg: crate::render::ERR_BG,
-                    ..DialSpec::default()
-                },
-                Some(e.to_string()),
-            ),
-        };
-        DialOutcome { spec, deps, error }
-    }
-
-    /// Evaluates a `render` (a function of `ctx`, or a static value) through `parse`, together
-    /// with the entities read through `ha.state` meanwhile.
-    fn tracked<T>(
-        &self,
-        render: &Value,
-        info: &CtxInfo,
-        parse: fn(&Value) -> mlua::Result<T>,
-    ) -> (mlua::Result<T>, HashSet<String>) {
+    /// Runs a button's or dial's `render` (a function of `ctx`, or a static value), recording
+    /// the entities it reads through `ha.state`. Never fails: an error is reported in the
+    /// outcome and the spec is the error tile.
+    pub fn render<D: Renders>(&self, def: &D, info: &CtxInfo) -> Rendered<D::Spec> {
         *self.host.tracking.borrow_mut() = Some(HashSet::new());
-        let res = (|| match render {
-            Value::Function(f) => parse(&f.call::<Value>(self.make_ctx(info)?)?),
-            other => parse(other),
+        let res = (|| match def.render_value() {
+            Value::Function(f) => D::parse(&f.call::<Value>(self.make_ctx(info)?)?),
+            other => D::parse(other),
         })();
-        (
-            res,
-            self.host.tracking.borrow_mut().take().unwrap_or_default(),
-        )
+        let deps = self.host.tracking.borrow_mut().take().unwrap_or_default();
+        match res {
+            Ok(spec) => Rendered {
+                spec,
+                deps,
+                error: None,
+            },
+            Err(e) => Rendered {
+                spec: D::error_spec(),
+                deps,
+                error: Some(e.to_string()),
+            },
+        }
     }
 
     /// Runs the press (`down`) or release handler. Returns a requested page switch.
     pub fn press(&self, btn: &ButtonDef, info: &CtxInfo, down: bool) -> Result<Option<String>> {
-        let Some(f) = (if down { &btn.press } else { &btn.release }) else {
-            return Ok(None);
-        };
-        *self.host.pending_goto.borrow_mut() = None;
-        let ctx = self.make_ctx(info).map_err(lerr)?;
-        f.call::<()>(ctx).map_err(lerr)?;
-        Ok(self.host.pending_goto.borrow_mut().take())
+        let f = if down { &btn.press } else { &btn.release };
+        self.call_handler(f, info, None)
     }
 
     /// The exports plugins can see, in definition order.
@@ -579,21 +553,33 @@ impl LuaRuntime {
     /// Runs the dial handler for `input` (none set = nothing happens). A `goto_page` is ignored:
     /// plugins have no pages.
     pub fn dial_input(&self, dial: &DialDef, info: &CtxInfo, input: DialInput) -> Result<()> {
-        let f = match input {
-            DialInput::Rotate(_) => &dial.rotate,
-            DialInput::Press => &dial.press,
-            DialInput::Release => &dial.release,
-            DialInput::Touch => &dial.touch,
+        let (f, ticks) = match input {
+            DialInput::Rotate(ticks) => (&dial.rotate, Some(ticks)),
+            DialInput::Press => (&dial.press, None),
+            DialInput::Release => (&dial.release, None),
+            DialInput::Touch => (&dial.touch, None),
         };
-        let Some(f) = f else { return Ok(()) };
+        self.call_handler(f, info, ticks)?;
+        Ok(())
+    }
+
+    /// Calls an input handler (if set) with `ctx` (and `ticks` for a dial turn); returns the
+    /// page it asked to go to.
+    fn call_handler(
+        &self,
+        f: &Option<Function>,
+        info: &CtxInfo,
+        ticks: Option<i32>,
+    ) -> Result<Option<String>> {
+        let Some(f) = f else { return Ok(None) };
         *self.host.pending_goto.borrow_mut() = None;
         let ctx = self.make_ctx(info).map_err(lerr)?;
-        match input {
-            DialInput::Rotate(ticks) => f.call::<()>((ctx, ticks)),
-            _ => f.call::<()>(ctx),
+        match ticks {
+            Some(ticks) => f.call::<()>((ctx, ticks)),
+            None => f.call::<()>(ctx),
         }
         .map_err(lerr)?;
-        Ok(())
+        Ok(self.host.pending_goto.borrow_mut().take())
     }
 
     fn make_ctx(&self, info: &CtxInfo) -> mlua::Result<Table> {
@@ -760,7 +746,7 @@ fn install(
     sdc.set(
         "feedback",
         lua.create_function(move |_, on: bool| {
-            reg.borrow_mut().settings.feedback = on;
+            reg.borrow_mut().feedback = on;
             Ok(())
         })?,
     )?;
@@ -875,9 +861,9 @@ fn install(
             let mut map = Vec::new();
             for pair in t.pairs::<String, Value>() {
                 let (k, v) = pair?;
-                if k != "*" && !DEVICE_TYPES.contains(&k.as_str()) {
+                if !DEVICE_TYPES.contains(&k.as_str()) {
                     return Err(mlua::Error::runtime(format!(
-                        "sdc.default_device: unknown device type '{k}' (use {} or \"*\")",
+                        "sdc.default_device: unknown device type '{k}' (use {})",
                         DEVICE_TYPES.join(", ")
                     )));
                 }
@@ -921,18 +907,11 @@ fn install(
                     Some(v) => lua.from_value(v)?,
                     None => serde_json::json!({}),
                 };
-                match &h.ha_tx {
-                    Some(tx) => {
-                        let _ = tx.send(HaCommand::CallService {
-                            domain,
-                            service,
-                            data,
-                        });
-                    }
-                    None => tracing::warn!(
-                        "ha.call({domain}.{service}) ignored: home assistant not configured"
-                    ),
-                }
+                let _ = h.ha_tx.send(HaCommand::CallService {
+                    domain,
+                    service,
+                    data,
+                });
                 Ok(())
             },
         )?,
@@ -1082,14 +1061,10 @@ fn parse_spec(v: &Value) -> mlua::Result<RenderSpec> {
     let mut spec = RenderSpec::default();
     let t = match v {
         Value::Nil | Value::Boolean(false) => return Ok(spec),
-        Value::String(s) => {
-            spec.text = Some(s.to_str()?.to_string());
-            return Ok(spec);
-        }
         Value::Table(t) => t,
         other => {
             return Err(mlua::Error::runtime(format!(
-                "render must return a table, string or nil, got {}",
+                "render must return a table or nil, got {}",
                 other.type_name()
             )))
         }
@@ -1112,12 +1087,11 @@ fn parse_spec(v: &Value) -> mlua::Result<RenderSpec> {
     spec.font_size = t.get("font_size")?;
     spec.chevron = match t.get::<Value>("chevron")? {
         Value::Nil | Value::Boolean(false) => Chevron::None,
-        Value::Boolean(true) => Chevron::Forward,
         Value::String(v) if v.to_str()? == "forward" => Chevron::Forward,
         Value::String(v) if v.to_str()? == "back" => Chevron::Back,
         other => {
             return Err(mlua::Error::runtime(format!(
-                "chevron: expected true, false, \"forward\" or \"back\", got {other:?}"
+                "chevron: expected \"forward\" or \"back\", got {other:?}"
             )))
         }
     };
@@ -1128,6 +1102,9 @@ fn parse_spec(v: &Value) -> mlua::Result<RenderSpec> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+    type HaRx = UnboundedReceiver<HaCommand>;
 
     fn info(page: &str, key: u8) -> CtxInfo {
         CtxInfo {
@@ -1142,151 +1119,113 @@ mod tests {
         }
     }
 
-    fn state(id: &str, s: &str) -> EntityState {
-        EntityState {
-            entity_id: id.into(),
-            state: s.into(),
-            attributes: json!({"brightness": 128}),
+    fn slot_info(slot: &str) -> CtxInfo {
+        CtxInfo {
+            slot: Some(slot.into()),
+            ..info("", 0)
         }
     }
 
-    #[test]
-    fn pages_and_buttons() {
-        let rt = LuaRuntime::load_str(
-            r#"
-            local sdc = require("sdc")
-            sdc.page("a", { sdc.button{ render = { text = "A" } }, false, sdc.button{ render = function() return { text = "C" } end } })
-            sdc.page("b", { sdc.button{ render = { text = "B" } } })
-            "#,
-            Host::new(None),
-        )
-        .unwrap();
-        assert_eq!(rt.page_names(), ["a", "b"]);
-        assert!(rt.button("a", 0).is_some());
-        assert!(rt.button("a", 1).is_none());
-        assert!(rt.button("a", 2).is_some());
-        assert!(rt.button("a", 3).is_none());
+    fn set_state(host: &Host, id: &str, state: &str, attributes: serde_json::Value) {
+        host.states.borrow_mut().insert(
+            id.into(),
+            EntityState {
+                entity_id: id.into(),
+                state: state.into(),
+                attributes,
+            },
+        );
+    }
+
+    /// Loads `src` as the test prelude wraps it (a device listing every page, unless the config
+    /// defines one); `ha.call`s land in the returned receiver.
+    fn try_load(src: &str) -> (Result<LuaRuntime>, Rc<Host>, HaRx) {
+        let (tx, rx) = unbounded_channel();
+        let host = Host::new(tx);
+        host.now_ms.set(Some(0.0));
+        let rt = LuaRuntime::from_source(&test_config(src), "=config", None, host.clone());
+        (rt, host, rx)
+    }
+
+    fn load(src: &str) -> LuaRuntime {
+        try_load(src).0.unwrap()
+    }
+
+    fn load_err(src: &str) -> String {
+        match try_load(src).0 {
+            Ok(_) => panic!("accepted: {src}"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    fn call_data(rx: &mut HaRx) -> (String, serde_json::Value) {
+        let HaCommand::CallService { service, data, .. } = rx.try_recv().expect("a call");
+        (service, data)
     }
 
     #[test]
-    fn static_and_function_render() {
-        let rt = LuaRuntime::load_str(
+    fn buttons_render_and_press() {
+        let (rt, _, mut rx) = try_load(
             r##"
+            local other = sdc.page("other", {})
             sdc.page("p", {
-              sdc.button{ render = { text = "Hi", bg = "#112233", font_size = 20 } },
-              sdc.button{ render = function(ctx) return { text = ctx.page .. ctx.key, fg = "#ff0000" } end },
-              sdc.button{ render = "plain" },
+              sdc.button{ render = { text = "Hi", bg = "#112233", font_size = 20, chevron = "back" } },
+              false,
+              sdc.button{ render = function(ctx) return { text = ctx.page .. ctx.key, fg = "#ff0000" } end,
+                          press = function(ctx) ctx.goto_page(other) end },
+              sdc.button{ press = function(ctx) ctx.goto_page("p")
+                                                ha.call("light", "toggle", { entity_id = "light.a" }) end },
+              sdc.button{ render = function() error("boom") end, press = function() error("bang") end },
             })
             "##,
-            Host::new(None),
-        )
-        .unwrap();
-        let a = rt.render(&rt.button("p", 0).unwrap(), &info("p", 0));
+        );
+        let rt = rt.unwrap();
+        let btn = |k| rt.button("p", k).unwrap();
+        assert!(rt.button("p", 1).is_none());
+
+        let a = rt.render(&btn(0), &info("p", 0));
         assert_eq!(a.spec.text.as_deref(), Some("Hi"));
         assert_eq!(a.spec.bg, Color([0x11, 0x22, 0x33]));
         assert_eq!(a.spec.font_size, Some(20.0));
-        assert!(a.error.is_none());
-        let b = rt.render(&rt.button("p", 1).unwrap(), &info("p", 1));
-        assert_eq!(b.spec.text.as_deref(), Some("p1"));
-        assert_eq!(b.spec.fg, Color([255, 0, 0]));
-        let c = rt.render(&rt.button("p", 2).unwrap(), &info("p", 2));
-        assert_eq!(c.spec.text.as_deref(), Some("plain"));
-    }
-
-    #[test]
-    fn pages_and_devices_are_handles_or_names() {
-        let rt = LuaRuntime::load_str(
-            r#"
-            local other = sdc.page("other", {})
-            local home = sdc.page("home", {
-              sdc.button{ press = function(ctx) ctx.goto_page(other) end },
-              sdc.button{ press = function(ctx) ctx.goto_page("home") end },
-            })
-            assert(tostring(home) == "home")
-            local deck = sdc.device("deck", { pages = { home, "other" }, home = other })
-            sdc.device("web", { pages = { home } })
-            sdc.default_device { mk2 = deck, browser = "web" }
-            "#,
-            Host::new(None),
-        )
-        .unwrap();
-        let d = rt.device("deck").unwrap();
+        assert_eq!(a.spec.chevron, Chevron::Back);
+        let b = rt.render(&btn(2), &info("p", 2));
         assert_eq!(
-            (d.pages.as_slice(), d.home.as_str()),
-            (&["home".to_string(), "other".to_string()][..], "other")
+            (b.spec.text.as_deref(), b.spec.fg),
+            (Some("p2"), Color([255, 0, 0]))
         );
-        assert_eq!(rt.resolve_device(None, "mk2").name, "deck");
-        assert_eq!(rt.resolve_device(None, "browser").name, "web");
-        let goto = |key| {
-            rt.press(&rt.button("home", key).unwrap(), &info("home", key), true)
-                .unwrap()
-        };
-        assert_eq!(goto(0).as_deref(), Some("other"), "handle");
-        assert_eq!(goto(1).as_deref(), Some("home"), "name");
-    }
 
-    #[test]
-    fn undefined_page_variables_are_load_errors() {
-        let err = |src: &str| {
-            LuaRuntime::load_str(src, Host::new(None))
-                .err()
-                .map(|e| format!("{e:#}"))
-                .unwrap_or_default()
-        };
-        // a typo'd variable is nil: inside the list it would otherwise silently end it
-        let e = err(r#"local a = sdc.page("a", {}) local b = sdc.page("b", {})
-                       sdc.device("d", { pages = { a, bb, b } })"#);
-        assert!(
-            e.contains("pages[2] is nil") && e.contains("defined above"),
-            "{e}"
-        );
-        let e = err(r#"sdc.page("a", {}) sdc.device("d", { pages = { "a" } })
-                       sdc.default_device { mk2 = sdc.page("a", {}) }"#);
-        assert!(e.contains("must be a device"), "{e}");
-        let e = err(r#"local a = sdc.page("a", {}) sdc.device("d", { pages = { a }, home = 5 })"#);
-        assert!(e.contains("'home' must be a page"), "{e}");
-    }
+        // a Lua error is the error tile, not a failure
+        let e = rt.render(&btn(4), &info("p", 4));
+        assert_eq!(e.spec, RenderSpec::error());
+        assert!(e.error.unwrap().contains("boom"));
+        assert!(rt.press(&btn(4), &info("p", 4), true).is_err());
 
-    #[test]
-    fn goto_page_from_press() {
-        let rt = LuaRuntime::load_str(
-            r#"sdc.page("p", { sdc.button{ press = function(ctx) ctx.goto_page("other") end },
-                               sdc.button{ press = function() end } })"#,
-            Host::new(None),
-        )
-        .unwrap();
-        let goto = rt
-            .press(&rt.button("p", 0).unwrap(), &info("p", 0), true)
-            .unwrap();
-        assert_eq!(goto.as_deref(), Some("other"));
+        // goto_page takes a handle or a name; ha.call reaches Home Assistant; no release handler
+        let press = |k| rt.press(&btn(k), &info("p", k), true).unwrap();
+        assert_eq!(press(2).as_deref(), Some("other"));
+        assert_eq!(press(3).as_deref(), Some("p"));
         assert_eq!(
-            rt.press(&rt.button("p", 1).unwrap(), &info("p", 1), true)
-                .unwrap(),
-            None
+            rx.try_recv().unwrap(),
+            HaCommand::CallService {
+                domain: "light".into(),
+                service: "toggle".into(),
+                data: json!({"entity_id": "light.a"})
+            }
         );
-        // no release handler
-        assert_eq!(
-            rt.press(&rt.button("p", 0).unwrap(), &info("p", 0), false)
-                .unwrap(),
-            None
-        );
+        assert_eq!(rt.press(&btn(3), &info("p", 3), false).unwrap(), None);
     }
 
     #[test]
-    fn ha_state_tracking_and_attributes() {
-        let host = Host::new(None);
-        host.states
-            .borrow_mut()
-            .insert("light.a".into(), state("light.a", "on"));
-        let rt = LuaRuntime::load_str(
+    fn render_tracks_entities_read() {
+        let (rt, host, _) = try_load(
             r#"sdc.page("p", { sdc.button{ render = function()
                  local l = ha.state("light.a")
                  local m = ha.state("light.missing")
                  return { text = l.state .. ":" .. l.attributes.brightness .. ":" .. tostring(m) }
                end } })"#,
-            host,
-        )
-        .unwrap();
+        );
+        set_state(&host, "light.a", "on", json!({"brightness": 128}));
+        let rt = rt.unwrap();
         let o = rt.render(&rt.button("p", 0).unwrap(), &info("p", 0));
         assert_eq!(o.spec.text.as_deref(), Some("on:128:nil"));
         assert_eq!(
@@ -1296,193 +1235,150 @@ mod tests {
     }
 
     #[test]
-    fn lua_error_gives_error_tile() {
-        let rt = LuaRuntime::load_str(
-            r#"sdc.page("p", { sdc.button{ render = function() error("boom") end, press = function() error("bang") end } })"#,
-            Host::new(None),
-        )
-        .unwrap();
-        let b = rt.button("p", 0).unwrap();
-        let o = rt.render(&b, &info("p", 0));
-        assert_eq!(o.spec, RenderSpec::error());
-        assert!(o.error.unwrap().contains("boom"));
-        assert!(rt.press(&b, &info("p", 0), true).is_err());
-    }
-
-    #[test]
-    fn ha_call_sends_command() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let rt = LuaRuntime::load_str(
-            r#"sdc.page("p", { sdc.button{ press = function() ha.call("light", "toggle", { entity_id = "light.a" }) end } })"#,
-            Host::new(Some(tx)),
-        )
-        .unwrap();
-        rt.press(&rt.button("p", 0).unwrap(), &info("p", 0), true)
-            .unwrap();
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            HaCommand::CallService {
-                domain: "light".into(),
-                service: "toggle".into(),
-                data: json!({"entity_id": "light.a"})
-            }
-        );
-    }
-
-    #[test]
-    fn bad_page_item_fails_load() {
-        assert!(LuaRuntime::load_str(r#"sdc.page("p", { 42 })"#, Host::new(None)).is_err());
-        assert!(LuaRuntime::load_str(r#"sdc.button{ press = 1 }"#, Host::new(None)).is_err());
-    }
-
-    #[test]
-    fn device_idle_and_brightness() {
-        let rt = LuaRuntime::load_str(
-            r#"sdc.page("p", {})
-               sdc.device("a", { pages = { "p" }, brightness = 40,
-                                 idle = { dim_after = 120, off_after = 600.5, home_after = 3600 } })
-               sdc.device("b", { pages = { "p" } })"#,
-            Host::new(None),
-        )
-        .unwrap();
-        let a = rt.device("a").unwrap();
-        assert_eq!(a.brightness, 40);
-        assert_eq!(a.idle.dim_after, Some(Duration::from_secs(120)));
-        assert_eq!(a.idle.off_after, Some(Duration::from_millis(600_500)));
-        assert_eq!(a.idle.home_after, Some(Duration::from_secs(3600)));
-        assert_eq!(a.idle.dim_brightness, 10);
-        // nothing set: never idles, default brightness
-        let b = rt.device("b").unwrap();
-        assert_eq!(b.brightness, DEFAULT_BRIGHTNESS);
-        assert_eq!(b.idle, IdleConfig::default());
-        assert_eq!(rt.settings(), Settings::default());
+    fn bad_buttons_and_renders() {
         for bad in [
-            "brightness = 101",
-            "idle = { dim_after = 0 }",
-            "idle = { dim_brightness = 200 }",
-            "idle = { dim_aftr = 5 }",
-            "idle = { home_after = -1 }",
+            r#"sdc.page("p", { 42 })"#,
+            r#"sdc.button{ press = 1 }"#,
+            r#"sdc.page("p", { sdc.dial{ render = function() end } })"#,
         ] {
-            let src =
-                format!(r#"sdc.page("p", {{}}) sdc.device("d", {{ pages = {{ "p" }}, {bad} }})"#);
-            assert!(
-                LuaRuntime::load_str(&src, Host::new(None)).is_err(),
-                "{bad}"
-            );
+            load_err(bad);
         }
-    }
-
-    #[test]
-    fn no_device_is_a_load_error() {
-        for src in ["", r#"sdc.page("p", {})"#] {
-            let e = LuaRuntime::load_raw(src, Host::new(None)).err().unwrap();
-            assert!(
-                format!("{e:#}").contains("the config defines no sdc.device; add at least one"),
-                "{e:#}"
-            );
+        // only tables describe a key: the string and `chevron = true` shorthands are errors
+        let rt = load(
+            r#"sdc.page("p", { sdc.button{ render = "text" }, sdc.button{ render = { chevron = true } } })"#,
+        );
+        for k in 0..2 {
+            let o = rt.render(&rt.button("p", k).unwrap(), &info("p", k));
+            assert!(o.error.is_some(), "key {k}");
         }
     }
 
     #[test]
     fn devices_parse_and_resolve() {
-        let rt = LuaRuntime::load_str(
+        let rt = load(
             r#"
-            sdc.device("a", { pages = { "p", "q", "p" }, home = "q", brightness = 40,
-                              idle = { dim_after = 5 } })
-            sdc.device("b", { pages = { "q" } })
-            sdc.default_device { mk2 = "b", ["*"] = "a" }
-            sdc.page("p", {}) sdc.page("q", {})
+            local other = sdc.page("other", {})
+            local home = sdc.page("home", {})
+            sdc.device("a", { pages = { home, "other", "home" }, home = other, brightness = 40,
+                              idle = { dim_after = 120, off_after = 600.5, home_after = 3600 } })
+            sdc.device("b", { pages = { home } })
+            sdc.device("c", { pages = { home } })
+            sdc.default_device { mk2 = "c", browser = "b" }
             "#,
-            Host::new(None),
-        )
-        .unwrap();
+        );
         let a = rt.device("a").unwrap();
-        assert_eq!(a.pages, ["p", "q"]);
-        assert_eq!((a.home.as_str(), a.brightness), ("q", 40));
-        assert_eq!(a.idle.dim_after, Some(Duration::from_secs(5)));
+        assert_eq!(a.pages, ["home", "other"]);
+        assert_eq!((a.home.as_str(), a.brightness), ("other", 40));
+        assert_eq!(a.idle.dim_after, Some(Duration::from_secs(120)));
+        assert_eq!(a.idle.off_after, Some(Duration::from_millis(600_500)));
+        assert_eq!(a.idle.home_after, Some(Duration::from_secs(3600)));
+        assert_eq!(a.idle.dim_brightness, 10);
+        // nothing set: first page is home, never idles, default brightness
         let b = rt.device("b").unwrap();
         assert_eq!(
-            (b.home.as_str(), b.idle),
-            ("q", IdleConfig::default()),
-            "home defaults to the first page"
+            (b.home.as_str(), b.brightness),
+            ("home", DEFAULT_BRIGHTNESS)
         );
+        assert_eq!(b.idle, IdleConfig::default());
+        assert!(rt.feedback());
+
         let name = |req, kind| rt.resolve_device(req, kind).name;
         assert_eq!(name(Some("a"), "mk2"), "a");
-        assert_eq!(name(None, "mk2"), "b");
-        assert_eq!(name(None, "xl"), "a");
-        assert_eq!(name(Some("zzz"), "mk2"), "b");
+        assert_eq!(name(None, "mk2"), "c");
+        assert_eq!(name(None, "browser"), "b");
+        assert_eq!(name(None, "xl"), "a", "the first device is the fallback");
+        assert_eq!(name(Some("zzz"), "mk2"), "c", "an unknown name falls back");
     }
 
     #[test]
     fn device_config_errors() {
-        let err = |src: &str| {
-            LuaRuntime::load_str(src, Host::new(None))
-                .err()
-                .unwrap_or_else(|| panic!("accepted: {src}"))
-                .to_string()
-        };
-        let pages = r#"sdc.page("p", {}) sdc.page("q", {}) "#;
+        let setup = r#"sdc.page("p", {}) sdc.page("q", {}) sdc.device("a", { pages = { "p" } }) "#;
         let cases = [
             (
-                r#"sdc.device("a", { pages = { "nope" } })"#,
+                r#"sdc.device("b", { pages = { "nope" } })"#,
                 "unknown page 'nope'",
             ),
             (
-                r#"sdc.device("a", { pages = { "p" }, home = "q" })"#,
+                r#"sdc.device("b", { pages = { "p" }, home = "q" })"#,
                 "home 'q' is not in its pages",
             ),
             (
-                r#"sdc.device("a", { pages = { "p" } }) sdc.device("a", { pages = { "q" } })"#,
+                r#"sdc.device("a", { pages = { "q" } })"#,
                 "duplicate device 'a'",
             ),
-            (r#"sdc.device("a", { pages = {} })"#, "at least one page"),
+            (r#"sdc.device("b", { pages = {} })"#, "at least one page"),
             (
-                r#"sdc.device("a", { pages = { "p" }, brightnes = 5 })"#,
+                r#"sdc.device("b", { pages = { "p" }, brightnes = 5 })"#,
                 "unknown field 'brightnes'",
             ),
             (
-                r#"sdc.device("a", { pages = { "p" }, brightness = 101 })"#,
+                r#"sdc.device("b", { pages = { "p" }, brightness = 101 })"#,
                 "must be an integer 0-100",
             ),
             (
-                r#"sdc.device("a", { pages = { "p" }, idle = { dim_after = 0 } })"#,
-                "sdc.device('a')",
+                r#"sdc.device("b", { pages = { "p" }, idle = { dim_after = 0 } })"#,
+                "sdc.device('b')",
             ),
             (
-                r#"sdc.device("a", { pages = { "p" } }) sdc.default_device { mk2 = "zz" }"#,
+                r#"sdc.device("b", { pages = { "p" }, idle = { dim_brightness = 200 } })"#,
+                "0-100",
+            ),
+            (
+                r#"sdc.device("b", { pages = { "p" }, idle = { dim_aftr = 5 } })"#,
+                "unknown field 'dim_aftr'",
+            ),
+            (
+                r#"sdc.device("b", { pages = { "p" }, idle = { home_after = -1 } })"#,
+                "seconds > 0",
+            ),
+            (
+                r#"sdc.default_device { mk2 = "zz" }"#,
                 "unknown device 'zz'",
             ),
             (
-                r#"sdc.device("a", { pages = { "p" } }) sdc.default_device { mk3 = "a" }"#,
+                r#"sdc.default_device { mk3 = "a" }"#,
                 "unknown device type 'mk3'",
             ),
             (
                 r#"sdc.default_device { ["*"] = "a" }"#,
-                "unknown device 'a'",
+                "unknown device type '*'",
+            ),
+            // a nil variable is an error rather than a silently shortened list or an unset field
+            (
+                r#"local a = sdc.page("a", {}) sdc.device("d", { pages = { a, bb, a } })"#,
+                "pages[2] is nil",
+            ),
+            (
+                r#"local a = sdc.page("a", {}) sdc.device("d", { pages = { a }, home = 5 })"#,
+                "'home' must be a page",
+            ),
+            (
+                r#"sdc.default_device { mk2 = sdc.page("z", {}) }"#,
+                "must be a device",
             ),
         ];
         for (src, want) in cases {
-            let e = err(&format!("{pages}{src}"));
+            let e = load_err(&format!("{setup}{src}"));
             assert!(e.contains(want), "{src}: {e}");
         }
         // pages may be defined after the device that uses them
-        LuaRuntime::load_str(
-            r#"sdc.device("a", { pages = { "late" } }) sdc.page("late", {})"#,
-            Host::new(None),
-        )
-        .unwrap();
+        load(r#"sdc.device("a", { pages = { "late" } }) sdc.page("late", {})"#);
+        // no device at all
+        for src in ["", r#"sdc.page("p", {})"#] {
+            let (tx, _rx) = unbounded_channel();
+            let e = LuaRuntime::from_source(src, "=config", None, Host::new(tx))
+                .err()
+                .unwrap();
+            assert!(format!("{e:#}").contains("defines no sdc.device"), "{e:#}");
+        }
     }
 
     #[test]
     fn span_layout_and_validation() {
-        let rt = LuaRuntime::load_str(
-            r#"
-            sdc.page("p", { false, sdc.span{ cols = 2, rows = 2, render = { text = "S" } },
-                            false, false, sdc.button{ render = { text = "B" } } })
-            "#,
-            Host::new(None),
-        )
-        .unwrap();
+        let rt = load(
+            r#"sdc.page("p", { false, sdc.span{ cols = 2, rows = 2, render = { text = "S" } },
+                               false, false, sdc.button{ render = { text = "B" } } })"#,
+        );
         let cells = rt.layout("p", 3, 5);
         assert_eq!(cells.len(), 15);
         let spans: Vec<_> = cells
@@ -1504,19 +1400,16 @@ mod tests {
         );
         assert!(matches!(cells[4], Cell::Button(_)));
         // a 4 column grid: the button at slot 4 is outside the span's covered slots
-        let narrow = rt.layout("p", 3, 4);
-        assert!(matches!(&narrow[1], Cell::Span(s) if s.error.is_none()));
+        assert!(matches!(&rt.layout("p", 3, 4)[1], Cell::Span(s) if s.error.is_none()));
         // 2 rows do not fit a 1 row grid
         let short = rt.layout("p", 1, 5);
         assert!(
             matches!(&short[1], Cell::Span(s) if s.error.as_deref().is_some_and(|e| e.contains("does not fit")))
         );
         // a button in a slot the span covers
-        let rt = LuaRuntime::load_str(
+        let rt = load(
             r#"sdc.page("p", { sdc.span{ cols = 2, rows = 1, render = { text = "S" } }, sdc.button{} })"#,
-            Host::new(None),
-        )
-        .unwrap();
+        );
         let cells = rt.layout("p", 3, 5);
         assert!(
             matches!(&cells[0], Cell::Span(s) if s.error.as_deref().is_some_and(|e| e.contains("overlaps")))
@@ -1527,29 +1420,20 @@ mod tests {
             "sdc.span{ cols = 0, rows = 1 }",
             "sdc.span{ cols = 1, rows = 1, press = 1 }",
         ] {
-            assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
-        }
-    }
-
-    fn slot_info(slot: &str) -> CtxInfo {
-        CtxInfo {
-            slot: Some(slot.into()),
-            ..info("", 0)
+            load_err(bad);
         }
     }
 
     #[test]
-    fn export_registers_and_returns_the_button() {
-        let rt = LuaRuntime::load_str(
+    fn exports() {
+        let rt = load(
             r##"
             local b = sdc.export("living", sdc.button{ label = "Living", render = { text = "L" } })
-            sdc.page("p", { b })                       -- same button in a page
+            sdc.page("p", { b })                       -- the same button in a page
             sdc.export("dim", sdc.dial{ render = function() return { title = "T" } end })
             sdc.export("wide", sdc.span{ cols = 2, rows = 2, render = { text = "S" } })
             "##,
-            Host::new(None),
-        )
-        .unwrap();
+        );
         assert!(rt.button("p", 0).is_some());
         let items: Vec<_> = rt
             .exports()
@@ -1565,16 +1449,15 @@ mod tests {
             ]
         );
         assert!(rt.export("nope").is_none());
-        // an exported span renders as a plain key: no span size in ctx
+        // an exported span renders as a plain key
         let Some(Export::Button(def)) = rt.export("wide") else {
             panic!("not a button")
         };
-        let o = rt.render(&def, &slot_info("s"));
-        assert_eq!(o.spec.text.as_deref(), Some("S"));
-    }
+        assert_eq!(
+            rt.render(&def, &slot_info("s")).spec.text.as_deref(),
+            Some("S")
+        );
 
-    #[test]
-    fn export_rejects_duplicates_bad_ids_and_non_buttons() {
         for bad in [
             r#"sdc.export("a", sdc.button{}) sdc.export("a", sdc.button{})"#,
             r#"sdc.export("", sdc.button{})"#,
@@ -1582,92 +1465,9 @@ mod tests {
             r#"sdc.export("a/b", sdc.button{})"#,
             r#"sdc.export("a", {})"#,
             r#"sdc.dial{ render = function() end, rotate = 1 }"#,
-            r#"sdc.page("p", { sdc.dial{ render = function() end } })"#,
         ] {
-            assert!(LuaRuntime::load_str(bad, Host::new(None)).is_err(), "{bad}");
+            load_err(bad);
         }
-    }
-
-    #[test]
-    fn dial_render_and_inputs() {
-        let host = Host::new(None);
-        host.states
-            .borrow_mut()
-            .insert("light.a".into(), state("light.a", "on"));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let host = Rc::new(Host {
-            ha_tx: Some(tx),
-            states: host.states.clone(),
-            ..Default::default()
-        });
-        let rt = LuaRuntime::load_str(
-            r##"
-            sdc.export("d", sdc.dial {
-              render = function(ctx)
-                local l = ha.state("light.a")
-                return { title = ctx.slot, value = 42, indicator = 250, icon = "i.png", bg = "#102030" }
-              end,
-              rotate = function(ctx, t) ha.call("light", "turn_on", { entity_id = "light.a", step = t }) end,
-              press = function(ctx) ha.call("light", "toggle", { entity_id = "light.a" }); ctx.goto_page("x") end,
-            })
-            "##,
-            host,
-        )
-        .unwrap();
-        let Some(Export::Dial(d)) = rt.export("d") else {
-            panic!("not a dial")
-        };
-        let o = rt.render_dial(&d, &slot_info("slot-1"));
-        assert!(o.error.is_none());
-        assert_eq!(o.spec.title, "slot-1");
-        assert_eq!(o.spec.value, "42");
-        assert_eq!(o.spec.indicator, 100);
-        assert_eq!(o.spec.icon.as_deref(), Some("i.png"));
-        assert_eq!(o.spec.bg, Color([0x10, 0x20, 0x30]));
-        assert_eq!(o.deps, HashSet::from(["light.a".to_string()]));
-        rt.dial_input(&d, &slot_info("slot-1"), DialInput::Rotate(-3))
-            .unwrap();
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            HaCommand::CallService {
-                domain: "light".into(),
-                service: "turn_on".into(),
-                data: json!({"entity_id": "light.a", "step": -3})
-            }
-        );
-        // press runs (goto_page is dropped); release/touch have no handler
-        rt.dial_input(&d, &slot_info("slot-1"), DialInput::Press)
-            .unwrap();
-        assert!(rx.try_recv().is_ok());
-        rt.dial_input(&d, &slot_info("slot-1"), DialInput::Touch)
-            .unwrap();
-        assert!(rx.try_recv().is_err());
-    }
-
-    /// A runtime whose `ha.call`s land in the returned receiver, with `states` already known.
-    fn dial_runtime(
-        src: &str,
-        states: &[(&str, &str, serde_json::Value)],
-    ) -> (
-        LuaRuntime,
-        Rc<Host>,
-        tokio::sync::mpsc::UnboundedReceiver<HaCommand>,
-    ) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let host = Host::new(Some(tx));
-        host.now_ms.set(Some(0.0));
-        for (id, st, attrs) in states {
-            host.states.borrow_mut().insert(
-                id.to_string(),
-                EntityState {
-                    entity_id: id.to_string(),
-                    state: st.to_string(),
-                    attributes: attrs.clone(),
-                },
-            );
-        }
-        let rt = LuaRuntime::load_str(src, host.clone()).unwrap();
-        (rt, host, rx)
     }
 
     fn dial_of(rt: &LuaRuntime, id: &str) -> DialDef {
@@ -1677,25 +1477,69 @@ mod tests {
         d
     }
 
-    fn call_data(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<HaCommand>,
-    ) -> (String, serde_json::Value) {
-        let HaCommand::CallService { service, data, .. } = rx.try_recv().expect("a call");
-        (service, data)
+    #[test]
+    fn dial_render_and_inputs() {
+        let (rt, _, mut rx) = try_load(
+            r##"
+            sdc.export("d", sdc.dial {
+              render = function(ctx)
+                local l = ha.state("light.a")
+                return { title = ctx.slot, value = 42, indicator = 250, icon = "i.png", bg = "#102030" }
+              end,
+              rotate = function(ctx, t) ha.call("light", "turn_on", { entity_id = "light.a", step = t }) end,
+              press = function(ctx) ha.call("light", "toggle", { entity_id = "light.a" }); ctx.goto_page("x") end,
+            })
+            sdc.export("bad", sdc.dial{ render = function() error("boom") end })
+            sdc.export("b", sdc.button{ press = function(ctx) ctx.goto_page("other") end })
+            "##,
+        );
+        let rt = rt.unwrap();
+        let d = dial_of(&rt, "d");
+        let ctx = slot_info("slot-1");
+        let o = rt.render(&d, &ctx);
+        assert!(o.error.is_none());
+        assert_eq!(o.spec.title, "slot-1");
+        assert_eq!(o.spec.value, "42");
+        assert_eq!(o.spec.indicator, 100);
+        assert_eq!(o.spec.icon.as_deref(), Some("i.png"));
+        assert_eq!(o.spec.bg, Color([0x10, 0x20, 0x30]));
+        assert_eq!(o.deps, HashSet::from(["light.a".to_string()]));
+
+        rt.dial_input(&d, &ctx, DialInput::Rotate(-3)).unwrap();
+        assert_eq!(
+            call_data(&mut rx).1,
+            json!({"entity_id": "light.a", "step": -3})
+        );
+        // press runs (its goto_page is dropped); release and touch have no handler
+        rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
+        assert_eq!(call_data(&mut rx).0, "toggle");
+        rt.dial_input(&d, &ctx, DialInput::Touch).unwrap();
+        assert!(rx.try_recv().is_err());
+
+        let o = rt.render(&dial_of(&rt, "bad"), &ctx);
+        assert_eq!(o.spec.title, "ERR");
+        assert!(o.error.unwrap().contains("boom"));
+
+        // the runtime reports a plugin button's goto_page; the engine drops it
+        let Some(Export::Button(b)) = rt.export("b") else {
+            panic!("not a button")
+        };
+        assert_eq!(rt.press(&b, &ctx, true).unwrap().as_deref(), Some("other"));
     }
 
     #[test]
     fn light_dial_steps_from_its_own_value_until_settled() {
-        let (rt, host, mut rx) = dial_runtime(
-            r#"sdc.export("d", sdc.light_dial { entity = "light.o", label = "Office" })"#,
-            &[(
-                "light.o",
-                "on",
-                json!({"brightness": 128, "supported_color_modes": ["color_temp", "xy"],
-                       "color_mode": "color_temp", "color_temp_kelvin": 3000,
-                       "min_color_temp_kelvin": 2000, "max_color_temp_kelvin": 6000}),
-            )],
+        let (rt, host, mut rx) =
+            try_load(r#"sdc.export("d", sdc.light_dial { entity = "light.o", label = "Office" })"#);
+        set_state(
+            &host,
+            "light.o",
+            "on",
+            json!({"brightness": 128, "supported_color_modes": ["color_temp", "xy"],
+                   "color_mode": "color_temp", "color_temp_kelvin": 3000,
+                   "min_color_temp_kelvin": 2000, "max_color_temp_kelvin": 6000}),
         );
+        let rt = rt.unwrap();
         let d = dial_of(&rt, "d");
         let ctx = slot_info("s");
         // HA still says 50% after every call; the dial keeps counting from its own value
@@ -1703,7 +1547,7 @@ mod tests {
             rt.dial_input(&d, &ctx, DialInput::Rotate(1)).unwrap();
             assert_eq!(call_data(&mut rx).1["brightness_pct"], json!(want));
         }
-        let o = rt.render_dial(&d, &ctx);
+        let o = rt.render(&d, &ctx);
         assert_eq!(
             (
                 o.spec.title.as_str(),
@@ -1714,23 +1558,23 @@ mod tests {
         );
         // after the settle time HA's state is shown and used again
         host.now_ms.set(Some(DIAL_SETTLE.as_millis() as f64 + 1.0));
-        assert_eq!(rt.render_dial(&d, &ctx).spec.value, "50%");
+        assert_eq!(rt.render(&d, &ctx).spec.value, "50%");
         rt.dial_input(&d, &ctx, DialInput::Rotate(-2)).unwrap();
         assert_eq!(call_data(&mut rx).1["brightness_pct"], json!(40));
 
         // press cycles brightness -> warmth -> hue -> brightness
         rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
-        assert_eq!(rt.render_dial(&d, &ctx).spec.title, "Office · warmth");
+        assert_eq!(rt.render(&d, &ctx).spec.title, "Office · warmth");
         rt.dial_input(&d, &ctx, DialInput::Rotate(3)).unwrap();
         assert_eq!(call_data(&mut rx).1["color_temp_kelvin"], json!(3300));
-        assert_eq!(rt.render_dial(&d, &ctx).spec.value, "3300K");
+        assert_eq!(rt.render(&d, &ctx).spec.value, "3300K");
         rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
         rt.dial_input(&d, &ctx, DialInput::Rotate(-1)).unwrap();
         // from white: a saturated colour, hue stepping down wraps
         assert_eq!(call_data(&mut rx).1["hs_color"], json!([350, 80]));
-        assert_eq!(rt.render_dial(&d, &ctx).spec.title, "Office · hue");
+        assert_eq!(rt.render(&d, &ctx).spec.title, "Office · hue");
         rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
-        assert_eq!(rt.render_dial(&d, &ctx).spec.title, "Office");
+        assert_eq!(rt.render(&d, &ctx).spec.title, "Office");
         // a tap toggles
         rt.dial_input(&d, &ctx, DialInput::Touch).unwrap();
         assert_eq!(call_data(&mut rx).0, "toggle");
@@ -1738,48 +1582,50 @@ mod tests {
 
     #[test]
     fn light_dial_modes_follow_the_light() {
-        let (rt, _host, mut rx) = dial_runtime(
-            r#"sdc.export("d", sdc.light_dial { entity = "light.k" })"#,
-            &[(
-                "light.k",
-                "off",
-                json!({"supported_color_modes": ["color_temp"],
-                "min_color_temp_kelvin": 2900, "max_color_temp_kelvin": 7000}),
-            )],
+        let (rt, host, mut rx) =
+            try_load(r#"sdc.export("d", sdc.light_dial { entity = "light.k" })"#);
+        set_state(
+            &host,
+            "light.k",
+            "off",
+            json!({"supported_color_modes": ["color_temp"],
+                   "min_color_temp_kelvin": 2900, "max_color_temp_kelvin": 7000}),
         );
+        let rt = rt.unwrap();
         let d = dial_of(&rt, "d");
         let ctx = slot_info("s");
-        assert_eq!(rt.render_dial(&d, &ctx).spec.value, "off");
+        assert_eq!(rt.render(&d, &ctx).spec.value, "off");
         // off: turning up starts from 0
         rt.dial_input(&d, &ctx, DialInput::Rotate(2)).unwrap();
         assert_eq!(call_data(&mut rx).1["brightness_pct"], json!(10));
-        assert_eq!(rt.render_dial(&d, &ctx).spec.value, "10%");
+        assert_eq!(rt.render(&d, &ctx).spec.value, "10%");
         rt.dial_input(&d, &ctx, DialInput::Rotate(-5)).unwrap();
         assert_eq!(call_data(&mut rx).0, "turn_off");
         // no colour: brightness and warmth only
         rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
-        assert_eq!(rt.render_dial(&d, &ctx).spec.title, "light.k · warmth");
+        assert_eq!(rt.render(&d, &ctx).spec.title, "light.k · warmth");
         rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
-        assert_eq!(rt.render_dial(&d, &ctx).spec.title, "light.k");
+        assert_eq!(rt.render(&d, &ctx).spec.title, "light.k");
     }
 
     #[test]
     fn volume_dial_steps_and_mutes() {
-        let (rt, _host, mut rx) = dial_runtime(
-            r#"sdc.export("v", sdc.volume_dial { entity = "media_player.k", label = "Kitchen", step = 3 })"#,
-            &[(
-                "media_player.k",
-                "playing",
-                json!({"volume_level": 0.2, "is_volume_muted": false}),
-            )],
+        let (rt, host, mut rx) =
+            try_load(r#"sdc.export("v", sdc.volume_dial { entity = "media_player.k" })"#);
+        set_state(
+            &host,
+            "media_player.k",
+            "playing",
+            json!({"volume_level": 0.2, "is_volume_muted": false}),
         );
+        let rt = rt.unwrap();
         let d = dial_of(&rt, "v");
         let ctx = slot_info("s");
         rt.dial_input(&d, &ctx, DialInput::Rotate(1)).unwrap();
         rt.dial_input(&d, &ctx, DialInput::Rotate(1)).unwrap();
         call_data(&mut rx);
-        assert_eq!(call_data(&mut rx).1["volume_level"], json!(0.26));
-        assert_eq!(rt.render_dial(&d, &ctx).spec.value, "26%");
+        assert_eq!(call_data(&mut rx).1["volume_level"], json!(0.24));
+        assert_eq!(rt.render(&d, &ctx).spec.value, "24%");
         rt.dial_input(&d, &ctx, DialInput::Press).unwrap();
         assert_eq!(
             call_data(&mut rx),
@@ -1788,46 +1634,8 @@ mod tests {
                 json!({"entity_id": "media_player.k", "is_volume_muted": true})
             )
         );
-    }
-
-    #[test]
-    fn built_in_dials_need_an_entity() {
-        let e = LuaRuntime::load_str(r#"sdc.export("d", sdc.light_dial {})"#, Host::new(None))
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(e.contains("sdc.light_dial: { entity"), "{e}");
-    }
-
-    #[test]
-    fn plugin_goto_page_is_a_noop() {
-        let rt = LuaRuntime::load_str(
-            r#"sdc.export("b", sdc.button{ press = function(ctx) ctx.goto_page("other") end })"#,
-            Host::new(None),
-        )
-        .unwrap();
-        let Some(Export::Button(b)) = rt.export("b") else {
-            panic!("not a button")
-        };
-        // the runtime reports the request; the engine drops it for plugin slots
-        assert_eq!(
-            rt.press(&b, &slot_info("s"), true).unwrap().as_deref(),
-            Some("other")
+        assert!(
+            load_err(r#"sdc.export("d", sdc.light_dial {})"#).contains("sdc.light_dial: { entity")
         );
-    }
-
-    #[test]
-    fn dial_render_error_gives_error_dial() {
-        let rt = LuaRuntime::load_str(
-            r#"sdc.export("d", sdc.dial{ render = function() error("boom") end })"#,
-            Host::new(None),
-        )
-        .unwrap();
-        let Some(Export::Dial(d)) = rt.export("d") else {
-            panic!()
-        };
-        let o = rt.render_dial(&d, &slot_info("s"));
-        assert_eq!(o.spec.title, "ERR");
-        assert!(o.error.unwrap().contains("boom"));
     }
 }

@@ -45,7 +45,7 @@ sdc.page("home", {
 sdc.device("deck", { pages = { "home" } })  -- required: at least one device shows the pages (see Devices)
 ```
 
-`render` is a table, a string, or a function returning one. The fields:
+`render` is a table, or a function returning one. The fields:
 
 | Field | Meaning |
 |-------|---------|
@@ -217,9 +217,7 @@ sdc.export("fan", sdc.dial {
 
 `sdc.light_dial` and `sdc.volume_dial` keep counting from their own value while you turn and show it straight
 away. Home Assistant only learns a light's new state once the light reports back, so stepping from HA's state
-loses or reverses steps on a fast turn. Options: `entity` (required), `label`, `icon`, plus `modes` (e.g.
-`{ "brightness", "warmth" }`) and `step` (`{ brightness = 5, warmth = 100, hue = 10 }`) for lights, or `step`
-(volume %, default 2) for speakers.
+loses or reverses steps on a fast turn. Options: `entity` (required), `label` and `icon`.
 
 Ids are 1-64 characters of `A-Z a-z 0-9 _ - .` and must be unique (a bad id fails the load). A dial cannot sit in
 a page; it is export-only. Full details in [crates/server/README.md](../crates/server/README.md#exports-and-dials-elgato-plugin).
@@ -243,7 +241,7 @@ local living = sdc.device("living-room", {
 })
 local office = sdc.device("office", { pages = { home } })
 
-sdc.default_device { mk2 = living, plus = office, ["*"] = living }
+sdc.default_device { mk2 = living, plus = office }
 ```
 
 Pages and devices can be referred to by **handle** (the value `sdc.page` / `sdc.device` returns) or by **name**.
@@ -254,8 +252,8 @@ leaving `home` out.
 
 `sdc.default_device` maps a device type to a device name. The types, derived from the model name a client reports,
 are `original` (Original and OriginalV2), `mk2` (including its scissor and module variants), `mini`, `xl`, `plus`,
-`plus-xl`, `neo` and `pedal`, plus `browser` for [browser decks](browser.md). `"*"` is the fallback for anything
-else.
+`plus-xl`, `neo` and `pedal`, plus `browser` for [browser decks](browser.md). Any other type gets the first
+`sdc.device` defined.
 
 **Which device a client gets**, in order:
 
@@ -263,8 +261,7 @@ else.
    [Raspberry Pi deck](pi.md#configuring-the-client)), or the Layout picker in the [browser deck](browser.md) menu. An unknown
    name is logged as a warning and skipped.
 2. The `sdc.default_device` entry for the client's type.
-3. The `"*"` entry.
-4. The first `sdc.device` defined.
+3. The first `sdc.device` defined.
 
 Details:
 
@@ -291,13 +288,13 @@ sdc.button { render = { text = "Quiet" }, feedback = false, press = function() e
 It does not flash for a press that only woke the display, a press that called `ctx.goto_page` (the page change is the
 feedback), a button without `press`, or a span.
 
-**Navigation chevron.** `chevron = true` (or `"forward"`) in a render descriptor draws a faint "›" in the
+**Navigation chevron.** `chevron = "forward"` in a render descriptor draws a faint "›" in the
 bottom-right corner of a key that opens another page; `chevron = "back"` draws "‹" in the top-left for a key that
 goes back (e.g. Home). On an icon-only key the icon shrinks slightly and moves away from the chevron so it has room.
 
 ```lua
 sdc.button {
-  render = { text = "Media", icon = "icons/play.png", bg = "#3b2f6b", chevron = true },
+  render = { text = "Media", icon = "icons/play.png", bg = "#3b2f6b", chevron = "forward" },
   press  = function(ctx) ctx.goto_page("media") end,
 }
 ```

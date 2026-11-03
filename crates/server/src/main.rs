@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
     let listen = std::env::var("SDC_LISTEN").unwrap_or_else(|_| "0.0.0.0:7700".into());
 
     let (ha_tx, ha_rx) = mpsc::unbounded_channel();
-    let engine_tx = engine::spawn(config.clone(), Some(ha_tx));
+    let engine_tx = engine::spawn(config.clone(), ha_tx);
     match HaConfig::from_env() {
         Some(cfg) => {
             // Bridge HA events into the engine; the HA task reconnects on its own.

@@ -96,7 +96,7 @@ things are visible to plugins. `id` is 1-64 characters of `A-Z a-z 0-9 _ - .` an
 duplicate id fails the config load (the previous config stays active). An optional `label = "..."` field on the
 button or dial is shown in the plugin's dropdown.
 See [Exports and dials](../../docs/configuration.md#exports-and-dials-elgato-plugin) for examples.
-- `sdc.light_dial { entity, label?, icon?, modes?, step? }` and `sdc.volume_dial { entity, label?, icon?, step? }`
+- `sdc.light_dial { entity, label?, icon? }` and `sdc.volume_dial { entity, label?, icon? }`
   are built-in dials (`crates/server/src/lua/dials.lua`). While being turned they step from their own value, not
   HA's lagging state, send absolute values and show their value at once; `DIAL_SETTLE` (1.5 s) after the last turn
   the engine redraws the slot and HA's state shows again. A light dial's press cycles brightness, warmth and hue

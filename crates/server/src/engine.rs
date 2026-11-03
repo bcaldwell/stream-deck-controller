@@ -219,7 +219,7 @@ enum FlashKey {
 }
 
 impl Engine {
-    pub fn new(config_path: PathBuf, ha_tx: Option<UnboundedSender<HaCommand>>) -> Self {
+    pub fn new(config_path: PathBuf, ha_tx: UnboundedSender<HaCommand>) -> Self {
         let base = config_path
             .parent()
             .map(Path::to_path_buf)
@@ -264,11 +264,7 @@ impl Engine {
     /// (Re)loads the config. On failure the previous config stays active.
     pub fn reload(&mut self) -> Result<()> {
         let rt = LuaRuntime::load(&self.config_path, self.host.clone())?;
-        tracing::info!(
-            "loaded {} (pages: {})",
-            self.config_path.display(),
-            rt.page_names().join(", ")
-        );
+        tracing::info!("loaded {}", self.config_path.display());
         let rt = &*self.runtime.insert(rt);
         self.renderer.clear_icon_cache();
         self.key_deps.clear();
@@ -501,9 +497,7 @@ impl Engine {
     }
 
     fn feedback(&self) -> bool {
-        self.runtime
-            .as_ref()
-            .is_some_and(|rt| rt.settings().feedback)
+        self.runtime.as_ref().is_some_and(|rt| rt.feedback())
     }
 
     /// Sends the brightness that matches the client's current power state.
@@ -905,7 +899,7 @@ fn ctx_info(c: &Client, key: u8) -> CtxInfo {
 /// subsequent hot reload can fix it.
 pub fn spawn(
     config_path: PathBuf,
-    ha_tx: Option<UnboundedSender<HaCommand>>,
+    ha_tx: UnboundedSender<HaCommand>,
 ) -> UnboundedSender<EngineEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = Handle::current();
@@ -1025,7 +1019,7 @@ mod tests {
         let dir = tempdir::Dir::new();
         let path = write_config(dir.path(), src);
         let (ha_tx, ha_rx) = mpsc::unbounded_channel();
-        let mut e = Engine::new(path, Some(ha_tx));
+        let mut e = Engine::new(path, ha_tx);
         e.reload().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         e.handle(EngineEvent::ClientConnected {
@@ -1432,13 +1426,13 @@ mod tests {
         sdc.device("a", { pages = { "home", "lights" }, home = "home",
                           idle = { home_after = 100 } })
         sdc.device("b", { pages = { "tv", "home" }, home = "tv", brightness = 30 })
-        sdc.default_device { mk2 = "a", browser = "b", ["*"] = "b" }
+        sdc.default_device { mk2 = "a", browser = "b" }
     "##;
 
     fn device_engine(src: &str) -> (Engine, tempdir::Dir) {
         let dir = tempdir::Dir::new();
         let path = write_config(dir.path(), src);
-        let mut e = Engine::new(path, None);
+        let mut e = Engine::new(path, mpsc::unbounded_channel().0);
         e.reload().unwrap();
         (e, dir)
     }
@@ -1489,20 +1483,15 @@ mod tests {
         // an unknown name falls through to the type default
         connect_dev(&mut e, 3, "Mk2", false, Some("nope"), t);
         assert_eq!(dev_of(&e, 3), ("a".into(), "home".into()));
-        // "*" for a type without an entry
+        // a type without an entry gets the first device
         connect_dev(&mut e, 4, "XlV2", false, None, t);
-        assert_eq!(dev_of(&e, 4), ("b".into(), "tv".into()));
+        assert_eq!(dev_of(&e, 4), ("a".into(), "home".into()));
         // browser type
         connect_dev(&mut e, 5, "Web Deck", true, None, t);
         assert_eq!(dev_of(&e, 5), ("b".into(), "tv".into()));
 
-        // no "*" and no matching type: the first device
-        write_config(
-            d.path(),
-            &DEVICES_CONFIG
-                .replace(r#"["*"] = "b""#, "")
-                .replace(r#"browser = "b","#, ""),
-        );
+        // no matching type: the first device
+        write_config(d.path(), &DEVICES_CONFIG.replace(r#", browser = "b""#, ""));
         e.handle_at(EngineEvent::Reload, t);
         connect_dev(&mut e, 6, "XlV2", false, None, t);
         assert_eq!(dev_of(&e, 6), ("a".into(), "home".into()));
@@ -1547,7 +1536,7 @@ mod tests {
     fn device_brightness_and_default() {
         let (mut e, _d) = device_engine(DEVICES_CONFIG);
         let t = Instant::now();
-        let mut b = connect_dev(&mut e, 1, "XlV2", false, None, t);
+        let mut b = connect_dev(&mut e, 1, "Web Deck", true, None, t);
         assert_eq!(brightness(&drain_out(&mut b)), [30]);
         let mut a = connect_dev(&mut e, 2, "Mk2", false, None, t);
         assert_eq!(brightness(&drain_out(&mut a)), [60], "default brightness");
@@ -1652,7 +1641,7 @@ mod tests {
             ),
         );
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
-        let mut e = Engine::new(cfg, None);
+        let mut e = Engine::new(cfg, mpsc::unbounded_channel().0);
         e.enable_fetch(Handle::current(), &ev_tx);
         e.reload().unwrap(); // prefetches both static images
         assert_eq!(e.pending_fetches(), 2);

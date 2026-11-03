@@ -288,7 +288,7 @@ impl Engine {
             }
             (Some(Export::Dial(def)), SlotKind::Dial) => {
                 let rt = self.runtime.as_ref().expect("export implies runtime");
-                let r = rt.render_dial(&def, &info);
+                let r = rt.render(&def, &info);
                 if let Some(e) = &r.error {
                     tracing::error!("render dial {export_id} for {}: {e}", info.client_id);
                 }
