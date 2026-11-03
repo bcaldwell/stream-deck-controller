@@ -135,7 +135,7 @@ async fn connect(url: &str) -> Client {
 }
 
 async fn connect_as(url: &str, target: Option<&str>, sha256: Option<&str>) -> Client {
-    connect_with(url, target, sha256, device()).await.0
+    connect_with(url, target, sha256, device()).await
 }
 
 async fn connect_with(
@@ -143,7 +143,7 @@ async fn connect_with(
     target: Option<&str>,
     sha256: Option<&str>,
     device: DeviceInfo,
-) -> (Client, bool) {
+) -> Client {
     let (mut c, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     let hello = ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
@@ -158,7 +158,7 @@ async fn connect_with(
         .unwrap();
     match next_msg(&mut c).await {
         Message::Text(t) => match serde_json::from_str(&t).unwrap() {
-            ServerMessage::Welcome { native_frames, .. } => (c, native_frames),
+            ServerMessage::Welcome { .. } => c,
             other => panic!("expected welcome, got {other:?}"),
         },
         other => panic!("expected welcome, got {other:?}"),
@@ -1188,7 +1188,7 @@ async fn plugin_subscribe_render_dependencies_and_input() {
 }
 
 #[tokio::test]
-async fn native_frames_are_rotated_once_and_confirmed() {
+async fn native_frames_are_rotated_once() {
     use sdc_protocol::{NativeImage, NativeMirror};
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
     let (_engine, url, _dir) = start_server("native", ha_tx).await;
@@ -1198,16 +1198,14 @@ async fn native_frames_are_rotated_once_and_confirmed() {
         mirror: NativeMirror::Both, // MK.2
     };
 
-    // plain client: upright frames, no confirmation
-    let (mut plain, native_frames) = connect_with(&url, None, None, device()).await;
-    assert!(!native_frames);
+    // plain client: upright frames
+    let mut plain = connect_with(&url, None, None, device()).await;
     let upright = initial_frames(&mut plain).await;
 
-    // MK.2-style client: confirmed, and every frame is the upright one rotated 180 degrees
+    // MK.2-style client: every frame is the upright one rotated 180 degrees
     let mut dev = device();
     dev.native = Some(fmt(72));
-    let (mut mk2, native_frames) = connect_with(&url, None, None, dev).await;
-    assert!(native_frames);
+    let mut mk2 = connect_with(&url, None, None, dev).await;
     let native = initial_frames(&mut mk2).await;
     let mut differing = 0;
     for (u, n) in upright.iter().zip(&native) {
@@ -1232,11 +1230,4 @@ async fn native_frames_are_rotated_once_and_confirmed() {
         differing += (u != n) as usize;
     }
     assert!(differing > 0);
-
-    // a size that is not the key size is declined
-    let mut dev = device();
-    dev.native = Some(fmt(80));
-    let (mut c, native_frames) = connect_with(&url, None, None, dev).await;
-    assert!(!native_frames);
-    initial_frames(&mut c).await;
 }

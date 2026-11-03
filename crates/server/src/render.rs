@@ -985,8 +985,8 @@ fn orient_native(img: &RgbImage, n: &NativeImage) -> RgbImage {
     }
 }
 
-/// Encodes `img` as a JPEG, oriented for a deck with native format `native` (see
-/// [`NativeImage::server_can_produce`]) so the deck can take it as it is.
+/// Encodes `img` as a JPEG, oriented for a deck with native format `native` so the deck can take
+/// it as it is.
 fn encode_jpeg(img: &RgbImage, native: Option<&NativeImage>) -> Vec<u8> {
     let oriented;
     let img = match native {

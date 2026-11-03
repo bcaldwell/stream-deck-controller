@@ -167,7 +167,7 @@ async fn handle_deck(
     let ClientMessage::Hello {
         protocol_version,
         client_id,
-        mut device,
+        device,
         client_target,
         client_sha256,
         device_name,
@@ -198,19 +198,8 @@ async fn handle_deck(
         None => client_id,
     };
     let key_count = device.key_count();
-    // Device-ready frames only for a physical deck whose format we can produce; everyone else
-    // keeps getting upright JPEGs.
-    if web.is_some()
-        || !device
-            .native
-            .is_some_and(|n| n.server_can_produce(device.key_size_px))
-    {
-        device.native = None;
-    }
-
     sink.send(text(&ServerMessage::Welcome {
         protocol_version: PROTOCOL_VERSION,
-        native_frames: device.native.is_some(),
     })?)
     .await?;
     let update = web

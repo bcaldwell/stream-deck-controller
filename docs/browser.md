@@ -11,13 +11,10 @@ same protocol as the Pi client over `/deck/ws`.
 The browser is a client of its own with the id `web-<random>` (kept in `localStorage`), and has its own page, idle
 state and brightness. Keys are rendered at 144 or 192 px depending on the screen's pixel ratio.
 
-When the config defines [devices](configuration.md#devices), the dot on the bezel opens a menu listing "Default" and
-each device name. Picking one makes this browser's deck use that device's pages, home page, brightness and idle
-settings; the choice is remembered in `localStorage` and the deck reconnects.
-
-![The layout menu](images/deck-menu.png)
-
-The menu is fed by `GET /deck/api/devices` (`[{name, pages, home}]`, empty without devices).
+The dot on the bezel opens a menu listing "Default" and each [device](configuration.md#devices) of the config.
+Picking one makes this browser's deck use that device's pages, home page, brightness and idle settings; the choice
+is remembered in `localStorage` and the deck reconnects. The menu is fed by `GET /deck/api/devices`
+(`[{name, pages, home}]`).
 
 ## Phones
 
