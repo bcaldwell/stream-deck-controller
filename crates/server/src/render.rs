@@ -18,8 +18,8 @@ use crate::assets::{is_ha_key, redact, Assets, Fetcher, Source};
 
 static FONT_BYTES: &[u8] = include_bytes!("../assets/OpenSans.ttf");
 
-/// Quality of every key JPEG. Native frames are encoded exactly once at this quality (the
-/// client writes them to the deck untouched), so there is no second lossy pass.
+/// Quality of every key JPEG. Frames are encoded exactly once, in the deck's native orientation
+/// (the client writes them to the deck untouched), so there is no second lossy pass.
 const JPEG_QUALITY: u8 = 90;
 const PAD: f32 = 4.0;
 const MIN_FONT_PX: f32 = 9.0;
@@ -54,8 +54,6 @@ const MAX_SRC_SHORT: u32 = 256;
 /// rendered go first. Sources such as media artwork change with every track, so this must not
 /// grow forever, while icons that are on a page stay hot.
 const MAX_REMOTE: usize = 128;
-/// Safety valve for the scaled-picture cache (it is also cleared on config reload).
-const MAX_PREPARED: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color(pub [u8; 3]);
@@ -183,9 +181,6 @@ impl Scaled {
     fn get(&self, src: &Loaded, fit: Fit) -> Arc<RgbaImage> {
         let slot = {
             let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-            if map.len() >= MAX_PREPARED {
-                map.clear();
-            }
             map.entry((src.id.clone(), fit)).or_default().clone()
         };
         slot.get_or_init(|| {
@@ -198,7 +193,9 @@ impl Scaled {
                     if let Some(t) = tint {
                         tint_premul(&mut crop, t);
                     }
-                    resize_premul(&crop, w, h, true)
+                    let mut icon = imageops::resize(&crop, w, h, FilterType::Lanczos3);
+                    unpremultiply(&mut icon);
+                    icon
                 }
             })
         })
@@ -217,15 +214,15 @@ impl Scaled {
     }
 }
 
-/// A map that drops its least recently used entries beyond `cap`. Lookups are linear in the
-/// number of entries to evict only, so it is meant for small caps.
-struct Lru<V> {
+/// Downloaded pictures by cache key. Beyond `cap` the least recently used entries are dropped
+/// (a scan per eviction, so meant for small caps).
+struct Lru {
     cap: usize,
     tick: u64,
-    map: HashMap<String, (V, u64)>,
+    map: HashMap<String, (Slot, u64)>,
 }
 
-impl<V> Lru<V> {
+impl Lru {
     fn new(cap: usize) -> Self {
         Self {
             cap,
@@ -235,7 +232,7 @@ impl<V> Lru<V> {
     }
 
     /// Marks `key` as just used.
-    fn get(&mut self, key: &str) -> Option<&V> {
+    fn get(&mut self, key: &str) -> Option<&Slot> {
         self.tick += 1;
         let tick = self.tick;
         self.map.get_mut(key).map(|(v, used)| {
@@ -244,18 +241,17 @@ impl<V> Lru<V> {
         })
     }
 
-    /// Inserts `key` and returns the keys evicted to stay within the cap. Entries for which
-    /// `keep` is true (downloads in flight) are never evicted, so the cap can be exceeded
-    /// while that many are pending.
-    fn insert(&mut self, key: String, v: V, keep: impl Fn(&V) -> bool) -> Vec<String> {
+    /// Inserts `key` and returns the keys evicted to stay within the cap. Downloads in flight
+    /// are never evicted, so the cap can be exceeded while that many are pending.
+    fn insert(&mut self, key: String, slot: Slot) -> Vec<String> {
         self.tick += 1;
-        self.map.insert(key.clone(), (v, self.tick));
+        self.map.insert(key.clone(), (slot, self.tick));
         let mut evicted = Vec::new();
         while self.map.len() > self.cap {
             let oldest = self
                 .map
                 .iter()
-                .filter(|(k, (v, _))| **k != key && !keep(v))
+                .filter(|(k, (s, _))| **k != key && !matches!(s, Slot::Loading))
                 .min_by_key(|(_, (_, used))| *used)
                 .map(|(k, _)| k.clone());
             let Some(k) = oldest else { break };
@@ -265,12 +261,13 @@ impl<V> Lru<V> {
         evicted
     }
 
-    fn values(&self) -> impl Iterator<Item = &V> {
-        self.map.values().map(|(v, _)| v)
+    fn pending(&self) -> usize {
+        let loading = |(s, _): &&(Slot, u64)| matches!(s, Slot::Loading);
+        self.map.values().filter(loading).count()
     }
 
-    fn retain(&mut self, f: impl Fn(&V) -> bool) {
-        self.map.retain(|_, (v, _)| f(v));
+    fn forget_failed(&mut self) {
+        self.map.retain(|_, (s, _)| !matches!(s, Slot::Failed(_)));
     }
 }
 
@@ -281,13 +278,13 @@ struct Painter {
 }
 
 pub struct Renderer {
-    painter: Arc<Painter>,
+    painter: Painter,
     assets: Assets,
     /// `icon`/`image` string -> where it lives (None: unresolvable, already logged).
     resolved: HashMap<String, Option<Source>>,
     local: HashMap<PathBuf, Option<Arc<Loaded>>>,
     /// Downloaded images by remote cache key (bounded, see [`MAX_REMOTE`]).
-    remote: Lru<Slot>,
+    remote: Lru,
     /// Without one, remote images are reported as failed (they are never fetched inline).
     fetcher: Option<Fetcher>,
 }
@@ -304,67 +301,34 @@ enum Img {
     Ready(Arc<Loaded>),
     Loading,
     Failed,
-    /// Home Assistant artwork that could not be fetched: media art legitimately goes away, so
-    /// this renders as if there were no picture, without an error tile.
-    Missing,
 }
 
 /// A key ready to rasterize: the spec plus its pictures looked up (cheap, needs the renderer's
 /// caches). Turning it into pixels needs no renderer state, so jobs can run in parallel.
 pub struct Job {
     spec: RenderSpec,
-    /// Canvas size; one key's size, or a span's virtual size including the gaps.
+    /// Canvas size: one key, or a whole span.
     w: u32,
     h: u32,
     /// Set for a span: how the canvas is cut into key tiles.
     span: Option<SpanGeom>,
     image: Option<Img>,
     icon: Option<Img>,
-    /// The icon's tint, if any.
-    tint: Option<[u8; 3]>,
 }
 
-impl Job {
-    /// Drops pictures that are [`Img::Missing`] so layout treats them as not given.
-    fn without_missing(mut self) -> Self {
-        let keep = |i: Option<Img>| i.filter(|i| !matches!(i, Img::Missing));
-        self.image = keep(self.image);
-        self.icon = keep(self.icon);
-        self
-    }
-}
-
-/// A rectangle of keys that shows one picture: `cols` x `rows` keys of `key` px with `gap` px
-/// between neighbours (the space between the physical keys, which the picture continues over).
+/// A rectangle of `cols` x `rows` keys of `key` px that shows one picture, cut into plain tiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpanGeom {
     pub cols: u32,
     pub rows: u32,
     pub key: u32,
-    pub gap: u32,
 }
 
-/// Default gap between keys in px at 72 px keys. 0 cuts a span into plain tiles; a
-/// gap matching the bezel (~18 on an MK.2) keeps lines straight across keys but
-/// hides a strip of the picture, usually the middle where the subject is.
-pub const DEFAULT_GAP: u32 = 0;
-
-/// A configured gap (px at 72 px keys) scaled to `key` px keys.
-pub fn gap_px(gap72: u32, key: u32) -> u32 {
-    (gap72 as f32 * key as f32 / 72.0).round() as u32
-}
-
-impl SpanGeom {
-    /// Size of the virtual canvas.
-    pub fn canvas(&self) -> (u32, u32) {
-        let len = |n: u32| n * self.key + n.saturating_sub(1) * self.gap;
-        (len(self.cols), len(self.rows))
-    }
-
-    /// Top-left of tile (`c`, `r`) in the canvas.
-    pub fn tile_origin(&self, c: u32, r: u32) -> (u32, u32) {
-        (c * (self.key + self.gap), r * (self.key + self.gap))
-    }
+/// A label's font size in px: used as given, or the largest that fits (up to the maximum).
+#[derive(Clone, Copy)]
+enum TextSize {
+    Fixed(f32),
+    Fit(f32),
 }
 
 #[derive(Clone, Copy)]
@@ -383,10 +347,10 @@ impl Renderer {
 
     pub fn with_assets(assets: Assets) -> Self {
         Self {
-            painter: Arc::new(Painter {
+            painter: Painter {
                 font: FontRef::try_from_slice(FONT_BYTES).expect("embedded font is valid"),
                 scaled: Scaled::default(),
-            }),
+            },
             assets,
             resolved: HashMap::new(),
             local: HashMap::new(),
@@ -405,15 +369,12 @@ impl Renderer {
         self.resolved.clear();
         self.local.clear();
         self.painter.scaled.clear();
-        self.remote.retain(|s| !matches!(s, Slot::Failed(_)));
+        self.remote.forget_failed();
     }
 
     /// Number of downloads in flight.
     pub fn pending(&self) -> usize {
-        self.remote
-            .values()
-            .filter(|s| matches!(s, Slot::Loading))
-            .count()
+        self.remote.pending()
     }
 
     /// Starts fetching `name` if it is a remote image that is not cached yet.
@@ -453,10 +414,7 @@ impl Renderer {
 
     /// Caches `slot`, dropping the pictures scaled from whatever the LRU evicts.
     fn store(&mut self, key: String, slot: Slot) {
-        for old in self
-            .remote
-            .insert(key, slot, |s| matches!(s, Slot::Loading))
-        {
+        for old in self.remote.insert(key, slot) {
             self.painter.scaled.forget(&old);
         }
     }
@@ -466,30 +424,18 @@ impl Renderer {
         self.painter.scaled.computed.load(Ordering::Relaxed)
     }
 
-    pub fn blank(&self, size: u32) -> Vec<u8> {
-        self.blank_with(Color::BLACK, size)
-    }
-
-    fn blank_with(&self, color: Color, size: u32) -> Vec<u8> {
-        encode_jpeg(&RgbImage::from_pixel(size, size, Rgb(color.0)))
-    }
-
     pub fn render(&mut self, spec: &RenderSpec, size: u32) -> Vec<u8> {
-        encode_jpeg(&self.render_image(spec, size))
+        self.render_for(spec, size, None)
     }
 
-    /// Like [`Renderer::render`], in a deck's native format when given.
+    /// Like [`Renderer::render`], in a deck's native orientation when given.
     pub fn render_for(
         &mut self,
         spec: &RenderSpec,
         size: u32,
         native: Option<&NativeImage>,
     ) -> Vec<u8> {
-        let img = self.render_image(spec, size);
-        match native {
-            Some(n) => encode_native(&img, n),
-            None => encode_jpeg(&img),
-        }
+        encode_jpeg(&self.render_image(spec, size), native)
     }
 
     /// Like [`Renderer::render`] as a PNG (plugins hand it to Elgato's `setImage`).
@@ -497,7 +443,7 @@ impl Renderer {
         encode_png(&self.render_image(spec, size))
     }
 
-    pub fn render_image(&mut self, spec: &RenderSpec, size: u32) -> RgbImage {
+    fn render_image(&mut self, spec: &RenderSpec, size: u32) -> RgbImage {
         let job = self.prepare(spec, size);
         self.painter.paint(&job)
     }
@@ -509,8 +455,7 @@ impl Renderer {
 
     /// Like [`Renderer::prepare`] for a span: the picture is laid out on the whole canvas.
     pub fn prepare_span(&mut self, spec: &RenderSpec, geom: SpanGeom) -> Job {
-        let (w, h) = geom.canvas();
-        self.prepare_sized(spec, w, h, Some(geom))
+        self.prepare_sized(spec, geom.cols * geom.key, geom.rows * geom.key, Some(geom))
     }
 
     fn prepare_sized(&mut self, spec: &RenderSpec, w: u32, h: u32, span: Option<SpanGeom>) -> Job {
@@ -519,32 +464,21 @@ impl Renderer {
             w,
             h,
             span,
-            image: spec.image.as_deref().map(|n| self.lookup(n)),
-            icon: spec.icon.as_deref().map(|n| self.lookup(n)),
-            tint: spec.tint.map(|c| c.0),
+            image: spec.image.as_deref().and_then(|n| self.lookup(n)),
+            icon: spec.icon.as_deref().and_then(|n| self.lookup(n)),
         }
-        .without_missing()
-    }
-
-    /// Rasterizes `span` and cuts it into its key tiles (row-major), before JPEG encoding.
-    pub fn render_span_images(&mut self, spec: &RenderSpec, geom: SpanGeom) -> Vec<RgbImage> {
-        let job = self.prepare_span(spec, geom);
-        self.painter.paint_tiles(&job)
     }
 
     /// Rasterizes and JPEG-encodes `jobs`, spread over the available cores. A job yields one
     /// JPEG, or for a span one per key (row-major); the results are concatenated in job order.
-    /// With `native`, each JPEG is in that device format (see [`encode_native`]).
+    /// With `native`, each JPEG is in that deck's orientation.
     pub fn encode_all(&self, jobs: Vec<Job>, native: Option<&NativeImage>) -> Vec<Vec<u8>> {
-        let painter = &*self.painter;
+        let painter = &self.painter;
         let run = |job: &Job| -> Vec<Vec<u8>> {
             painter
                 .paint_tiles(job)
                 .iter()
-                .map(|t| match native {
-                    Some(n) => encode_native(t, n),
-                    None => encode_jpeg(t),
-                })
+                .map(|t| encode_jpeg(t, native))
                 .collect()
         };
         let workers = std::thread::available_parallelism()
@@ -554,36 +488,20 @@ impl Renderer {
             return jobs.iter().flat_map(run).collect();
         }
         let next = AtomicUsize::new(0);
-        let mut out: Vec<Option<Vec<Vec<u8>>>> = vec![None; jobs.len()];
+        let done = Mutex::new(Vec::new());
         std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..workers)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut done = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(job) = jobs.get(i) else { break };
-                            done.push((i, run(job)));
-                        }
-                        done
-                    })
-                })
-                .collect();
-            for h in handles {
-                for (i, jpeg) in h.join().expect("render worker panicked") {
-                    out[i] = Some(jpeg);
-                }
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(job) = jobs.get(i) else { break };
+                    let jpegs = run(job);
+                    done.lock().unwrap().push((i, jpegs));
+                });
             }
         });
-        out.into_iter()
-            .flat_map(|j| j.expect("every job ran"))
-            .collect()
-    }
-
-    /// Renders several keys at once (see [`Renderer::encode_all`]).
-    pub fn render_many(&mut self, specs: &[RenderSpec], size: u32) -> Vec<Vec<u8>> {
-        let jobs = specs.iter().map(|s| self.prepare(s, size)).collect();
-        self.encode_all(jobs, None)
+        let mut done = done.into_inner().unwrap();
+        done.sort_by_key(|(i, _)| *i);
+        done.into_iter().flat_map(|(_, jpegs)| jpegs).collect()
     }
 
     fn resolve(&mut self, name: &str) -> Option<Source> {
@@ -602,14 +520,16 @@ impl Renderer {
     }
 
     /// Local files are decoded inline (cached); remote ones come from the cache or start a
-    /// background download and report `Loading`.
-    fn lookup(&mut self, name: &str) -> Img {
+    /// background download and report `Loading`. `None` is Home Assistant artwork that could
+    /// not be fetched: media art legitimately goes away, so the key renders as if no picture
+    /// were given, without an error tile.
+    fn lookup(&mut self, name: &str) -> Option<Img> {
         let Some(src) = self.resolve(name) else {
-            return Img::Failed;
+            return Some(Img::Failed);
         };
         let Some(key) = self.assets.remote_key(&src) else {
             let Source::File(full) = src else {
-                return Img::Failed;
+                unreachable!("only local files have no remote key");
             };
             let loaded =
                 self.local
@@ -621,17 +541,12 @@ impl Renderer {
                             None
                         }
                     });
-            return loaded.clone().map_or(Img::Failed, Img::Ready);
+            return Some(loaded.clone().map_or(Img::Failed, Img::Ready));
         };
-        // failed Home Assistant artwork is not an error, see [`Img::Missing`]
-        let failed = if is_ha_key(&key) {
-            Img::Missing
-        } else {
-            Img::Failed
-        };
+        let failed = (!is_ha_key(&key)).then_some(Img::Failed);
         match self.remote.get(&key) {
-            Some(Slot::Ready(i)) => return Img::Ready(i.clone()),
-            Some(Slot::Loading) => return Img::Loading,
+            Some(Slot::Ready(i)) => return Some(Img::Ready(i.clone())),
+            Some(Slot::Loading) => return Some(Img::Loading),
             Some(Slot::Failed(at)) if at.elapsed() < FAIL_TTL => return failed,
             _ => {}
         }
@@ -651,7 +566,7 @@ impl Renderer {
         };
         if started {
             self.store(key, Slot::Loading);
-            Img::Loading
+            Some(Img::Loading)
         } else {
             self.store(key, Slot::Failed(Instant::now()));
             failed
@@ -668,10 +583,7 @@ impl Painter {
         };
         (0..g.rows)
             .flat_map(|r| (0..g.cols).map(move |c| (c, r)))
-            .map(|(c, r)| {
-                let (x, y) = g.tile_origin(c, r);
-                imageops::crop_imm(&img, x, y, g.key, g.key).to_image()
-            })
+            .map(|(c, r)| imageops::crop_imm(&img, c * g.key, r * g.key, g.key, g.key).to_image())
             .collect()
     }
 
@@ -774,14 +686,23 @@ impl Painter {
                 };
                 self.draw_err(&mut img, full, top);
             }
-            Some(Img::Loading | Img::Missing) | None => {}
+            Some(Img::Loading) | None => {}
         }
         match (icon, icon_area) {
-            (Some(Img::Ready(im)), Some(area)) => self.draw_icon(&mut img, im, area, job.tint),
+            (Some(Img::Ready(im)), Some(area)) => {
+                self.draw_icon(&mut img, im, area, spec.tint.map(|c| c.0))
+            }
             (Some(Img::Failed), Some(area)) => self.draw_err(&mut img, area, area),
             _ => {}
         }
         if let (Some(text), Some(area)) = (text, text_area) {
+            // under an icon even an explicit size may not overflow the band into the icon
+            let bottom = icon.is_some() && image.is_none();
+            let size = match spec_font {
+                Some(f) if bottom => TextSize::Fixed(f.min(text_max)),
+                Some(f) => TextSize::Fixed(f),
+                None => TextSize::Fit(text_max),
+            };
             if image.is_some() {
                 // drop shadow so the label stays legible on busy pictures
                 let o = s / 72.0;
@@ -790,24 +711,9 @@ impl Painter {
                     y: area.y + o,
                     ..area
                 };
-                self.draw_text(
-                    &mut img,
-                    text,
-                    shadow,
-                    Color::BLACK,
-                    spec_font,
-                    text_max,
-                    false,
-                );
+                self.draw_text(&mut img, text, shadow, Color::BLACK, size, false);
             }
-            let bottom = icon.is_some() && image.is_none();
-            // under an icon even an explicit size may not overflow the band into the icon
-            let font_size = if bottom {
-                spec_font.map(|f| f.min(text_max))
-            } else {
-                spec_font
-            };
-            self.draw_text(&mut img, text, area, spec.fg, font_size, text_max, bottom);
+            self.draw_text(&mut img, text, area, spec.fg, size, bottom);
         }
         if job.span.is_none() {
             if spec.chevron != Chevron::None {
@@ -850,26 +756,23 @@ impl Painter {
             "ERR",
             label,
             Color::WHITE,
-            None,
-            (label.h * 0.6).min(img.width() as f32 * 0.32),
+            TextSize::Fit((label.h * 0.6).min(img.width() as f32 * 0.32)),
             false,
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn draw_text(
         &self,
         img: &mut RgbImage,
         text: &str,
         area: Area,
         fg: Color,
-        font_size: Option<f32>,
-        auto_max: f32,
+        size: TextSize,
         bottom: bool,
     ) {
-        let (px, lines) = match font_size {
-            Some(px) => (px, wrap(&self.font, px, text, area.w).0),
-            None => self.fit(text, area, auto_max),
+        let (px, lines) = match size {
+            TextSize::Fixed(px) => (px, wrap(&self.font, px, text, area.w).0),
+            TextSize::Fit(max) => self.fit(text, area, max),
         };
         let sf = self.font.as_scaled(PxScale::from(px));
         let line_h = px * LINE;
@@ -1002,11 +905,11 @@ fn blend(dst: &mut Rgb<u8>, src: [u8; 3], a: f32) {
 }
 
 /// Scales `src` (premultiplied) to cover a `w` x `h` rectangle and center-crops the overflow.
-pub fn cover(src: &RgbaImage, w: u32, h: u32) -> RgbaImage {
+fn cover(src: &RgbaImage, w: u32, h: u32) -> RgbaImage {
     let k = (w as f32 / src.width() as f32).max(h as f32 / src.height() as f32);
     let sw = ((src.width() as f32 * k).round() as u32).max(w);
     let sh = ((src.height() as f32 * k).round() as u32).max(h);
-    let scaled = resize_premul(src, sw, sh, false);
+    let scaled = imageops::resize(src, sw, sh, FilterType::Lanczos3);
     let mut out = imageops::crop_imm(&scaled, (sw - w) / 2, (sh - h) / 2, w, h).to_image();
     unpremultiply(&mut out);
     out
@@ -1070,17 +973,6 @@ fn unpremultiply(img: &mut RgbaImage) {
     }
 }
 
-/// Lanczos resize of a premultiplied picture (so transparent pixels do not bleed their colour
-/// into the edges); optionally converts the result back to straight alpha.
-fn resize_premul(src: &RgbaImage, w: u32, h: u32, straight: bool) -> RgbaImage {
-    let mut out = imageops::resize(src, w, h, FilterType::Lanczos3);
-    if straight {
-        unpremultiply(&mut out);
-    }
-    out
-}
-
-/// Alpha-composites `over` onto `img` with its top-left corner at (`ox`, `oy`).
 /// Distance from `(px, py)` to the segment `a`-`b`.
 fn segment_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
@@ -1161,6 +1053,7 @@ fn draw_ring(img: &mut RgbImage) {
     }
 }
 
+/// Alpha-composites `over` onto `img` with its top-left corner at (`ox`, `oy`).
 fn composite(img: &mut RgbImage, over: &RgbaImage, ox: i64, oy: i64) {
     for (x, y, p) in over.enumerate_pixels() {
         let (dx, dy) = (ox + x as i64, oy + y as i64);
@@ -1205,7 +1098,7 @@ fn encode_png(img: &RgbImage) -> Vec<u8> {
 
 /// Applies a deck's native orientation to an upright key image: rotate clockwise, then mirror
 /// (the order `elgato-streamdeck` uses; the size already matches).
-pub fn orient_native(img: &RgbImage, n: &NativeImage) -> RgbImage {
+fn orient_native(img: &RgbImage, n: &NativeImage) -> RgbImage {
     use image::imageops::{flip_horizontal, flip_vertical, rotate180, rotate270, rotate90};
     let r = match n.rotation {
         90 => rotate90(img),
@@ -1221,13 +1114,17 @@ pub fn orient_native(img: &RgbImage, n: &NativeImage) -> RgbImage {
     }
 }
 
-/// The JPEG a deck with format `n` (see [`NativeImage::server_can_produce`]) takes as it is:
-/// oriented, encoded once.
-pub fn encode_native(img: &RgbImage, n: &NativeImage) -> Vec<u8> {
-    encode_jpeg(&orient_native(img, n))
-}
-
-fn encode_jpeg(img: &RgbImage) -> Vec<u8> {
+/// Encodes `img` as a JPEG, oriented for a deck with native format `native` (see
+/// [`NativeImage::server_can_produce`]) so the deck can take it as it is.
+fn encode_jpeg(img: &RgbImage, native: Option<&NativeImage>) -> Vec<u8> {
+    let oriented;
+    let img = match native {
+        Some(n) => {
+            oriented = orient_native(img, n);
+            &oriented
+        }
+        None => img,
+    };
     let mut buf = Vec::new();
     JpegEncoder::new_with_quality(&mut buf, JPEG_QUALITY)
         .write_image(
@@ -1243,6 +1140,12 @@ fn encode_jpeg(img: &RgbImage) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Renders several keys at once through the parallel path.
+    fn render_many(r: &mut Renderer, specs: &[RenderSpec], size: u32) -> Vec<Vec<u8>> {
+        let jobs = specs.iter().map(|s| r.prepare(s, size)).collect();
+        r.encode_all(jobs, None)
+    }
 
     #[test]
     fn color_parsing() {
@@ -1453,7 +1356,16 @@ mod tests {
             },
             72,
         );
-        assert_eq!(transparent, r.blank_with(bg, 72));
+        assert_eq!(
+            transparent,
+            r.render(
+                &RenderSpec {
+                    bg,
+                    ..Default::default()
+                },
+                72
+            )
+        );
 
         // text over a picture is drawn on a darkened bottom
         let labelled = r.render(
@@ -1519,15 +1431,16 @@ mod tests {
 
     #[test]
     fn lru_evicts_least_recently_used_but_not_pending() {
-        let mut l: Lru<u8> = Lru::new(2);
-        assert!(l.insert("a".into(), 0, |_| false).is_empty());
-        assert!(l.insert("b".into(), 0, |_| false).is_empty());
+        let failed = || Slot::Failed(Instant::now());
+        let mut l = Lru::new(2);
+        assert!(l.insert("a".into(), failed()).is_empty());
+        assert!(l.insert("b".into(), failed()).is_empty());
         l.get("a"); // b is now the oldest
-        assert_eq!(l.insert("c".into(), 0, |_| false), ["b"]);
-        // entries in flight (value 1) stay even over the cap
-        let mut l: Lru<u8> = Lru::new(1);
-        l.insert("p".into(), 1, |v| *v == 1);
-        assert!(l.insert("q".into(), 1, |v| *v == 1).is_empty());
+        assert_eq!(l.insert("c".into(), failed()), ["b"]);
+        // downloads in flight stay even over the cap
+        let mut l = Lru::new(1);
+        l.insert("p".into(), Slot::Loading);
+        assert!(l.insert("q".into(), Slot::Loading).is_empty());
         assert_eq!(l.map.len(), 2);
     }
 
@@ -1641,15 +1554,15 @@ mod tests {
         let spec = specs.pop().unwrap();
         let page = vec![spec; 15];
         let mut r = Renderer::new(dir.clone());
-        let first = r.render_many(&page, 72);
+        let first = render_many(&mut r, &page, 72);
         assert_eq!(r.scalings(), 1, "15 keys share one scaling");
-        let second = r.render_many(&page, 72);
+        let second = render_many(&mut r, &page, 72);
         assert_eq!(r.scalings(), 1, "a re-render reuses it");
         assert_eq!(first, second);
-        r.render_many(&page[..1], 96);
+        render_many(&mut r, &page[..1], 96);
         assert_eq!(r.scalings(), 2, "a new key size scales again");
         r.clear_icon_cache();
-        r.render_many(&page[..1], 72);
+        render_many(&mut r, &page[..1], 72);
         assert_eq!(r.scalings(), 3, "a reload drops the cache");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1659,39 +1572,24 @@ mod tests {
         let (dir, specs) = big_icons("par", 6, 300);
         let mut r = Renderer::new(dir.clone());
         let serial: Vec<_> = specs.iter().map(|s| r.render(s, 72)).collect();
-        assert_eq!(r.render_many(&specs, 72), serial);
+        assert_eq!(render_many(&mut r, &specs, 72), serial);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// `cargo test -p sdc-server --release -- --ignored --nocapture page_render_timing`
-    #[test]
-    #[ignore]
-    fn page_render_timing() {
-        let (dir, specs) = big_icons("bench", 15, 1024);
-        let mut r = Renderer::new(dir.clone());
-        for pass in ["cold", "warm"] {
-            let t = Instant::now();
-            let serial: Vec<_> = specs.iter().map(|s| r.render(s, 72)).collect();
-            eprintln!("{pass} serial   page of 15 icons: {:?}", t.elapsed());
-            let t = Instant::now();
-            let many = r.render_many(&specs, 72);
-            eprintln!("{pass} parallel page of 15 icons: {:?}", t.elapsed());
-            assert_eq!(serial, many);
-        }
-        std::fs::remove_dir_all(dir).unwrap();
+    fn span_tiles(r: &mut Renderer, spec: &RenderSpec, geom: SpanGeom) -> Vec<RgbImage> {
+        let job = r.prepare_span(spec, geom);
+        r.painter.paint_tiles(&job)
     }
 
     #[test]
-    fn span_tiles_are_crops_of_one_canvas_skipping_the_gaps() {
-        // a picture whose red is x and green is y over the 162x162 canvas of a 2x2 span
+    fn span_tiles_are_crops_of_one_canvas() {
+        // a picture whose red is x and green is y over the 144x144 canvas of a 2x2 span
         let geom = SpanGeom {
             cols: 2,
             rows: 2,
             key: 72,
-            gap: 18,
         };
-        assert_eq!(geom.canvas(), (162, 162));
-        let mut src = RgbaImage::new(162, 162);
+        let mut src = RgbaImage::new(144, 144);
         for (x, y, p) in src.enumerate_pixels_mut() {
             *p = image::Rgba([x as u8, y as u8, 0, 255]);
         }
@@ -1701,14 +1599,11 @@ mod tests {
             image: Some("grad.png".into()),
             ..Default::default()
         };
-        let tiles = r.render_span_images(&spec, geom);
+        let tiles = span_tiles(&mut r, &spec, geom);
         assert_eq!(tiles.len(), 4);
-        for t in &tiles {
-            assert_eq!((t.width(), t.height()), (72, 72));
-        }
         for (i, t) in tiles.iter().enumerate() {
-            let (c, row) = (i as u32 % 2, i as u32 / 2);
-            let (ox, oy) = (c * 90, row * 90);
+            assert_eq!((t.width(), t.height()), (72, 72));
+            let (ox, oy) = (i as u32 % 2 * 72, i as u32 / 2 * 72);
             for (x, y) in [(0, 0), (71, 0), (0, 71), (71, 71), (30, 40)] {
                 let p = t.get_pixel(x, y).0;
                 let want = [(ox + x) as u8, (oy + y) as u8, 0];
@@ -1718,8 +1613,6 @@ mod tests {
                 );
             }
         }
-        // the edge of the left tile and the start of the right one skip the 18 px gap
-        assert!(tiles[1].get_pixel(0, 0).0[0] > tiles[0].get_pixel(71, 0).0[0] + 15);
         // the JPEG path gives the same number of tiles
         let jobs = vec![r.prepare_span(&spec, geom), r.prepare(&spec, 72)];
         assert_eq!(r.encode_all(jobs, None).len(), 5);
@@ -1731,16 +1624,15 @@ mod tests {
             cols: 2,
             rows: 2,
             key: 72,
-            gap: 18,
         };
         let mut r = Renderer::new(PathBuf::from("."));
         let spec = RenderSpec {
             text: Some("W".into()),
             ..Default::default()
         };
-        let tiles = r.render_span_images(&spec, geom);
+        let tiles = span_tiles(&mut r, &spec, geom);
         let bg = spec.bg.0;
-        // one big glyph centred on the canvas straddles the gaps: every tile shows a part of
+        // one big glyph centred on the canvas straddles the tiles: every tile shows a part of
         // it near the canvas centre and nothing near its own outer corner
         let ink = |t: &RgbImage, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>| {
             xs.flat_map(|x| ys.clone().map(move |y| (x, y)))
@@ -1750,7 +1642,6 @@ mod tests {
         assert!(ink(&tiles[3], 0..22, 0..22));
         assert!(!ink(&tiles[0], 0..20, 0..20));
         assert!(!ink(&tiles[3], 52..72, 52..72));
-        assert_eq!(gap_px(18, 96), 24);
     }
 
     /// Bounding box (y range) of pixels matching `f`.
@@ -2003,120 +1894,27 @@ mod tests {
     fn native_jpeg_is_encoded_once_and_oriented() {
         let img = corner_marked();
         let n = native(0, NativeMirror::Both);
-        let jpeg = encode_native(&img, &n);
+        let jpeg = encode_jpeg(&img, Some(&n));
         let back = image::load_from_memory(&jpeg).unwrap().to_rgb8();
         assert_eq!(back.dimensions(), (72, 72));
         assert!(near(back.get_pixel(66, 66).0, [255, 0, 0]));
         assert!(near(back.get_pixel(5, 5).0, [0, 0, 255]));
         // an upright request is unchanged by the native path with the identity format
         assert_eq!(
-            encode_native(&img, &native(0, NativeMirror::None)),
-            encode_jpeg(&img)
+            encode_jpeg(&img, Some(&native(0, NativeMirror::None))),
+            encode_jpeg(&img, None)
         );
         // and the renderer path agrees with encoding the oriented render
         let mut r = Renderer::new(PathBuf::from("."));
         let spec = RenderSpec::default();
         assert_eq!(
             r.render_for(&spec, 72, Some(&n)),
-            encode_native(&r.render_image(&spec, 72), &n)
+            encode_jpeg(&r.render_image(&spec, 72), Some(&n))
         );
         let jobs = vec![r.prepare(&spec, 72)];
         assert_eq!(
             r.encode_all(jobs, Some(&n)),
             vec![r.render_for(&spec, 72, Some(&n))]
         );
-    }
-
-    /// Old path (encode upright, client decodes, rotates, encodes again) against the single
-    /// encode, as mean absolute error per channel against the unencoded oriented render.
-    /// `cargo test -p sdc-server --lib jpeg_generations -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn jpeg_generations() {
-        let mut r = Renderer::new(PathBuf::from("."));
-        let n = native(0, NativeMirror::Both);
-        let mae = |a: &RgbImage, b: &RgbImage| -> f64 {
-            let sum: u64 = a
-                .pixels()
-                .zip(b.pixels())
-                .map(|(p, q)| {
-                    p.0.iter()
-                        .zip(q.0)
-                        .map(|(x, y)| x.abs_diff(y) as u64)
-                        .sum::<u64>()
-                })
-                .sum();
-            sum as f64 / (a.width() * a.height() * 3) as f64
-        };
-        let specs = [
-            (
-                "white 'Lights' on dark",
-                Color([20, 20, 30]),
-                Color([255, 255, 255]),
-                "Lights",
-            ),
-            (
-                "small red on black",
-                Color([0, 0, 0]),
-                Color([230, 40, 40]),
-                "Kitchen 21.5",
-            ),
-            (
-                "green on blue",
-                Color([10, 40, 120]),
-                Color([40, 230, 90]),
-                "ON",
-            ),
-            (
-                "yellow on red",
-                Color([160, 20, 20]),
-                Color([250, 220, 30]),
-                "Thermostat",
-            ),
-        ];
-        let (mut t_old, mut t_new) = (0.0, 0.0);
-        for (name, bg, fg, text) in specs {
-            let spec = RenderSpec {
-                bg,
-                fg,
-                text: Some(text.into()),
-                ..Default::default()
-            };
-            let img = r.render_image(&spec, 72);
-            let want = orient_native(&img, &n);
-            let once = image::load_from_memory(&encode_native(&img, &n))
-                .unwrap()
-                .to_rgb8();
-            let up = image::load_from_memory(&encode_jpeg(&img))
-                .unwrap()
-                .to_rgb8();
-            let twice = image::load_from_memory(&encode_jpeg(&orient_native(&up, &n)))
-                .unwrap()
-                .to_rgb8();
-            let (e1, e2) = (mae(&want, &once), mae(&want, &twice));
-            t_old += e2;
-            t_new += e1;
-            println!("{name:26} double {e2:.3}  single {e1:.3}");
-        }
-        // the client-side work the single encode removes: decode + orient + encode
-        let jpeg = encode_jpeg(&r.render_image(
-            &RenderSpec {
-                bg: Color([0, 0, 0]),
-                fg: Color([230, 40, 40]),
-                text: Some("Kitchen 21.5".into()),
-                ..Default::default()
-            },
-            72,
-        ));
-        let t = Instant::now();
-        for _ in 0..500 {
-            let up = image::load_from_memory(&jpeg).unwrap().to_rgb8();
-            std::hint::black_box(encode_jpeg(&orient_native(&up, &n)));
-        }
-        println!(
-            "client decode+orient+encode: {:.3} ms/key (this machine)",
-            t.elapsed().as_secs_f64() * 2.0
-        );
-        println!("mean: double {:.3}  single {:.3}", t_old / 4.0, t_new / 4.0);
     }
 }

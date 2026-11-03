@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use crate::assets::{Assets, Fetcher, HaApi, S3Config};
 use crate::ha::{HaCommand, HaEvent};
 use crate::lua_api::{Cell, CtxInfo, DeviceDef, Host, IdleConfig, LuaRuntime, Settings, SpanCell};
-use crate::render::{gap_px, Color, RenderSpec, Renderer, SpanGeom, DEFAULT_GAP};
+use crate::render::{Color, RenderSpec, Renderer, SpanGeom};
 
 mod plugin;
 
@@ -936,7 +936,6 @@ impl Engine {
             Some(rt) => rt.layout(&c.page, c.device.rows, c.device.cols),
             None => Vec::new(),
         };
-        let key_gap = self.settings().key_gap;
         // keys each job produces a tile for, in order, with the entities their render read
         let mut groups: Vec<(Vec<u8>, HashSet<String>)> = Vec::with_capacity(keys.len());
         let mut jobs = Vec::with_capacity(keys.len());
@@ -990,7 +989,6 @@ impl Engine {
                             cols: sp.size.cols as u32,
                             rows: sp.size.rows as u32,
                             key: size,
-                            gap: gap_px(sp.size.gap.or(key_gap).unwrap_or(DEFAULT_GAP), size),
                         };
                         jobs.push(self.renderer.prepare_span(&spec, geom));
                         groups.push((members, deps));
