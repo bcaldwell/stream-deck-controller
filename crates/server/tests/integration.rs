@@ -124,6 +124,7 @@ async fn start_server_with(
         listener,
         engine_tx.clone(),
         Arc::new(server.binaries),
+        Arc::default(),
         server.token.map(Into::into),
         server.deck_auth,
     ));
@@ -595,6 +596,7 @@ async fn real_ha_client_against_mock_ha() {
         HaConfig::new(&mock.url, "secret"),
         ha_rx,
         engine_tx.clone(),
+        Arc::default(),
     ));
 
     let mut c = connect(&url).await;
@@ -1230,4 +1232,49 @@ async fn native_frames_are_rotated_once() {
         differing += (u != n) as usize;
     }
     assert!(differing > 0);
+}
+
+#[tokio::test]
+async fn status_page_reports_connections_and_a_failed_reload_behind_sso() {
+    let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
+    let (engine, url, dir) = start_server_with(
+        "status",
+        ha_tx,
+        Server {
+            binaries: ClientBinaries::with("aarch64-linux", b"bin"),
+            ..Server::default()
+        },
+    )
+    .await;
+    assert_eq!(http_get_raw(&url, "/status", "").await.0, 401);
+    assert_eq!(http_get_raw(&url, "/status/api", "").await.0, 401);
+    let (status, page) = http_get_raw(&url, "/status", EMAIL).await;
+    assert_eq!(status, 200);
+    assert!(String::from_utf8(page).unwrap().contains("/status/api"));
+
+    let _deck = connect(&url).await;
+    let api = || async {
+        let (status, body) = http_get_raw(&url, "/status/api", EMAIL).await;
+        assert_eq!(status, 200);
+        serde_json::from_slice::<Value>(&body).unwrap()
+    };
+    let s = api().await;
+    assert_eq!(s["server"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(s["server"]["reload_error"], Value::Null);
+    assert_eq!(s["home_assistant"]["connected"], false);
+    assert_eq!(s["decks"][0]["client_id"], "test");
+    assert_eq!(s["decks"][0]["power"], "active");
+    assert_eq!(s["decks"][0]["browser"], false);
+    assert_eq!(s["client_binaries"][0]["target"], "aarch64-linux");
+    assert_eq!(s["client_binaries"][0]["sha256"], sha256_hex(b"bin")[..12]);
+
+    std::fs::write(dir.0.join("config.lua"), "this is not lua").unwrap();
+    engine.send(EngineEvent::Reload).unwrap();
+    let s = api().await;
+    assert!(!s["server"]["reload_error"]["message"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    // the previous config keeps serving
+    assert_eq!(s["decks"][0]["page"], "home");
 }

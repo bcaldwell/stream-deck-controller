@@ -84,7 +84,13 @@ async fn main() -> Result<()> {
     let (ha_tx, ha_rx) = mpsc::unbounded_channel();
     let engine_tx = engine::spawn(config.clone(), ha_tx, ha_cfg.clone())?;
     // Bridge HA events into the engine; the HA task reconnects on its own.
-    tokio::spawn(ha::run(ha_cfg, ha_rx, engine_tx.clone()));
+    let ha_status = Arc::default();
+    tokio::spawn(ha::run(
+        ha_cfg,
+        ha_rx,
+        engine_tx.clone(),
+        Arc::clone(&ha_status),
+    ));
     let _watcher = watch::spawn(&config, engine_tx.clone())
         .inspect_err(|e| tracing::warn!("config hot reload disabled: {e:#}"))
         .ok();
@@ -114,7 +120,7 @@ async fn main() -> Result<()> {
     }
     tracing::info!("listening on ws://{}/ws", listener.local_addr()?);
     tokio::select! {
-        _ = http::serve(listener, engine_tx, binaries, token, deck_auth) => {}
+        _ = http::serve(listener, engine_tx, binaries, ha_status, token, deck_auth) => {}
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
     }
     Ok(())

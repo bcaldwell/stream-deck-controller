@@ -16,8 +16,14 @@
 //! - `GET /deck/icon.svg`                 its icon
 //! - `GET /deck/ws`                       websocket for browser decks (same protocol as `/ws`)
 //! - `GET /deck/api/devices`              configured `sdc.device`s (`[{name, pages, home}]`)
+//!
+//! The status page uses the same SSO check:
+//!
+//! - `GET /status`                        what is connected, in a page that refreshes itself
+//! - `GET /status/api`                    the same as JSON
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
@@ -31,6 +37,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::clients::ClientBinaries;
 use crate::engine::EngineEvent;
+use crate::ha::HaStatus;
 use crate::ws;
 
 /// How `/deck` routes are authenticated.
@@ -63,6 +70,8 @@ const NO_STORE: (header::HeaderName, &str) = (header::CACHE_CONTROL, "no-store")
 pub struct AppState {
     pub engine: UnboundedSender<EngineEvent>,
     pub binaries: Arc<ClientBinaries>,
+    pub ha: Arc<Mutex<HaStatus>>,
+    pub started: Instant,
 }
 
 /// A static page served as is.
@@ -74,6 +83,7 @@ fn page(content_type: &'static str, body: &'static str) -> axum::routing::Method
 pub fn router(
     engine: UnboundedSender<EngineEvent>,
     binaries: Arc<ClientBinaries>,
+    ha: Arc<Mutex<HaStatus>>,
     token: Option<String>,
     deck_auth: DeckAuth,
 ) -> Router {
@@ -99,6 +109,14 @@ pub fn router(
         )
         .route("/deck/ws", get(ws::deck_upgrade))
         .route("/deck/api/devices", get(deck_devices))
+        .route(
+            "/status",
+            page(
+                "text/html; charset=utf-8",
+                include_str!("../assets/status.html"),
+            ),
+        )
+        .route("/status/api", get(status_api))
         .route_layer(middleware::from_fn_with_state(deck_auth, deck_guard));
     let clients = Router::new()
         .route("/ws", get(ws::upgrade))
@@ -112,17 +130,23 @@ pub fn router(
         .route("/healthz", get(|| async { "ok" }))
         .merge(clients)
         .merge(deck)
-        .with_state(AppState { engine, binaries })
+        .with_state(AppState {
+            engine,
+            binaries,
+            ha,
+            started: Instant::now(),
+        })
 }
 
 pub async fn serve(
     listener: TcpListener,
     engine: UnboundedSender<EngineEvent>,
     binaries: Arc<ClientBinaries>,
+    ha: Arc<Mutex<HaStatus>>,
     token: Option<String>,
     deck_auth: DeckAuth,
 ) {
-    if let Err(e) = axum::serve(listener, router(engine, binaries, token, deck_auth)).await {
+    if let Err(e) = axum::serve(listener, router(engine, binaries, ha, token, deck_auth)).await {
         tracing::error!("http server failed: {e}");
     }
 }
@@ -187,6 +211,46 @@ async fn deck_devices(State(state): State<AppState>) -> Response {
     (
         [(header::CONTENT_TYPE, "application/json"), NO_STORE],
         json!(devices).to_string(),
+    )
+        .into_response()
+}
+
+/// Everything the status page shows, as JSON. Times are ages in seconds.
+async fn status_api(State(state): State<AppState>) -> Response {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if state.engine.send(EngineEvent::Status(tx)).is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Ok(engine) = rx.await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let now = Instant::now();
+    let age = |at: Instant| now.saturating_duration_since(at).as_secs();
+    let ha = state.ha.lock().unwrap();
+    let body = json!({
+        "server": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_s": age(state.started),
+            "config_path": engine.config_path,
+            "config_loaded_s": engine.config_loaded_s,
+            "reload_error": engine.reload_error,
+        },
+        "home_assistant": {
+            "connected": ha.connected_since.is_some(),
+            "connected_s": ha.connected_since.map(age),
+            "last_message_s": ha.last_message.map(age),
+        },
+        "decks": engine.decks,
+        "plugins": engine.plugins,
+        "client_binaries": state
+            .binaries
+            .offered()
+            .map(|(target, sha)| json!({ "target": target, "sha256": sha }))
+            .collect::<Vec<_>>(),
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json"), NO_STORE],
+        body.to_string(),
     )
         .into_response()
 }

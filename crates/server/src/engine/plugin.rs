@@ -38,6 +38,7 @@ pub enum PluginOut {
 pub(super) struct Plugin {
     pub(super) client_id: String,
     pub(super) tx: UnboundedSender<PluginOut>,
+    pub(super) connected_at: Instant,
     pub(super) slots: HashMap<String, Slot>,
 }
 
@@ -73,6 +74,7 @@ impl Engine {
             Plugin {
                 client_id,
                 tx,
+                connected_at: Instant::now(),
                 slots: HashMap::new(),
             },
         );

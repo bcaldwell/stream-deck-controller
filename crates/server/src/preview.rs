@@ -31,7 +31,7 @@ pub async fn run(
     let mut engine = Engine::new(config, ha_cmd_tx, ha_cfg.clone(), Handle::current(), &ev_tx)?;
 
     if let Some(cfg) = ha_cfg {
-        tokio::spawn(ha::run(cfg, ha_cmd_rx, ev_tx.clone()));
+        tokio::spawn(ha::run(cfg, ha_cmd_rx, ev_tx.clone(), Default::default()));
         // wait for the initial state snapshot
         let seeded = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(ev) = ev_rx.recv().await {

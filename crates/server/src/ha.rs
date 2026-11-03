@@ -4,7 +4,8 @@
 //! [`HaEvent`]s come out (delivered as [`EngineEvent::Ha`]). Tests can therefore
 //! substitute a fake by driving those channels directly.
 
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -76,15 +77,26 @@ impl HaConfig {
     }
 }
 
+/// The connection as the status page shows it; written by [`run`].
+#[derive(Debug, Default)]
+pub struct HaStatus {
+    pub connected_since: Option<Instant>,
+    /// Last message of any kind from Home Assistant.
+    pub last_message: Option<Instant>,
+}
+
 /// Runs forever (until `cmds` closes), reconnecting with exponential backoff.
 pub async fn run(
     cfg: HaConfig,
     mut cmds: UnboundedReceiver<HaCommand>,
     events: UnboundedSender<EngineEvent>,
+    status: Arc<Mutex<HaStatus>>,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        match session(&cfg, &mut cmds, &events, &mut backoff).await {
+        let ended = session(&cfg, &mut cmds, &events, &mut backoff, &status).await;
+        status.lock().unwrap().connected_since = None;
+        match ended {
             Ok(()) => return,
             Err(e) => {
                 tracing::warn!("home assistant connection lost: {e:#}; retrying in {backoff:?}")
@@ -115,6 +127,7 @@ async fn session(
     cmds: &mut UnboundedReceiver<HaCommand>,
     events: &UnboundedSender<EngineEvent>,
     backoff: &mut Duration,
+    status: &Mutex<HaStatus>,
 ) -> Result<()> {
     tracing::info!("connecting to home assistant at {}", cfg.base_url);
     let (ws, _) = tokio_tungstenite::connect_async(cfg.ws_url())
@@ -140,6 +153,7 @@ async fn session(
         }
     }
     tracing::info!("home assistant authenticated");
+    status.lock().unwrap().connected_since = Some(Instant::now());
     *backoff = Duration::from_secs(1);
 
     // Subscribe before fetching states so no change falls in between.
@@ -155,7 +169,11 @@ async fn session(
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     loop {
         tokio::select! {
-            msg = next_json(&mut rx) => handle_message(msg?, events)?,
+            msg = next_json(&mut rx) => {
+                let msg = msg?;
+                status.lock().unwrap().last_message = Some(Instant::now());
+                handle_message(msg, events)?;
+            }
             cmd = cmds.recv() => match cmd {
                 None => return Ok(()),
                 Some(HaCommand::CallService { domain, service, data }) => {

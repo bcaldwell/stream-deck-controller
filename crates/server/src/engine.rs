@@ -24,10 +24,12 @@ use crate::lua_api::{Cell, CtxAt, CtxInfo, CtxSpan, DeviceDef, Host, LuaRuntime}
 use crate::render::Renderer;
 
 mod plugin;
+mod status;
 mod target;
 
 use plugin::Plugin;
 pub use plugin::PluginOut;
+pub use status::EngineStatus;
 pub use target::TargetId;
 use target::{Deps, Target};
 
@@ -99,6 +101,8 @@ pub enum EngineEvent {
     Redraw(TargetId),
     /// The config's `sdc.device`s, for the browser deck's layout choice.
     ListDevices(tokio::sync::oneshot::Sender<Vec<DeviceDef>>),
+    /// What is connected and how the config loaded, for the status page.
+    Status(tokio::sync::oneshot::Sender<EngineStatus>),
     Ha(HaEvent),
     /// A background image download finished (key: the renderer's cache key).
     ImageFetched {
@@ -146,6 +150,7 @@ struct Client {
     cells: Vec<Cell>,
     /// One render target per key.
     keys: Vec<Target<Vec<u8>>>,
+    connected_at: Instant,
     /// Last key press (or connect): drives dim/off.
     last_activity: Instant,
     /// Last key press, carried across reconnects: drives `home_after`.
@@ -192,6 +197,9 @@ pub struct Engine {
     config_path: PathBuf,
     host: Rc<Host>,
     rt: LuaRuntime,
+    /// When `rt` was loaded, and the last failed reload since (cleared by a good one).
+    loaded_at: Instant,
+    reload_error: Option<(Instant, String)>,
     renderer: Renderer,
     clients: BTreeMap<ClientId, Client>,
     /// Page and last key press of clients that went away, by client_id, so a reconnect (deploy,
@@ -236,6 +244,8 @@ impl Engine {
             config_path,
             host,
             rt,
+            loaded_at: Instant::now(),
+            reload_error: None,
             renderer,
             clients: BTreeMap::new(),
             remembered: HashMap::new(),
@@ -258,6 +268,7 @@ impl Engine {
         let new = LuaRuntime::load(&self.config_path, self.host.clone())?;
         // The old runtime outlives the clients' cells that still point into it.
         let _old = std::mem::replace(&mut self.rt, new);
+        self.loaded_at = Instant::now();
         self.config_loaded();
         Ok(())
     }
@@ -325,15 +336,19 @@ impl Engine {
             EngineEvent::ListDevices(reply) => {
                 let _ = reply.send(self.rt.devices());
             }
+            EngineEvent::Status(reply) => {
+                let _ = reply.send(self.status(now));
+            }
             EngineEvent::Ha(e) => self.ha_event(e),
             EngineEvent::ImageFetched { key, result } => {
                 self.renderer.finish_fetch(&key, result);
                 self.dep_changed(&format!("img:{key}"));
             }
             EngineEvent::Reload => {
-                if let Err(e) = self.reload() {
+                self.reload_error = self.reload().err().map(|e| {
                     tracing::error!("config reload failed, keeping previous config: {e:#}");
-                }
+                    (now, format!("{e:#}"))
+                });
             }
             EngineEvent::Tick => self.tick(now),
         }
@@ -395,6 +410,7 @@ impl Engine {
             def,
             tx,
             page,
+            connected_at: now,
             last_activity: now,
             last_press,
             power: Power::Active,

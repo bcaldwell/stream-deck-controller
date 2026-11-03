@@ -39,6 +39,15 @@ deck connects.
   the identity of a physical deck.
 - `SDC_DECK_AUTH=none` skips the check. Use it only for local development; the server logs a warning.
 
+## Status page
+
+`/status` (and `/status/api` for the same data as JSON) shows what the server sees, refreshing every 5 seconds and
+readable on a phone: version, uptime, config path, when the config last loaded and the error of a failed hot reload
+(the previous config stays active), whether Home Assistant is connected and when it last sent anything, each deck
+(client id, model, `sdc.device`, page, power state, last key press, whether it is a browser), each plugin with its
+slot -> export subscriptions, and the client binaries offered for self-update (target and short sha256). It uses the
+same `X-Auth-Request-Email` check as `/deck`.
+
 ## Trying it locally
 
 ```sh

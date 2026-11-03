@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0b0d">
+<title>Stream Deck status</title>
+<link rel="icon" href="/deck/icon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #0b0b0d;
+    --card-hi: #2b2c31;
+    --card-lo: #141518;
+    --edge: rgba(255, 255, 255, .07);
+    --ok: #35e07a;
+    --wait: #ffb020;
+    --bad: #ff5d5d;
+    --ink: #8a8d97;
+    --hi: #e6e7ea;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px max(16px, env(safe-area-inset-right)) 32px max(16px, env(safe-area-inset-left));
+    background: radial-gradient(120% 90% at 50% 0%, #17181c 0%, #0b0b0d 70%) fixed;
+    color: var(--ink); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 20px; color: var(--hi); font-weight: 600; }
+  h2 { margin: 24px 0 8px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink); font-weight: 600; }
+  .sub { font-size: 12px; }
+  .card {
+    margin: 0 0 8px; padding: 12px 14px; border-radius: 14px; border: 1px solid #000;
+    background: linear-gradient(165deg, var(--card-hi) 0%, #1c1d21 38%, var(--card-lo) 100%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .10), inset 0 0 0 1px var(--edge), 0 6px 14px rgba(0, 0, 0, .45);
+  }
+  .card b { color: var(--hi); font-weight: 600; word-break: break-all; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
+  .row span:first-child { flex: none; }
+  .row span:last-child { color: var(--hi); text-align: right; word-break: break-all; }
+  .dot { display: inline-block; width: 9px; height: 9px; margin-right: 8px; border-radius: 50%; background: var(--bad); }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.wait { background: var(--wait); }
+  .err { border-color: var(--bad); }
+  .err pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; color: var(--bad); font: 12px/1.4 ui-monospace, Menlo, monospace; }
+  .tag { margin-left: 6px; padding: 1px 6px; border-radius: 8px; font-size: 11px; background: rgba(255, 255, 255, .08); color: var(--ink); }
+  .empty { padding: 4px 2px; }
+  #stale { display: none; color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Stream Deck status</h1>
+  <div class="sub"><span id="stamp">loading</span> <span id="stale">· server unreachable</span></div>
+  <div id="out"></div>
+</main>
+<script>
+const out = document.getElementById("out");
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const ago = s => {
+  if (s == null) return "never";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
+  if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor(s % 3600 / 60) + "m";
+  return Math.floor(s / 86400) + "d " + Math.floor(s % 86400 / 3600) + "h";
+};
+const row = (k, v) => `<div class="row"><span>${esc(k)}</span><span>${v}</span></div>`;
+const card = (head, body, cls = "") => `<div class="card ${cls}">${head}${body}</div>`;
+const section = (title, cards, none) =>
+  `<h2>${title}</h2>` + (cards.length ? cards.join("") : `<div class="empty">${none}</div>`);
+
+function render(d) {
+  const s = d.server, ha = d.home_assistant;
+  let html = "<h2>Server</h2>";
+  html += card(`<b>v${esc(s.version)}</b>`,
+    row("Up", ago(s.uptime_s)) + row("Config", esc(s.config_path)) + row("Config loaded", ago(s.config_loaded_s) + " ago"));
+  if (s.reload_error) {
+    html += card(`<b>Last config reload failed</b> (${ago(s.reload_error.age_s)} ago, previous config still active)`,
+      `<pre>${esc(s.reload_error.message)}</pre>`, "err");
+  }
+  html += "<h2>Home Assistant</h2>";
+  html += card(`<span class="dot ${ha.connected ? "ok" : ""}"></span><b>${ha.connected ? "Connected" : "Not connected"}</b>`,
+    (ha.connected ? row("Connected for", ago(ha.connected_s)) : "") + row("Last message", ha.last_message_s == null ? "never" : ago(ha.last_message_s) + " ago"));
+  html += section("Decks", d.decks.map(k => card(
+    `<span class="dot ${k.power == "active" ? "ok" : k.power == "dim" ? "wait" : ""}"></span><b>${esc(k.client_id)}</b>${k.browser ? '<span class="tag">browser</span>' : ""}`,
+    row("Model", esc(k.model)) + row("Device", esc(k.device)) + row("Page", esc(k.page)) + row("Power", k.power) +
+    row("Last key press", ago(k.last_press_s) + " ago") + row("Connected for", ago(k.connected_s)))), "No decks connected.");
+  html += section("Plugins", d.plugins.map(p => card(
+    `<span class="dot ok"></span><b>${esc(p.client_id)}</b>`,
+    row("Connected for", ago(p.connected_s)) +
+    (Object.entries(p.slots).map(([slot, exp]) => row(slot, esc(exp))).join("") || row("Slots", "none")))), "No plugins connected.");
+  html += section("Client binaries offered", d.client_binaries.map(b => card(
+    `<b>${esc(b.target)}</b>`, row("sha256", esc(b.sha256)))), "None; self-update is off.");
+  out.innerHTML = html;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/status/api", { cache: "no-store" });
+    if (!r.ok) throw new Error(r.status);
+    render(await r.json());
+    document.getElementById("stamp").textContent = "updated " + new Date().toLocaleTimeString() + " · every 5s";
+    document.getElementById("stale").style.display = "none";
+  } catch (e) {
+    document.getElementById("stale").style.display = "inline";
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

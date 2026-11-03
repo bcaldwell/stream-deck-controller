@@ -74,6 +74,13 @@ impl ClientBinaries {
         self.by_target.get(target)
     }
 
+    /// The targets offered, with the first 12 hex digits of each binary's sha256.
+    pub fn offered(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_target
+            .iter()
+            .map(|(t, b)| (t.as_str(), &b.sha256[..12]))
+    }
+
     /// The `Update` to send a client that reported `target`/`sha256`, if we have a different
     /// binary for that target. Clients that do not report both get nothing.
     pub fn update_for(&self, target: Option<&str>, sha256: Option<&str>) -> Option<ServerMessage> {
