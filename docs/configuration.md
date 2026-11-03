@@ -231,8 +231,7 @@ a page; it is export-only. Full details in [crates/server/README.md](../crates/s
 Pages are global. A *device* is a named set of them: it says which pages a deck can show, where it starts, and
 optionally its own brightness and idle settings. Use devices when several decks share one config, for example a
 Stream Deck Plus in the office that needs different pages than the Mk.2 in the living room. A config must define at
-least one `sdc.device`; without one it fails to load. (`sdc.default_page`, `sdc.idle` and `sdc.brightness` no longer
-exist: calling them is an error, set the same things on the device. `sdc.key_gap` and `sdc.feedback` stay global.)
+least one `sdc.device`; without one it fails to load.
 
 ```lua
 local home  = sdc.page("home", { ... })   -- sdc.page and sdc.device return handles
@@ -249,11 +248,11 @@ local office = sdc.device("office", { pages = { home } })
 sdc.default_device { mk2 = living, plus = office, ["*"] = living }
 ```
 
-Pages and devices can be referred to by **handle** (the value `sdc.page` / `sdc.device` returns) or by **name**:
-handles catch typos when the config loads (a misspelled variable is `nil`, and `pages[2] is nil — is the page
-variable defined above?` stops the load), names work anywhere, including before a page is defined, which helps when
-pages link to each other (`ctx.goto_page("lights")` on a page defined before `lights`). One Lua caveat: a field
-set to `nil` simply doesn't exist, so a misspelled `home = homee` behaves like leaving `home` out.
+Pages and devices can be referred to by **handle** (the value `sdc.page` / `sdc.device` returns) or by **name**.
+A misspelled handle variable is `nil` and stops the load (`pages[2] is nil — is the page variable defined above?`);
+names also work before the page is defined, which helps when pages link to each other
+(`ctx.goto_page("lights")`). A field set to `nil` doesn't exist, so a misspelled `home = homee` behaves like
+leaving `home` out.
 
 `sdc.default_device` maps a device type to a device name. The types, derived from the model name a client reports,
 are `original` (Original and OriginalV2), `mk2` (including its scissor and module variants), `mini`, `xl`, `plus`,
@@ -271,15 +270,14 @@ else.
 
 Details:
 
-- A device without `brightness` uses 60; one without `idle` never dims, switches off or goes home on its own.
 - `ctx.goto_page` to a page outside the client's device is logged and ignored.
 - The device's `home` is the start page, the target of `home_after`, and the fallback when a remembered page is not
   on the device (also after a config reload). A deck that reconnects and lands on a different device than before
   starts at the new device's home.
 - A config reload re-resolves the device of every connected client. A mirror viewer uses the mirrored deck's device.
   Elgato plugin exports are not affected by devices.
-- These fail the load, keeping the previous config: an unknown page in `pages`, a `home` not in `pages`, duplicate
-  device names, a config without any `sdc.device`, or `sdc.default_device` naming an unknown device or type.
+- An unknown page in `pages`, a `home` not in `pages`, duplicate device names or an unknown device or type in
+  `sdc.default_device` fail the load, keeping the previous config.
 
 ## Feedback & navigation markers
 
@@ -306,30 +304,7 @@ sdc.button {
 }
 ```
 
-## Putting it together
+## Running
 
-A small but complete config:
-
-```lua
-local sdc = require("sdc")
-
-sdc.page("home", {
-  sdc.button {
-    render = function()
-      local l = ha.state("light.office")
-      local on = l and l.state == "on"
-      return { text = "Office", icon = "icons/bulb.png", bg = on and "#f5b400" or "#2a2a2e" }
-    end,
-    press = function() ha.call("light", "toggle", { entity_id = "light.office" }) end,
-  },
-})
-
-sdc.device("office", {
-  pages = { "home" },
-  brightness = 60,
-  idle = { dim_after = 120, off_after = 600, home_after = 3600 },
-})
-```
-
-Run it with `HA_URL=https://homeassistant.local:8123 HA_TOKEN=... sdc-server config.lua`, or use the Docker image
+Run with `HA_URL=https://homeassistant.local:8123 HA_TOKEN=... sdc-server config.lua`, or use the Docker image
 described in [Deployment](deploy.md).
