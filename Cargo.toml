@@ -23,6 +23,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 strip = true
 lto = "thin"
+# A broken invariant ends the process; k8s (server) or systemd (Pi client) restarts it.
+panic = "abort"
 
 # elgato-streamdeck pulls hidapi with default features (linux-static-hidraw -> needs libudev),
 # and hidapi allows exactly one Linux backend. Patch in a copy that selects the pure-Rust
