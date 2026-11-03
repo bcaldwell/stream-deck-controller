@@ -28,7 +28,7 @@ pub async fn run(
     let (ha_cmd_tx, ha_cmd_rx) = mpsc::unbounded_channel();
     // Image downloads report back here; unlike the server, we wait for them below.
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
-    let mut engine = Engine::new(config, ha_cmd_tx, Handle::current(), &ev_tx)?;
+    let mut engine = Engine::new(config, ha_cmd_tx, ha_cfg.clone(), Handle::current(), &ev_tx)?;
 
     if let Some(cfg) = ha_cfg {
         tokio::spawn(ha::run(cfg, ha_cmd_rx, ev_tx.clone()));

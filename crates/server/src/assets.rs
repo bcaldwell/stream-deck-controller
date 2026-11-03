@@ -11,6 +11,8 @@ use image::RgbaImage;
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use tokio::runtime::Handle;
 
+use crate::ha::HaConfig;
+
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// Sanity cap on a downloaded image.
 const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
@@ -78,39 +80,6 @@ impl S3Config {
     }
 }
 
-/// Where to reach Home Assistant's HTTP API (for `/api/...` image paths such as media artwork).
-#[derive(Debug, Clone)]
-pub struct HaApi {
-    /// `http://host:8123`, no trailing slash.
-    pub base_url: String,
-    pub token: String,
-}
-
-impl HaApi {
-    pub fn new(url: &str, token: &str) -> Self {
-        let u = url.trim().trim_end_matches('/');
-        let u = u.strip_suffix("/api/websocket").unwrap_or(u);
-        let u = if let Some(rest) = u.strip_prefix("wss://") {
-            format!("https://{rest}")
-        } else if let Some(rest) = u.strip_prefix("ws://") {
-            format!("http://{rest}")
-        } else {
-            u.to_string()
-        };
-        Self {
-            base_url: u,
-            token: token.to_string(),
-        }
-    }
-
-    /// Reads `HA_URL` / `HA_TOKEN`; `None` if either is unset.
-    pub fn from_env() -> Option<Self> {
-        let url = std::env::var("HA_URL").ok().filter(|s| !s.is_empty())?;
-        let token = std::env::var("HA_TOKEN").ok().filter(|s| !s.is_empty())?;
-        Some(Self::new(&url, &token))
-    }
-}
-
 /// Prefix of the cache keys of Home Assistant sources.
 const HA_KEY: &str = "ha:";
 
@@ -143,12 +112,13 @@ pub struct Assets {
     base_dir: PathBuf,
     /// Optional: a config that uses only local files and URLs needs no bucket.
     s3: Option<S3Config>,
-    ha: HaApi,
+    /// Always set by the server; `None` only for an offline `render` preview.
+    ha: Option<HaConfig>,
 }
 
 impl Assets {
     /// `base_dir` is the directory local paths are relative to (the config's directory).
-    pub fn new(base_dir: PathBuf, s3: Option<S3Config>, ha: HaApi) -> Self {
+    pub fn new(base_dir: PathBuf, s3: Option<S3Config>, ha: Option<HaConfig>) -> Self {
         Self { base_dir, s3, ha }
     }
 
@@ -159,6 +129,9 @@ impl Assets {
             return Ok(Source::Url(name.to_string()));
         }
         if name.starts_with("/api/") {
+            if self.ha.is_none() {
+                bail!("{name}: no Home Assistant to fetch it from (offline preview)");
+            }
             return Ok(Source::Ha(name.to_string()));
         }
         let path = self.base_dir.join(name);
@@ -193,10 +166,13 @@ impl Assets {
                 let s3 = self.s3.as_ref().expect("an S3 source implies S3 config");
                 s3.presign_get(k).map(plain)
             }
-            Source::Ha(p) => Ok(Download {
-                url: format!("{}{p}", self.ha.base_url),
-                bearer: Some(self.ha.token.clone()),
-            }),
+            Source::Ha(p) => {
+                let ha = self.ha.as_ref().expect("an HA source implies HA config");
+                Ok(Download {
+                    url: format!("{}{p}", ha.base_url),
+                    bearer: Some(ha.token.clone()),
+                })
+            }
             Source::File(_) => unreachable!("local files are read, not downloaded"),
         }
     }
@@ -300,7 +276,7 @@ mod tests {
     }
 
     fn assets(dir: PathBuf, s3: Option<S3Config>) -> Assets {
-        Assets::new(dir, s3, HaApi::new("http://ha.local:8123/", "tok"))
+        Assets::new(dir, s3, Some(HaConfig::new("http://ha.local:8123/", "tok")))
     }
 
     #[test]
@@ -346,11 +322,6 @@ mod tests {
         assert!(no_s3.resolve("tv/popcorn.png").is_err());
         assert!(no_s3.resolve("local.png").is_ok());
         assert!(no_s3.resolve("/apix/y.png").is_err());
-        // websocket-style URLs are accepted for HA_URL too
-        assert_eq!(
-            HaApi::new("wss://ha.example/api/websocket", "t").base_url,
-            "https://ha.example"
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -374,7 +345,8 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let a = |token: &str| Assets::new(PathBuf::from("."), None, HaApi::new(&base, token));
+        let a =
+            |token: &str| Assets::new(PathBuf::from("."), None, Some(HaConfig::new(&base, token)));
         let path = "/api/media_player_proxy/x?token=t";
         let dl = |a: &Assets| a.download(&a.resolve(path).unwrap()).unwrap();
         let (good, bad) = (dl(&a("secret")), dl(&a("wrong")));

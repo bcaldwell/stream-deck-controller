@@ -1011,14 +1011,14 @@ fn encode_jpeg(img: &RgbImage, native: Option<&NativeImage>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::HaApi;
+    use crate::ha::HaConfig;
     use std::path::{Path, PathBuf};
 
     /// A renderer on a shared runtime; downloads (to nowhere) report to no one.
     fn renderer(dir: impl AsRef<Path>) -> Renderer {
         static RT: LazyLock<tokio::runtime::Runtime> =
             LazyLock::new(|| tokio::runtime::Runtime::new().unwrap());
-        let ha = HaApi::new("http://127.0.0.1:9", "t");
+        let ha = Some(HaConfig::new("http://127.0.0.1:9", "t"));
         let fetcher = Fetcher::new(RT.handle().clone(), |_| {});
         Renderer::new(Assets::new(dir.as_ref().to_path_buf(), None, ha), fetcher)
     }

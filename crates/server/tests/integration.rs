@@ -117,7 +117,7 @@ async fn start_server_with(
     let dir = TempDir::new(tag);
     let cfg = dir.0.join("config.lua");
     std::fs::write(&cfg, server.config).unwrap();
-    let engine_tx = engine::spawn(cfg, ha_tx).unwrap();
+    let engine_tx = engine::spawn(cfg, ha_tx, HaConfig::new("http://127.0.0.1:9", "t")).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
     tokio::spawn(http::serve(

@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
     // Without Home Assistant there is nothing to show: fail like a bad config would.
     let ha_cfg = HaConfig::from_env()?;
     let (ha_tx, ha_rx) = mpsc::unbounded_channel();
-    let engine_tx = engine::spawn(config.clone(), ha_tx)?;
+    let engine_tx = engine::spawn(config.clone(), ha_tx, ha_cfg.clone())?;
     // Bridge HA events into the engine; the HA task reconnects on its own.
     tokio::spawn(ha::run(ha_cfg, ha_rx, engine_tx.clone()));
     let _watcher = watch::spawn(&config, engine_tx.clone())

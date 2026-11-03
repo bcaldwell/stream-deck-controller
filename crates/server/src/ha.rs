@@ -40,16 +40,18 @@ pub enum HaCommand {
     },
 }
 
+/// Where Home Assistant is: `HA_URL` (`http(s)://host:port`) and a long-lived `HA_TOKEN`.
 #[derive(Debug, Clone)]
 pub struct HaConfig {
-    pub ws_url: String,
+    /// `http(s)://host:port`, no trailing slash.
+    pub base_url: String,
     pub token: String,
 }
 
 impl HaConfig {
     pub fn new(url: &str, token: &str) -> Self {
         Self {
-            ws_url: ws_url(url),
+            base_url: url.trim().trim_end_matches('/').to_string(),
             token: token.to_string(),
         }
     }
@@ -64,22 +66,13 @@ impl HaConfig {
         };
         Ok(Self::new(&var("HA_URL")?, &var("HA_TOKEN")?))
     }
-}
 
-/// `http://host:8123` -> `ws://host:8123/api/websocket` (https -> wss).
-pub fn ws_url(url: &str) -> String {
-    let u = url.trim().trim_end_matches('/');
-    let u = if let Some(rest) = u.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = u.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        u.to_string()
-    };
-    if u.ends_with("/api/websocket") {
-        u
-    } else {
-        format!("{u}/api/websocket")
+    /// `http://host:8123` -> `ws://host:8123/api/websocket` (https -> wss).
+    pub fn ws_url(&self) -> String {
+        format!(
+            "ws{}/api/websocket",
+            self.base_url.strip_prefix("http").unwrap_or(&self.base_url)
+        )
     }
 }
 
@@ -123,8 +116,8 @@ async fn session(
     events: &UnboundedSender<EngineEvent>,
     backoff: &mut Duration,
 ) -> Result<()> {
-    tracing::info!("connecting to home assistant at {}", cfg.ws_url);
-    let (ws, _) = tokio_tungstenite::connect_async(cfg.ws_url.as_str())
+    tracing::info!("connecting to home assistant at {}", cfg.base_url);
+    let (ws, _) = tokio_tungstenite::connect_async(cfg.ws_url())
         .await
         .context("connect")?;
     let (mut tx, mut rx) = ws.split();
@@ -247,14 +240,14 @@ mod tests {
 
     #[test]
     fn url_derivation() {
+        let ws = |url| HaConfig::new(url, "t").ws_url();
         assert_eq!(
-            ws_url("http://ha.local:8123"),
+            ws("http://ha.local:8123"),
             "ws://ha.local:8123/api/websocket"
         );
         assert_eq!(
-            ws_url("https://ha.example.com/"),
+            ws("https://ha.example.com/"),
             "wss://ha.example.com/api/websocket"
         );
-        assert_eq!(ws_url("ws://x:1/api/websocket"), "ws://x:1/api/websocket");
     }
 }

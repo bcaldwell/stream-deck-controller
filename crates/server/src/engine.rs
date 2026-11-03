@@ -18,8 +18,8 @@ use sdc_protocol::{device_type, DeviceInfo, PluginClientMessage};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, UnboundedSender, WeakUnboundedSender};
 
-use crate::assets::{Assets, Fetcher, HaApi, S3Config};
-use crate::ha::{HaCommand, HaEvent};
+use crate::assets::{Assets, Fetcher, S3Config};
+use crate::ha::{HaCommand, HaConfig, HaEvent};
 use crate::lua_api::{Cell, DeviceDef, Host, LuaRuntime};
 use crate::render::Renderer;
 
@@ -200,6 +200,7 @@ impl Engine {
     pub fn new(
         config_path: PathBuf,
         ha_tx: UnboundedSender<HaCommand>,
+        ha: Option<HaConfig>,
         handle: Handle,
         events: &UnboundedSender<EngineEvent>,
     ) -> Result<Self> {
@@ -209,8 +210,6 @@ impl Engine {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
-        let ha =
-            HaApi::from_env().unwrap_or_else(|| HaApi::new("http://homeassistant.invalid", ""));
         let weak = events.downgrade();
         let fetched = weak.clone();
         let fetcher = Fetcher::new(handle.clone(), move |(key, result)| {
@@ -546,6 +545,7 @@ fn home_due(home_after: Option<Duration>, last_press: Instant, now: Instant) -> 
 pub fn spawn(
     config_path: PathBuf,
     ha_tx: UnboundedSender<HaCommand>,
+    ha: HaConfig,
 ) -> Result<UnboundedSender<EngineEvent>> {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = Handle::current();
@@ -565,7 +565,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("sdc-engine".into())
         .spawn(
-            move || match Engine::new(config_path, ha_tx, handle, &events) {
+            move || match Engine::new(config_path, ha_tx, Some(ha), handle, &events) {
                 Ok(engine) => {
                     drop(events);
                     let _ = started.send(Ok(()));
@@ -712,7 +712,7 @@ mod tests {
             let path = write_config(dir.path(), src);
             let (ha_tx, ha) = mpsc::unbounded_channel();
             let (events, _) = mpsc::unbounded_channel();
-            let e = Engine::new(path, ha_tx, Handle::current(), &events).unwrap();
+            let e = Engine::new(path, ha_tx, None, Handle::current(), &events).unwrap();
             Rig {
                 e,
                 ha,
@@ -1163,7 +1163,7 @@ mod tests {
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let (ha_tx, _ha) = mpsc::unbounded_channel();
         // loading prefetches both static images
-        let mut e = Engine::new(cfg, ha_tx, Handle::current(), &ev_tx).unwrap();
+        let mut e = Engine::new(cfg, ha_tx, None, Handle::current(), &ev_tx).unwrap();
         assert_eq!(e.pending_fetches(), 2);
 
         let (tx, mut rx) = mpsc::unbounded_channel();
