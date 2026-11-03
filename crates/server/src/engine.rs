@@ -31,7 +31,7 @@ use plugin::Plugin;
 pub use plugin::PluginOut;
 pub use status::EngineStatus;
 pub use target::TargetId;
-use target::{Deps, Target};
+use target::{Deps, Hold, Target};
 
 pub type ClientId = u64;
 
@@ -99,8 +99,11 @@ pub enum EngineEvent {
     /// Render a target again (a flash is over, a dial's turn has settled). The target may have
     /// gone away since this was scheduled.
     Redraw(TargetId),
-    /// The config's `sdc.device`s, for the browser deck's layout choice.
-    ListDevices(tokio::sync::oneshot::Sender<Vec<DeviceDef>>),
+    /// A key with a `long_press` handler has been down for `LONG_PRESS` (if it is still).
+    LongPress(TargetId),
+    /// The config's `sdc.device`s as JSON (name, pages, home page now), for the browser deck's
+    /// layout choice.
+    ListDevices(tokio::sync::oneshot::Sender<Vec<serde_json::Value>>),
     /// What is connected and how the config loaded, for the status page.
     Status(tokio::sync::oneshot::Sender<EngineStatus>),
     Ha(HaEvent),
@@ -146,6 +149,9 @@ struct Client {
     def: DeviceDef,
     tx: UnboundedSender<Out>,
     page: String,
+    /// The page `def`'s home was when the client last went there: a deck still on it when it
+    /// wakes from Off gets the home of the new time of day.
+    home: String,
     /// What each key shows on `page`.
     cells: Vec<Cell>,
     /// One render target per key.
@@ -171,6 +177,7 @@ impl Client {
         self.layout(rt);
         for key in &mut self.keys {
             key.flash_until = None;
+            key.hold = Hold::Idle;
         }
     }
 
@@ -290,7 +297,8 @@ impl Engine {
                 .rt
                 .resolve_device(c.want_device.as_deref(), client_kind(c.web, &c.device));
             if c.def.name != def.name || !def.pages.contains(&c.page) {
-                c.page = def.home.clone();
+                c.page = self.rt.home(&def);
+                c.home = c.page.clone();
             }
             if c.def.level(c.power) != def.level(c.power) {
                 rebrightened.push(*id);
@@ -333,8 +341,19 @@ impl Engine {
             EngineEvent::PluginDisconnected(id) => self.plugin_disconnected(id),
             EngineEvent::Plugin { id, msg } => self.plugin_message(id, msg, now),
             EngineEvent::Redraw(target) => self.redraw(target, now),
+            EngineEvent::LongPress(target) => self.long_press(&target, now),
             EngineEvent::ListDevices(reply) => {
-                let _ = reply.send(self.rt.devices());
+                let devices = self.rt.devices();
+                let _ = reply.send(
+                    devices
+                        .into_iter()
+                        .map(|d| {
+                            serde_json::json!({
+                                "name": d.name, "pages": d.pages, "home": self.rt.home(&d)
+                            })
+                        })
+                        .collect(),
+                );
             }
             EngineEvent::Status(reply) => {
                 let _ = reply.send(self.status(now));
@@ -390,6 +409,7 @@ impl Engine {
             .find(|c| c.client_id == client_id)
             .map(|c| (c.page.clone(), c.last_press, c.def.name.clone()))
             .or_else(|| self.remembered.remove(&client_id));
+        let home = self.rt.home(&def);
         let (page, last_press) = match prev {
             Some((page, at, dev))
                 if dev == def.name
@@ -398,7 +418,7 @@ impl Engine {
             {
                 (page, at)
             }
-            _ => (def.home.clone(), now),
+            _ => (home.clone(), now),
         };
         let mut client = Client {
             client_id,
@@ -411,6 +431,7 @@ impl Engine {
             tx,
             page,
             connected_at: now,
+            home,
             last_activity: now,
             last_press,
             power: Power::Active,
@@ -421,6 +442,23 @@ impl Engine {
         self.clients.insert(id, client);
         self.send_brightness(id);
         self.render(keys);
+    }
+
+    /// Sends a client to its device's home page as of now.
+    fn go_home(&mut self, id: ClientId) {
+        let c = self.clients.get_mut(&id).expect("a connected client");
+        c.home = self.rt.home(&c.def);
+        let home = c.home.clone();
+        self.show_page(id, &home);
+    }
+
+    /// A client's display came back from Off. One left on its home page since before the home
+    /// changed (a time-of-day `home`) shows the current one.
+    fn woke_from_off(&mut self, id: ClientId) {
+        let c = &self.clients[&id];
+        if c.page == c.home && self.rt.home(&c.def) != c.home {
+            self.go_home(id);
+        }
     }
 
     /// Switches a client to `page` if its device includes it.
@@ -495,15 +533,13 @@ impl Engine {
         let home: Vec<_> = self
             .clients
             .iter()
-            .filter(|(_, c)| {
-                c.page != c.def.home && home_due(c.def.idle.home_after, c.last_press, now)
-            })
-            .map(|(id, c)| (*id, c.def.home.clone()))
+            .filter(|(_, c)| c.page != c.home && home_due(c.def.idle.home_after, c.last_press, now))
+            .map(|(id, _)| *id)
             .collect();
-        for (id, page) in home {
+        for id in home {
             // Rendered even while the display is off, so waking shows home.
-            tracing::info!(client = id, page = %page, "idle for home_after, going home");
-            self.show_page(id, &page);
+            tracing::info!(client = id, "idle for home_after, going home");
+            self.go_home(id);
         }
         let mut changed = Vec::new();
         for (id, c) in &mut self.clients {
@@ -534,7 +570,11 @@ impl Engine {
         c.last_press = now;
         if c.power != Power::Active {
             tracing::info!(client = %c.client_id, "woken from USB suspend");
+            let was_off = c.power == Power::Off;
             c.power = Power::Active;
+            if was_off {
+                self.woke_from_off(id);
+            }
             self.send_brightness(id);
         }
     }
@@ -547,8 +587,12 @@ impl Engine {
             if c.power != Power::Active {
                 // The press only wakes the display; it is not a button press.
                 tracing::info!(client = %c.client_id, key, "woken by key press");
+                let was_off = c.power == Power::Off;
                 c.power = Power::Active;
                 c.swallow_up.insert(key);
+                if was_off {
+                    self.woke_from_off(id);
+                }
                 self.send_brightness(id);
                 return;
             }
@@ -1468,5 +1512,147 @@ mod tests {
         r.at(EngineEvent::PluginDisconnected(7), 4);
         r.at(EngineEvent::Redraw(TargetId::Slot(7, "d".into())), 5);
         assert!(r.e.deps.is_empty());
+    }
+
+    const LONG_PRESS_BUTTON: &str = r##"
+        local calls = function(what) return function() ha.call("t", what, {}) end end
+        local plain = sdc.button{ render = { text = "P" }, press = calls("plain_press"), release = calls("plain_release") }
+        local long = sdc.button{ render = { text = "L" },
+          press = calls("press"), release = calls("release"), long_press = calls("long") }
+        sdc.page("home", { plain, long, sdc.button{ render = { text = "Go" }, long_press = function(ctx) ctx.goto_page("two") end } })
+        sdc.page("two", {})
+        sdc.export("long", long)
+    "##;
+
+    /// The services Lua called, in order.
+    fn ha_services(r: &mut Rig) -> Vec<String> {
+        std::iter::from_fn(|| r.ha.try_recv().ok())
+            .map(|c| match c {
+                HaCommand::CallService { service, .. } => service,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn long_press_runs_instead_of_press_and_release() {
+        let (mut r, _rx) = Rig::new(LONG_PRESS_BUTTON);
+        // without a long_press handler nothing changes: press on down, release on up
+        r.key(0, true, 1);
+        r.key(0, false, 1);
+        assert_eq!(ha_services(&mut r), ["plain_press", "plain_release"]);
+
+        // released early: press and release run together on the release
+        r.key(1, true, 2);
+        assert!(ha_services(&mut r).is_empty());
+        r.key(1, false, 2);
+        assert_eq!(ha_services(&mut r), ["press", "release"]);
+        // the timer of that press fires during the next one: too early to count
+        r.key(1, true, 3);
+        r.at(EngineEvent::LongPress(TargetId::Key(1, 1)), 3);
+        assert!(ha_services(&mut r).is_empty());
+        r.key(1, false, 3);
+        ha_services(&mut r);
+
+        // still held when the timer fires: the long press runs and the release is swallowed
+        r.key(1, true, 10);
+        r.at(EngineEvent::LongPress(TargetId::Key(1, 1)), 11);
+        assert_eq!(ha_services(&mut r), ["long"]);
+        r.key(1, false, 12);
+        assert!(ha_services(&mut r).is_empty());
+        // and a timer after the release does nothing
+        r.at(EngineEvent::LongPress(TargetId::Key(1, 1)), 13);
+        assert!(ha_services(&mut r).is_empty());
+
+        // a long press may change the page
+        r.key(2, true, 20);
+        r.at(EngineEvent::LongPress(TargetId::Key(1, 2)), 21);
+        assert_eq!(r.page(1), "two");
+        r.key(2, false, 22);
+
+        // a plugin key slot behaves the same
+        let (tx, _plugin_rx) = mpsc::unbounded_channel();
+        r.at(
+            EngineEvent::PluginConnected {
+                id: 7,
+                client_id: "p".into(),
+                tx,
+            },
+            30,
+        );
+        let plugin = |r: &mut Rig, msg, at| r.at(EngineEvent::Plugin { id: 7, msg }, at);
+        plugin(&mut r, subscribe("k", "long", SlotKind::Key), 30);
+        plugin(
+            &mut r,
+            PluginClientMessage::SlotDown { slot: "k".into() },
+            31,
+        );
+        plugin(&mut r, PluginClientMessage::SlotUp { slot: "k".into() }, 31);
+        assert_eq!(ha_services(&mut r), ["press", "release"]);
+        plugin(
+            &mut r,
+            PluginClientMessage::SlotDown { slot: "k".into() },
+            40,
+        );
+        r.at(EngineEvent::LongPress(TargetId::Slot(7, "k".into())), 41);
+        plugin(&mut r, PluginClientMessage::SlotUp { slot: "k".into() }, 42);
+        assert_eq!(ha_services(&mut r), ["long"]);
+    }
+
+    #[tokio::test]
+    async fn long_press_does_not_run_when_the_press_only_woke_the_display() {
+        let (mut r, _rx) = Rig::new(&format!(
+            r##"{LONG_PRESS_BUTTON}
+            sdc.device("d", {{ pages = {{ "home", "two" }}, idle = {{ off_after = 10 }} }})"##
+        ));
+        r.tick(11);
+        r.key(1, true, 20);
+        r.key(1, false, 20);
+        r.at(EngineEvent::LongPress(TargetId::Key(1, 1)), 21);
+        assert!(ha_services(&mut r).is_empty());
+    }
+
+    #[tokio::test]
+    async fn home_function_is_evaluated_whenever_a_client_goes_home() {
+        let (mut r, mut rx) = Rig::new(
+            r##"
+            local evening = false
+            sdc.page("morning", {
+              sdc.button{ render = { text = "Eve" }, press = function() evening = true end },
+              sdc.button{ render = { text = "Away" }, press = function(ctx) ctx.goto_page("other") end },
+            })
+            sdc.page("tv", { sdc.button{ render = { text = "Away" }, press = function(ctx) ctx.goto_page("other") end } })
+            sdc.page("other", {})
+            sdc.device("d", {
+              pages = { "morning", "tv", "other" },
+              home = function() return evening and "tv" or "morning" end,
+              idle = { off_after = 10, home_after = 1000 },
+            })
+            "##,
+        );
+        drain(&mut rx);
+        assert_eq!(r.page(1), "morning");
+
+        // evening comes while the deck sits on the morning home; it keeps it until it wakes
+        r.key(0, true, 1);
+        assert_eq!(r.page(1), "morning");
+        r.tick(12);
+        r.tick(13);
+        assert_eq!(r.page(1), "morning");
+        r.key(0, true, 20);
+        assert_eq!(r.page(1), "tv");
+
+        // a deck on another page is not moved by waking, only by home_after
+        r.key(0, true, 21);
+        assert_eq!(r.page(1), "other");
+        r.tick(40);
+        r.key(0, true, 41);
+        assert_eq!(r.page(1), "other");
+        r.tick(41 + 1000);
+        assert_eq!(r.page(1), "tv");
+
+        // a new connection starts at the current home
+        r.at(EngineEvent::ClientDisconnected(1), 2000);
+        let _rx = r.connect(2, "c2", "t", false, None, 2001);
+        assert_eq!(r.page(2), "tv");
     }
 }

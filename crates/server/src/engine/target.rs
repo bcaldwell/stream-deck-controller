@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 use sdc_protocol::SlotKind;
 
 use super::{ClientId, Engine, EngineEvent, Frame, Out, PluginOut};
-use crate::lua_api::{ButtonDef, Cell, CtxInfo, CtxSpan, DialDef, DialInput, Export, DIAL_SETTLE};
+use crate::lua_api::{
+    ButtonDef, ButtonInput, Cell, CtxInfo, CtxSpan, DialDef, DialInput, Export, DIAL_SETTLE,
+    LONG_PRESS,
+};
 use crate::render::{encode_all, Color, Encoding, Grid, RenderSpec, Renderer};
 
 /// How long a target shows the press flash.
@@ -37,12 +40,23 @@ impl TargetId {
     }
 }
 
+/// Where a key stands between going down and coming up, for buttons with a `long_press`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Hold {
+    Idle,
+    /// Down since then; the press is decided when the key comes up or [`LONG_PRESS`] passes.
+    Pending(Instant),
+    /// The long press ran; the release is swallowed.
+    Fired,
+}
+
 /// The state every target has; `T` is what it last sent (a deck key's JPEG, a slot's message).
 pub(super) struct Target<T> {
     /// To suppress identical output.
     last: Option<T>,
     /// While set (and in the future) the target shows the press flash.
     pub(super) flash_until: Option<Instant>,
+    pub(super) hold: Hold,
 }
 
 impl<T> Target<T> {
@@ -50,6 +64,7 @@ impl<T> Target<T> {
         Target {
             last: None,
             flash_until: None,
+            hold: Hold::Idle,
         }
     }
 }
@@ -144,18 +159,18 @@ fn image_deps(renderer: &mut Renderer, spec: &RenderSpec) -> Vec<String> {
 }
 
 impl Engine {
-    /// The flash state of `id`; `None` if the target is gone.
-    fn flash_until(&mut self, id: &TargetId) -> Option<&mut Option<Instant>> {
+    /// The flash and hold state of `id`; `None` if the target is gone.
+    fn press_state(&mut self, id: &TargetId) -> Option<(&mut Option<Instant>, &mut Hold)> {
         match id {
-            TargetId::Key(c, key) => self
-                .clients
-                .get_mut(c)
-                .map(|c| &mut c.keys[*key as usize].flash_until),
+            TargetId::Key(c, key) => self.clients.get_mut(c).map(|c| {
+                let t = &mut c.keys[*key as usize];
+                (&mut t.flash_until, &mut t.hold)
+            }),
             TargetId::Slot(c, slot) => self
                 .plugins
                 .get_mut(c)
                 .and_then(|p| p.slots.get_mut(slot))
-                .map(|s| &mut s.target.flash_until),
+                .map(|s| (&mut s.target.flash_until, &mut s.target.hold)),
         }
     }
 
@@ -413,48 +428,106 @@ impl Engine {
         self.render(ids);
     }
 
-    /// Runs the press (`down`) or release handler of a key or key slot.
-    pub(super) fn press(&mut self, id: &TargetId, down: bool, now: Instant) {
-        let (btn, info, in_span) = match id {
+    /// The button a key or key slot runs, its `ctx`, and whether it is part of a span.
+    fn button_of(&self, id: &TargetId) -> Option<(ButtonDef, CtxInfo, bool)> {
+        match id {
             TargetId::Key(c, key) => {
                 let client = &self.clients[c];
                 match &client.cells[*key as usize] {
-                    Cell::Button(b) => (b.clone(), client.ctx(*key, None), false),
+                    Cell::Button(b) => Some((b.clone(), client.ctx(*key, None), false)),
                     Cell::Span(sp) if sp.error.is_none() => {
                         let span = CtxSpan {
                             cols: sp.size.cols,
                             rows: sp.size.rows,
                             index: Some(sp.index),
                         };
-                        (sp.def.clone(), client.ctx(*key, Some(span)), true)
+                        Some((sp.def.clone(), client.ctx(*key, Some(span)), true))
                     }
-                    _ => return,
+                    _ => None,
                 }
             }
             TargetId::Slot(c, slot) => match self.slot_content(*c, slot) {
-                Ok(SlotContent::Key(b)) => (b, self.plugins[c].ctx(slot), false),
-                _ => return,
+                Ok(SlotContent::Key(b)) => Some((b, self.plugins[c].ctx(slot), false)),
+                _ => None,
             },
+        }
+    }
+
+    /// A key or key slot went down (`down`) or up. A button with a `long_press` waits to see
+    /// which of the two it is: released within [`LONG_PRESS`] it runs `press` and `release`
+    /// together, held that long [`Engine::long_press`] runs its handler.
+    pub(super) fn press(&mut self, id: &TargetId, down: bool, now: Instant) {
+        let Some((btn, info, in_span)) = self.button_of(id) else {
+            return;
         };
-        match self.rt.press(&btn, &info, down) {
-            Ok(Some(page)) => match id {
-                TargetId::Key(c, _) => self.goto_page(*c, &page),
-                TargetId::Slot(..) => {
-                    tracing::debug!("goto_page({page}) from a plugin key ignored")
+        if !btn.has_long_press() {
+            let input = if down {
+                ButtonInput::Press
+            } else {
+                ButtonInput::Release
+            };
+            self.run_button(id, &btn, &info, in_span, input, now);
+            return;
+        }
+        let (_, hold) = self.press_state(id).expect("pressed target exists");
+        if down {
+            *hold = Hold::Pending(now);
+            self.later(LONG_PRESS, EngineEvent::LongPress(id.clone()));
+        } else if let Hold::Pending(_) = std::mem::replace(hold, Hold::Idle) {
+            // `press` may have left the page, taking the release's key with it.
+            if self.run_button(id, &btn, &info, in_span, ButtonInput::Press, now) {
+                self.run_button(id, &btn, &info, in_span, ButtonInput::Release, now);
+            }
+        }
+    }
+
+    /// The hold timer of a key ran out: runs `long_press` if the key is still down.
+    pub(super) fn long_press(&mut self, id: &TargetId, now: Instant) {
+        // The target may have gone, and an older press's timer may fire during a newer one.
+        let Some((_, hold)) = self.press_state(id) else {
+            return;
+        };
+        match *hold {
+            Hold::Pending(since) if now.saturating_duration_since(since) >= LONG_PRESS => {
+                *hold = Hold::Fired;
+            }
+            _ => return,
+        }
+        let (btn, info, in_span) = self.button_of(id).expect("a held button exists");
+        self.run_button(id, &btn, &info, in_span, ButtonInput::LongPress, now);
+    }
+
+    /// Runs one handler of `btn`. Returns whether the key stays where it was: no page switch, no
+    /// error.
+    fn run_button(
+        &mut self,
+        id: &TargetId,
+        btn: &ButtonDef,
+        info: &CtxInfo,
+        in_span: bool,
+        input: ButtonInput,
+        now: Instant,
+    ) -> bool {
+        match self.rt.press(btn, info, input) {
+            Ok(Some(page)) => {
+                match id {
+                    TargetId::Key(c, _) => self.goto_page(*c, &page),
+                    TargetId::Slot(..) => {
+                        tracing::debug!("goto_page({page}) from a plugin key ignored")
+                    }
                 }
-            },
+                false
+            }
             Ok(None) => {
-                if down && btn.has_press() && btn.feedback && !in_span {
+                if input != ButtonInput::Release && btn.handles(input) && btn.feedback && !in_span {
                     self.flash(id, now);
                 }
+                true
             }
             Err(e) => {
-                fail(
-                    &info,
-                    if down { "press" } else { "release" },
-                    format!("{e:#}"),
-                );
+                fail(info, &format!("{input:?}"), format!("{e:#}"));
                 self.show_error_tile(id);
+                false
             }
         }
     }
@@ -474,9 +547,9 @@ impl Engine {
         if matches!(input, DialInput::Rotate(_)) {
             // Built-in dials show their own value while being turned; redraw once that is over so
             // the slot shows Home Assistant's state again even if no state change arrives.
-            self.redraw_later(
-                TargetId::Slot(conn, slot.to_string()),
+            self.later(
                 DIAL_SETTLE + Duration::from_millis(50),
+                EngineEvent::Redraw(TargetId::Slot(conn, slot.to_string())),
             );
         }
     }
@@ -486,18 +559,18 @@ impl Engine {
         if !self.rt.feedback() {
             return;
         }
-        *self.flash_until(id).expect("pressed target exists") = Some(now + FLASH);
+        *self.press_state(id).expect("pressed target exists").0 = Some(now + FLASH);
         self.render(vec![id.clone()]);
-        self.redraw_later(id.clone(), FLASH);
+        self.later(FLASH, EngineEvent::Redraw(id.clone()));
     }
 
-    /// Sends [`EngineEvent::Redraw`] for `id` after `delay`.
-    fn redraw_later(&self, id: TargetId, delay: Duration) {
+    /// Sends `event` to the engine after `delay`.
+    fn later(&self, delay: Duration, event: EngineEvent) {
         let events = self.events.clone();
         self.handle.spawn(async move {
             tokio::time::sleep(delay).await;
             if let Some(tx) = events.upgrade() {
-                let _ = tx.send(EngineEvent::Redraw(id));
+                let _ = tx.send(event);
             }
         });
     }
@@ -505,7 +578,7 @@ impl Engine {
     /// A scheduled redraw: ends the target's flash if it is over, then renders it.
     pub(super) fn redraw(&mut self, id: TargetId, now: Instant) {
         // The one place a target may have gone since the event was scheduled.
-        let Some(flash_until) = self.flash_until(&id) else {
+        let Some((flash_until, _)) = self.press_state(&id) else {
             return;
         };
         if flash_until.is_some_and(|until| until <= now) {

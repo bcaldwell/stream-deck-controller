@@ -68,6 +68,21 @@ sdc.device("deck", { pages = { "home" } })  -- required: at least one device sho
 
 A Lua error in `render` or `press` is logged and shows a red `ERR` tile on that key; the server keeps running.
 
+**Long press.** A button (or span) may also have `long_press = function(ctx) ... end`. Without it nothing changes:
+`press` runs when the key goes down and `release` when it comes up. With it, the key decides on release: held for
+500 ms, `long_press` runs (with the press flash) and the release is swallowed; let go sooner and `press` then
+`release` run together at that moment. So a button with a long press acts when the key is released, not when it is
+pressed. It works on deck keys and Elgato plugin key slots, may call `ctx.goto_page`, and a press that only woke the
+display stays wake-only.
+
+```lua
+sdc.button {
+  render = { text = "Lamp" },
+  press      = function() ha.call("light", "toggle", { entity_id = "light.lamp" }) end,
+  long_press = function(ctx) ctx.goto_page("lamp-details") end,
+}
+```
+
 ## Home Assistant state and services
 
 ```lua
@@ -113,7 +128,7 @@ sdc.page("media", { ... })
 
 ## Spans
 
-`sdc.span { cols, rows, render, press, release }` is a button covering a rectangle of keys and drawing one
+`sdc.span { cols, rows, render, press, release, long_press }` is a button covering a rectangle of keys and drawing one
 picture or text across all of them. A span in list slot `k` occupies `k .. k+cols-1` on that row and the same
 columns on the following rows. The other slots it covers must be `false`/`nil`.
 
@@ -235,7 +250,7 @@ local media = sdc.page("media", { ... })
 
 local living = sdc.device("living-room", {
   pages = { home, media },         -- handles or names; must exist; order does not matter
-  home = home,                     -- start page, must be in pages (default: the first of pages)
+  home = home,                     -- start page, must be in pages (default: the first of pages); or a function, see below
   brightness = 60,                 -- optional, 0-100 (default 60)
   idle = { dim_after = 120, off_after = 600, home_after = 3600 },   -- optional; absent: never idles
 })
@@ -249,6 +264,22 @@ A misspelled handle variable is `nil` and stops the load (`pages[2] is nil — i
 names also work before the page is defined, which helps when pages link to each other
 (`ctx.goto_page("lights")`). A field set to `nil` doesn't exist, so a misspelled `home = homee` behaves like
 leaving `home` out.
+
+**Time-of-day home.** `home` may also be a function returning a page handle or name. The server calls it whenever it
+sends a deck home: when a deck connects without a remembered page, at `home_after`, after a config reload that drops
+the deck's page, and when the display wakes from off while the deck is still on the page that home last was (a deck
+left on home overnight shows the morning home on the first press). The page must be one of the device's `pages`;
+anything else is logged as a Lua error (once) and the device's first page is used.
+
+```lua
+sdc.device("living-room", {
+  pages = { home, tv },
+  home = function()
+    return os.date("*t").hour >= 17 and tv or home   -- evening: the tv page
+  end,
+  idle = { off_after = 600, home_after = 3600 },
+})
+```
 
 `sdc.default_device` maps a device type to a device name. The types, derived from the model name a client reports,
 are `original` (Original and OriginalV2), `mk2` (including its scissor and module variants), `mini`, `xl`, `plus`,
@@ -266,7 +297,7 @@ are `original` (Original and OriginalV2), `mk2` (including its scissor and modul
 Details:
 
 - `ctx.goto_page` to a page outside the client's device is logged and ignored.
-- The device's `home` is the start page, the target of `home_after`, and the fallback when a remembered page is not
+- The device's `home` (see above for a function) is the start page, the target of `home_after`, and the fallback when a remembered page is not
   on the device (also after a config reload). A deck that reconnects and lands on a different device than before
   starts at the new device's home.
 - A config reload re-resolves the device of every connected client.
@@ -286,7 +317,7 @@ sdc.button { render = { text = "Quiet" }, feedback = false, press = function() e
 ```
 
 It does not flash for a press that only woke the display, a press that called `ctx.goto_page` (the page change is the
-feedback), a button without `press`, or a span.
+feedback), a button without `press`, or a span. A button with `long_press` flashes when either `press` or `long_press` ran.
 
 **Navigation chevron.** `chevron = "forward"` in a render descriptor draws a faint "›" in the
 bottom-right corner of a key that opens another page; `chevron = "back"` draws "‹" in the top-left for a key that

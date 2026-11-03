@@ -69,6 +69,8 @@ pub struct ButtonDef {
     render: Value,
     press: Option<Function>,
     release: Option<Function>,
+    /// Runs instead of `press`/`release` when the key is held for [`LONG_PRESS`].
+    long_press: Option<Function>,
     /// `feedback = false` turns the press flash off for this button.
     pub feedback: bool,
     /// Set for `sdc.span{...}`: the button covers a rectangle of keys.
@@ -79,12 +81,34 @@ pub struct ButtonDef {
 
 impl UserData for ButtonDef {}
 
+/// The handlers of a button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonInput {
+    Press,
+    Release,
+    LongPress,
+}
+
 impl ButtonDef {
-    /// Whether the button has a press handler (a press without one is not worth a flash).
-    pub fn has_press(&self) -> bool {
-        self.press.is_some()
+    /// Whether the button has a handler for `input` (an input without one is not worth a flash).
+    pub fn handles(&self, input: ButtonInput) -> bool {
+        match input {
+            ButtonInput::Press => &self.press,
+            ButtonInput::Release => &self.release,
+            ButtonInput::LongPress => &self.long_press,
+        }
+        .is_some()
+    }
+
+    /// A button with a long-press handler decides between press and long press only once the key
+    /// is released or held long enough.
+    pub fn has_long_press(&self) -> bool {
+        self.long_press.is_some()
     }
 }
+
+/// How long a key with a `long_press` handler must be held.
+pub const LONG_PRESS: Duration = Duration::from_millis(500);
 
 /// `sdc.dial{...}`: a Stream Deck + dial (plugin only, see [`Export`]).
 #[derive(Clone)]
@@ -191,18 +215,26 @@ impl Default for IdleConfig {
     }
 }
 
+/// A device's start/default page: fixed, or decided by a Lua function whenever a client goes
+/// home (see [`LuaRuntime::home`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Home {
+    /// One of the device's `pages` (checked when the config loads).
+    Page(String),
+    Dynamic(Function),
+}
+
 /// Brightness of a device that sets no `brightness`.
 pub const DEFAULT_BRIGHTNESS: u8 = 60;
 const DEFAULT_DIM_BRIGHTNESS: u8 = 10;
 
 /// `sdc.device{...}`: which pages a deck shows, where it starts, and its own idle/brightness.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeviceDef {
     pub name: String,
     /// Pages this device may show (all exist; validated after the config ran).
     pub pages: Vec<String>,
-    /// Start/default page; one of `pages`.
-    pub home: String,
+    pub home: Home,
     /// Active brightness (percent); [`DEFAULT_BRIGHTNESS`] when the device sets none.
     pub brightness: u8,
     /// Dim/off/home timers; the default never idles.
@@ -314,6 +346,8 @@ pub struct LuaRuntime {
     lua: Lua,
     host: Rc<Host>,
     registry: Rc<RefCell<Registry>>,
+    /// Errors of `home` functions already logged, so a bad one is not repeated on every call.
+    home_errors: RefCell<HashSet<String>>,
 }
 
 impl LuaRuntime {
@@ -338,6 +372,7 @@ impl LuaRuntime {
             lua,
             host,
             registry,
+            home_errors: RefCell::default(),
         };
         rt.validate_devices()?;
         Ok(rt)
@@ -361,12 +396,13 @@ impl LuaRuntime {
                     bail!("sdc.device('{}'): unknown page '{p}' in pages", d.name);
                 }
             }
-            if !d.pages.contains(&d.home) {
-                bail!(
-                    "sdc.device('{}'): home '{}' is not in its pages",
-                    d.name,
-                    d.home
-                );
+            if let Home::Page(home) = &d.home {
+                if !d.pages.contains(home) {
+                    bail!(
+                        "sdc.device('{}'): home '{home}' is not in its pages",
+                        d.name
+                    );
+                }
             }
         }
         for (kind, name) in &r.default_devices {
@@ -395,6 +431,35 @@ impl LuaRuntime {
             .or_else(|| r.devices.first())
             .cloned()
             .expect("validated: at least one device")
+    }
+
+    /// The page a client of `device` goes to now. A `home` function that fails or returns a page
+    /// the device does not have is a Lua error (logged once); the device's first page is used.
+    pub fn home(&self, device: &DeviceDef) -> String {
+        let f = match &device.home {
+            Home::Page(page) => return page.clone(),
+            Home::Dynamic(f) => f,
+        };
+        let what = format!("sdc.device('{}'): home function", device.name);
+        let result = f
+            .call::<Value>(())
+            .and_then(|v| name_ref(&v, "page", &format!("{what} returned")))
+            .map_err(lerr)
+            .and_then(|page| {
+                if device.pages.contains(&page) {
+                    Ok(page)
+                } else {
+                    Err(anyhow!(
+                        "{what} returned page '{page}', which is not in its pages"
+                    ))
+                }
+            });
+        result.unwrap_or_else(|e| {
+            if self.home_errors.borrow_mut().insert(format!("{e:#}")) {
+                tracing::error!("{e:#}; using the first page");
+            }
+            device.pages[0].clone()
+        })
     }
 
     /// A defined device by name.
@@ -528,9 +593,18 @@ impl LuaRuntime {
         }
     }
 
-    /// Runs the press (`down`) or release handler. Returns a requested page switch.
-    pub fn press(&self, btn: &ButtonDef, info: &CtxInfo, down: bool) -> Result<Option<String>> {
-        let f = if down { &btn.press } else { &btn.release };
+    /// Runs a button handler. Returns a requested page switch.
+    pub fn press(
+        &self,
+        btn: &ButtonDef,
+        info: &CtxInfo,
+        input: ButtonInput,
+    ) -> Result<Option<String>> {
+        let f = match input {
+            ButtonInput::Press => &btn.press,
+            ButtonInput::Release => &btn.release,
+            ButtonInput::LongPress => &btn.long_press,
+        };
         self.call_handler(f, info, None)
     }
 
@@ -845,7 +919,12 @@ fn install(
                             }
                         }
                     }
-                    "home" => home = Some(name_ref(&v, "page", &field)?),
+                    "home" => {
+                        home = Some(match v {
+                            Value::Function(f) => Home::Dynamic(f),
+                            v => Home::Page(name_ref(&v, "page", &field)?),
+                        })
+                    }
                     "brightness" => brightness = percent_arg(&field, &v)?,
                     "idle" => idle = idle_arg(&what, &v)?,
                     _ => {
@@ -860,7 +939,7 @@ fn install(
                     "{what}: 'pages' must list at least one page"
                 )));
             }
-            let home = home.unwrap_or_else(|| pages[0].clone());
+            let home = home.unwrap_or_else(|| Home::Page(pages[0].clone()));
             let h = handle(lua, "device", &name)?;
             reg.borrow_mut().devices.push(DeviceDef {
                 name,
@@ -964,6 +1043,7 @@ fn button_def(t: &Table, what: &str, span: Option<SpanDef>) -> mlua::Result<Butt
         render: t.get("render")?,
         press: field(t, what, "press")?,
         release: field(t, what, "release")?,
+        long_press: field(t, what, "long_press")?,
         feedback: field::<Option<bool>>(t, what, "feedback")?.unwrap_or(true),
         span,
         label: field(t, what, "label")?,
@@ -1217,10 +1297,15 @@ mod tests {
         let e = rt.render(&btn(4), &info("p", 4));
         assert_eq!(e.spec, RenderSpec::error());
         assert!(e.error.unwrap().contains("boom"));
-        assert!(rt.press(&btn(4), &info("p", 4), true).is_err());
+        assert!(rt
+            .press(&btn(4), &info("p", 4), ButtonInput::Press)
+            .is_err());
 
         // goto_page takes a handle or a name; ha.call reaches Home Assistant; no release handler
-        let press = |k| rt.press(&btn(k), &info("p", k), true).unwrap();
+        let press = |k| {
+            rt.press(&btn(k), &info("p", k), ButtonInput::Press)
+                .unwrap()
+        };
         assert_eq!(press(2).as_deref(), Some("other"));
         assert_eq!(press(3).as_deref(), Some("p"));
         assert_eq!(
@@ -1231,7 +1316,11 @@ mod tests {
                 data: json!({"entity_id": "light.a"})
             }
         );
-        assert_eq!(rt.press(&btn(3), &info("p", 3), false).unwrap(), None);
+        assert_eq!(
+            rt.press(&btn(3), &info("p", 3), ButtonInput::Release)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1287,7 +1376,7 @@ mod tests {
         );
         let a = rt.device("a").unwrap();
         assert_eq!(a.pages, ["home", "other"]);
-        assert_eq!((a.home.as_str(), a.brightness), ("other", 40));
+        assert_eq!((rt.home(&a).as_str(), a.brightness), ("other", 40));
         assert_eq!(a.idle.dim_after, Some(Duration::from_secs(120)));
         assert_eq!(a.idle.off_after, Some(Duration::from_millis(600_500)));
         assert_eq!(a.idle.home_after, Some(Duration::from_secs(3600)));
@@ -1295,7 +1384,7 @@ mod tests {
         // nothing set: first page is home, never idles, default brightness
         let b = rt.device("b").unwrap();
         assert_eq!(
-            (b.home.as_str(), b.brightness),
+            (rt.home(&b).as_str(), b.brightness),
             ("home", DEFAULT_BRIGHTNESS)
         );
         assert_eq!(b.idle, IdleConfig::default());
@@ -1307,6 +1396,27 @@ mod tests {
         assert_eq!(name(None, "browser"), "b");
         assert_eq!(name(None, "xl"), "a", "the first device is the fallback");
         assert_eq!(name(Some("zzz"), "mk2"), "c", "an unknown name falls back");
+    }
+
+    #[test]
+    fn home_function_picks_a_page_of_the_device() {
+        let rt = load(
+            r##"
+            local a = sdc.page("a", {})
+            local b = sdc.page("b", {})
+            sdc.page("c", {})
+            sdc.device("by_handle", { pages = { a, b }, home = function() return b end })
+            sdc.device("by_name", { pages = { a, b }, home = function() return "b" end })
+            sdc.device("elsewhere", { pages = { a, b }, home = function() return "c" end })
+            sdc.device("broken", { pages = { a, b }, home = function() error("boom") end })
+            "##,
+        );
+        let home = |d: &str| rt.home(&rt.device(d).unwrap());
+        assert_eq!(home("by_handle"), "b");
+        assert_eq!(home("by_name"), "b");
+        // runtime input from Lua: checked, the first page is the fallback
+        assert_eq!(home("elsewhere"), "a");
+        assert_eq!(home("broken"), "a");
     }
 
     #[test]
@@ -1543,7 +1653,10 @@ mod tests {
         let Some(Export::Button(b)) = rt.export("b") else {
             panic!("not a button")
         };
-        assert_eq!(rt.press(&b, &ctx, true).unwrap().as_deref(), Some("other"));
+        assert_eq!(
+            rt.press(&b, &ctx, ButtonInput::Press).unwrap().as_deref(),
+            Some("other")
+        );
     }
 
     #[test]

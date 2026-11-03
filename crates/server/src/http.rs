@@ -204,10 +204,6 @@ async fn deck_devices(State(state): State<AppState>) -> Response {
     let Ok(devices) = rx.await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let devices: Vec<_> = devices
-        .into_iter()
-        .map(|d| json!({ "name": d.name, "pages": d.pages, "home": d.home }))
-        .collect();
     (
         [(header::CONTENT_TYPE, "application/json"), NO_STORE],
         json!(devices).to_string(),
