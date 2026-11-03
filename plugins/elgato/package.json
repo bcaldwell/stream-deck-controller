@@ -1,6 +1,6 @@
 {
   "name": "sdc-elgato-plugin",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Elgato Stream Deck plugin: use stream-deck-controller buttons and dials next to normal Elgato actions",
   "scripts": {
     "build": "rollup -c",
