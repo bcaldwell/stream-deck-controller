@@ -10,11 +10,7 @@
 		<sdpi-item label="Export">
 			<sdpi-select setting="export" datasource="getExports" hot-reload loading="Loading exports..." placeholder="Choose a button"></sdpi-select>
 		</sdpi-item>
-		<sdpi-item label="Server URL">
-			<sdpi-textfield global setting="url" placeholder="your-server.example.com"></sdpi-textfield>
-		</sdpi-item>
-		<sdpi-item label="Token">
-			<sdpi-password global setting="token"></sdpi-password>
-		</sdpi-item>
+		<div id="connection"></div>
+		<script src="connection.js"></script>
 	</body>
 </html>

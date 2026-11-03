@@ -31,6 +31,36 @@ export function serverUrl(input: string, endpoint: Endpoint): string {
 	return u.toString();
 }
 
+/**
+ * What the property inspector's Connection section shows: no host = not configured, otherwise
+ * connected or the reason the last attempt failed. The hub and the deck links all talk to the
+ * same server, so they share this one object and the latest event wins.
+ */
+export type Status = { host: string; connected: boolean; reason: string };
+
+export const status: Status = { host: "", connected: false, reason: "" };
+/** Called after every change of `status`. */
+export const statusChanged: { listener: (() => void) | undefined } = { listener: undefined };
+
+const setStatus = (next: Partial<Status>): void => {
+	Object.assign(status, next);
+	statusChanged.listener?.();
+};
+
+/** A short reason for the inspector out of a socket error. */
+const failure = (e: Error & { code?: string }): string => {
+	switch (e.code) {
+		case "ENOTFOUND":
+			return "host not found";
+		case "ECONNREFUSED":
+			return "connection refused";
+		case "ETIMEDOUT":
+			return "timed out";
+		default:
+			return e.message;
+	}
+};
+
 const MIN_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
 const HEARTBEAT_MS = 20_000;
@@ -66,6 +96,7 @@ export class Connection {
 		if (nextUrl === this.#url && nextToken === this.#token) return;
 		this.#url = nextUrl;
 		this.#token = nextToken;
+		setStatus({ host: nextUrl && new URL(nextUrl).host, connected: false, reason: "" });
 		this.reconnect();
 	}
 
@@ -87,6 +118,7 @@ export class Connection {
 	/** The server answered the hello: the next failure starts the backoff over. */
 	connected(): void {
 		this.#backoff = MIN_BACKOFF_MS;
+		setStatus({ connected: true, reason: "" });
 	}
 
 	/** Sends `msg` as JSON; false if there is no open socket. */
@@ -118,12 +150,17 @@ export class Connection {
 		ws.on("pong", () => (this.#alive = true));
 		ws.on("unexpected-response", (_req, res) => {
 			streamDeck.logger.warn(`server refused the connection: HTTP ${res.statusCode} (check the token)`);
+			setStatus({ reason: res.statusCode === 401 ? "token rejected (HTTP 401)" : `HTTP ${res.statusCode}` });
 			res.resume();
 		});
-		ws.on("error", (e) => streamDeck.logger.warn(`websocket error: ${e.message}`));
+		ws.on("error", (e) => {
+			streamDeck.logger.warn(`websocket error: ${e.message}`);
+			setStatus({ reason: failure(e) });
+		});
 		ws.on("close", () => {
 			if (this.#ws !== ws) return; // replaced by reconnect()
 			streamDeck.logger.info("disconnected");
+			if (status.connected) setStatus({ connected: false, reason: "connection lost" });
 			this.#down();
 			this.#scheduleRetry();
 		});

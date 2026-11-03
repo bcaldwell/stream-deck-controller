@@ -7,14 +7,10 @@
 	</head>
 
 	<body>
-		<sdpi-item label="Deck layout">
-			<sdpi-textfield global setting="layout" placeholder="sdc.device name (empty = default)"></sdpi-textfield>
+		<sdpi-item>
+			<small>This key shows the server's key at its own position on the deck. Nothing to set here.</small>
 		</sdpi-item>
-		<sdpi-item label="Server URL">
-			<sdpi-textfield global setting="url" placeholder="your-server.example.com"></sdpi-textfield>
-		</sdpi-item>
-		<sdpi-item label="Token">
-			<sdpi-password global setting="token"></sdpi-password>
-		</sdpi-item>
+		<div id="connection"></div>
+		<script src="connection.js"></script>
 	</body>
 </html>

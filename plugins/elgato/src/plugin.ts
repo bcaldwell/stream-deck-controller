@@ -5,7 +5,8 @@ import streamDeck from "@elgato/streamdeck";
 import { SdcButton } from "./actions/button";
 import { SdcDeckKey } from "./actions/deck-key";
 import { SdcDial } from "./actions/dial";
-import { sendExports } from "./actions/shared";
+import { sendExports, sendStatus } from "./actions/shared";
+import { statusChanged } from "./conn";
 import { Decks } from "./deck";
 import { Hub } from "./hub";
 
@@ -36,6 +37,11 @@ hub.onExports = () => {
 	if (open?.manifestId === "ca.bcaldwell.sdc.dial") void sendExports(hub, "dial");
 	else if (open?.manifestId === "ca.bcaldwell.sdc.button") void sendExports(hub, "key");
 };
+
+// The inspector's Connection section follows the connection live.
+const pushStatus = (): void => void (streamDeck.ui.action && sendStatus());
+statusChanged.listener = pushStatus;
+streamDeck.ui.onDidAppear(pushStatus);
 
 streamDeck.settings.onDidReceiveGlobalSettings<GlobalSettings>((ev) => configure(ev.settings));
 // Wake from sleep: the old socket is usually dead, do not wait for the heartbeat to notice.

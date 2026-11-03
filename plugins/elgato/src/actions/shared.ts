@@ -8,6 +8,7 @@ import {
 	type WillDisappearEvent,
 } from "@elgato/streamdeck";
 
+import { status } from "../conn";
 import type { Hub } from "../hub";
 import type { SlotKind } from "../protocol";
 
@@ -23,6 +24,11 @@ export async function sendExports(hub: Hub, kind: SlotKind): Promise<void> {
 		.filter((e) => e.kind === kind)
 		.map((e) => ({ label: e.label ? `${e.label} (${e.id})` : e.id, value: e.id }));
 	await streamDeck.ui.sendToPropertyInspector({ event: "getExports", items });
+}
+
+/** Sends the connection status to the open property inspector's Connection section. */
+export async function sendStatus(): Promise<void> {
+	await streamDeck.ui.sendToPropertyInspector({ event: "status", ...status });
 }
 
 /** Subscribes the action instance to its chosen export and unsubscribes when it goes away. */

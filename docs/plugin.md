@@ -43,7 +43,7 @@ page set with `goto_page`, home, spans and press flash, and the plugin only show
 2. In the Stream Deck app drag **SDC Deck Key** onto every key you want the server to drive (all 8 on a Stream Deck +).
    The key's index comes from its position (row by row, 4 columns on a +), so the key in row 2, column 1 is key 4.
    Keys without an SDC Deck Key are not shown by the server; ordinary Elgato actions can sit beside them.
-3. **Deck layout** (shared setting, optional) is the `sdc.device` name to request; empty means the server's default
+3. **Deck layout** (shared setting in the inspector's Connection section, optional) is the `sdc.device` name to request; empty means the server's default
    for the deck type.
 
 Each physical Stream Deck with at least one SDC Deck Key gets its own connection to `/ws` (the server URL setting

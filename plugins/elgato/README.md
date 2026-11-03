@@ -16,7 +16,7 @@ Three actions appear in the Stream Deck app under "Stream Deck Controller":
   `release` and `touch` (tap on the touch strip).
 - **SDC Deck Key** (keys): a key of a whole page set. The plugin then acts as a deck client on `/ws` (one connection
   per physical Stream Deck that shows one), so you get pages, `goto_page`, home, spans and press flash like on a Pi.
-  No per-key settings: the key index is the position on the deck. The shared **Deck layout** setting is the
+  No per-key settings: the key index is the position on the deck. The shared **Deck layout** setting (in the Connection section) is the
   `sdc.device` name to request (empty = the server's default for the deck type). See `docs/plugin.md`.
 
 ## Install
@@ -26,14 +26,18 @@ Needs Elgato's Stream Deck app 7.1 or newer (macOS 12+, Windows 10+).
 1. Get `ca.bcaldwell.sdc.streamDeckPlugin`: from the GitHub release / the `elgato-plugin` artifact of a CI run,
    or build it (below).
 2. Double-click it; the Stream Deck app installs it.
-3. Drag "SDC Button" or "SDC Dial" onto a key or dial. In its settings:
+3. Drag "SDC Button" or "SDC Dial" onto a key or dial. Its settings show the **Export** dropdown (the server's exports of
+   the right kind; empty while the server is unreachable) and, at the bottom, one **Connection** section shared by all
+   actions:
    - **Server URL** (shared by all actions): your server, e.g. `your-server.example.com` (a bare host or `https://` URL means `wss://host/plugin/ws`).
      Nothing connects until it is set.
    - **Token** (shared): the server's `SDC_CLIENT_TOKEN`. Stream Deck stores plugin global settings in its
      preferences as plain text, so treat the laptop like any other place you keep that token. Leave empty if the
      server has no token.
-   - **Export**: a dropdown with the server's exports of the right kind (buttons for a key, dials for a dial).
-     The list is empty while the server is unreachable.
+   - **Deck layout** (shared): only for SDC Deck Key, see above.
+
+   The Connection section's first line is the live status ("● Connected to host", "Not configured" or "Can't connect:
+   <reason>", e.g. token rejected). It is collapsed while connected and open otherwise.
 
 The first connection can take a moment; keys keep their last image while the server is away and flash the
 alert (yellow triangle) when pressed offline. The plugin reconnects with backoff (1 s up to 30 s), re-subscribes
