@@ -114,7 +114,7 @@ impl HaApi {
 /// Prefix of the cache keys of Home Assistant sources.
 const HA_KEY: &str = "ha:";
 
-/// True for the cache key of a Home Assistant source (see [`Assets::remote_key`]).
+/// True for the cache key of a Home Assistant source (see [`Assets::key`]).
 pub fn is_ha_key(key: &str) -> bool {
     key.starts_with(HA_KEY)
 }
@@ -141,37 +141,24 @@ pub struct Download {
 /// Resolves the strings used for `icon` / `image` to a [`Source`].
 pub struct Assets {
     base_dir: PathBuf,
+    /// Optional: a config that uses only local files and URLs needs no bucket.
     s3: Option<S3Config>,
-    ha: Option<HaApi>,
+    ha: HaApi,
 }
 
 impl Assets {
     /// `base_dir` is the directory local paths are relative to (the config's directory).
-    pub fn new(base_dir: PathBuf, s3: Option<S3Config>) -> Self {
-        Self {
-            base_dir,
-            s3,
-            ha: None,
-        }
+    pub fn new(base_dir: PathBuf, s3: Option<S3Config>, ha: HaApi) -> Self {
+        Self { base_dir, s3, ha }
     }
 
-    /// Enables `/api/...` sources.
-    pub fn with_ha(mut self, ha: Option<HaApi>) -> Self {
-        self.ha = ha;
-        self
-    }
-
-    /// `http(s)://` -> URL; `/api/...` -> Home Assistant (an error if it is not configured);
-    /// else an existing file relative to the config dir; else, if S3 assets are configured, an
-    /// object key in the bucket.
+    /// `http(s)://` -> URL; `/api/...` -> Home Assistant; else an existing file relative to the
+    /// config dir; else, if S3 assets are configured, an object key in the bucket.
     pub fn resolve(&self, name: &str) -> Result<Source> {
         if name.starts_with("http://") || name.starts_with("https://") {
             return Ok(Source::Url(name.to_string()));
         }
         if name.starts_with("/api/") {
-            if self.ha.is_none() {
-                bail!("{} needs HA_URL and HA_TOKEN", redact(name));
-            }
             return Ok(Source::Ha(name.to_string()));
         }
         let path = self.base_dir.join(name);
@@ -187,17 +174,13 @@ impl Assets {
         )
     }
 
-    /// Stable cache key for a remote source (`None` for local files).
-    pub fn remote_key(&self, src: &Source) -> Option<String> {
+    /// Stable cache key of a source.
+    pub fn key(&self, src: &Source) -> String {
         match src {
-            Source::File(_) => None,
-            Source::Url(u) => Some(u.clone()),
-            Source::Ha(p) => Some(format!("{HA_KEY}{p}")),
-            Source::S3(k) => Some(format!(
-                "s3://{}/{}",
-                self.s3.as_ref().map_or("", |s| s.bucket.as_str()),
-                k.trim_start_matches('/')
-            )),
+            Source::File(p) => p.display().to_string(),
+            Source::Url(u) => u.clone(),
+            Source::Ha(p) => format!("{HA_KEY}{p}"),
+            Source::S3(k) => format!("s3:{}", k.trim_start_matches('/')),
         }
     }
 
@@ -206,23 +189,15 @@ impl Assets {
         let plain = |url| Download { url, bearer: None };
         match src {
             Source::Url(u) => Ok(plain(u.clone())),
-            Source::S3(k) => self
-                .s3
-                .as_ref()
-                .ok_or_else(|| anyhow!("S3 assets are not configured"))?
-                .presign_get(k)
-                .map(plain),
-            Source::Ha(p) => {
-                let ha = self
-                    .ha
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Home Assistant is not configured"))?;
-                Ok(Download {
-                    url: format!("{}{p}", ha.base_url),
-                    bearer: Some(ha.token.clone()),
-                })
+            Source::S3(k) => {
+                let s3 = self.s3.as_ref().expect("an S3 source implies S3 config");
+                s3.presign_get(k).map(plain)
             }
-            Source::File(p) => bail!("{} is a local file", p.display()),
+            Source::Ha(p) => Ok(Download {
+                url: format!("{}{p}", self.ha.base_url),
+                bearer: Some(self.ha.token.clone()),
+            }),
+            Source::File(_) => unreachable!("local files are read, not downloaded"),
         }
     }
 }
@@ -324,80 +299,59 @@ mod tests {
         assert!(!url.contains("secret"));
     }
 
-    #[test]
-    fn resolution_order() {
-        let dir = tmp("resolve");
-        std::fs::write(dir.join("local.png"), b"x").unwrap();
-        let with_s3 = Assets::new(dir.clone(), Some(s3()));
-        // URL wins, then an existing local file, then the bucket
-        assert_eq!(
-            with_s3.resolve("https://example.com/a.png").unwrap(),
-            Source::Url("https://example.com/a.png".into())
-        );
-        assert_eq!(
-            with_s3.resolve("local.png").unwrap(),
-            Source::File(dir.join("local.png"))
-        );
-        assert_eq!(
-            with_s3.resolve("tv/popcorn.png").unwrap(),
-            Source::S3("tv/popcorn.png".into())
-        );
-        // without a bucket a missing file is an error
-        let no_s3 = Assets::new(dir.clone(), None);
-        assert!(no_s3.resolve("tv/popcorn.png").is_err());
-        assert!(no_s3.resolve("local.png").is_ok());
-        std::fs::remove_dir_all(dir).unwrap();
+    fn assets(dir: PathBuf, s3: Option<S3Config>) -> Assets {
+        Assets::new(dir, s3, HaApi::new("http://ha.local:8123/", "tok"))
     }
 
     #[test]
-    fn remote_keys_and_download_urls() {
-        let a = Assets::new(PathBuf::from("."), Some(s3()));
-        let obj = Source::S3("tv/popcorn.png".into());
+    fn sources_resolve_in_order_and_download_with_credentials() {
+        let dir = tmp("resolve");
+        std::fs::write(dir.join("local.png"), b"x").unwrap();
+        let a = assets(dir.clone(), Some(s3()));
+        // URL, Home Assistant, then an existing local file, then the bucket
+        let url = a.resolve("https://x/y.png").unwrap();
+        assert_eq!(url, Source::Url("https://x/y.png".into()));
+        assert_eq!(a.key(&url), "https://x/y.png");
         assert_eq!(
-            a.remote_key(&obj).as_deref(),
-            Some("s3://stream-deck-icons/tv/popcorn.png")
-        );
-        assert!(a
-            .download(&obj)
-            .unwrap()
-            .url
-            .contains("/stream-deck-icons/tv/popcorn.png?"));
-        let u = Source::Url("https://x/y.png".into());
-        assert_eq!(a.remote_key(&u).as_deref(), Some("https://x/y.png"));
-        assert_eq!(
-            a.download(&u).unwrap(),
+            a.download(&url).unwrap(),
             Download {
                 url: "https://x/y.png".into(),
                 bearer: None
             }
         );
-        assert_eq!(a.remote_key(&Source::File("f".into())), None);
-    }
-
-    #[test]
-    fn ha_paths_resolve_to_the_ha_server_with_the_token() {
-        let ha = HaApi::new("http://ha.local:8123/", "tok");
-        let a = Assets::new(PathBuf::from("."), None).with_ha(Some(ha));
+        let file = a.resolve("local.png").unwrap();
+        assert_eq!(file, Source::File(dir.join("local.png")));
+        let obj = a.resolve("tv/popcorn.png").unwrap();
+        assert_eq!(obj, Source::S3("tv/popcorn.png".into()));
+        assert_eq!(a.key(&obj), "s3:tv/popcorn.png");
+        assert!(a
+            .download(&obj)
+            .unwrap()
+            .url
+            .contains("/stream-deck-icons/tv/popcorn.png?"));
+        // /api/ paths are Home Assistant's, fetched with the token
         let path = "/api/media_player_proxy/media_player.tv?token=abc&cache=1";
-        let src = a.resolve(path).unwrap();
-        assert_eq!(src, Source::Ha(path.into()));
-        assert!(is_ha_key(&a.remote_key(&src).unwrap()));
+        let ha = a.resolve(path).unwrap();
+        assert_eq!(ha, Source::Ha(path.into()));
+        assert!(is_ha_key(&a.key(&ha)));
         assert_eq!(
-            a.download(&src).unwrap(),
+            a.download(&ha).unwrap(),
             Download {
                 url: format!("http://ha.local:8123{path}"),
                 bearer: Some("tok".into())
             }
         );
-        // not configured: an error source; other absolute paths are not HA's
-        let none = Assets::new(PathBuf::from("."), None);
-        assert!(none.resolve(path).is_err());
-        assert!(a.resolve("/apix/y.png").is_err());
-        // websocket-style URLs are accepted too
+        // without a bucket a missing file is an error
+        let no_s3 = assets(dir.clone(), None);
+        assert!(no_s3.resolve("tv/popcorn.png").is_err());
+        assert!(no_s3.resolve("local.png").is_ok());
+        assert!(no_s3.resolve("/apix/y.png").is_err());
+        // websocket-style URLs are accepted for HA_URL too
         assert_eq!(
             HaApi::new("wss://ha.example/api/websocket", "t").base_url,
             "https://ha.example"
         );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -420,9 +374,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let a = |token: &str| {
-            Assets::new(PathBuf::from("."), None).with_ha(Some(HaApi::new(&base, token)))
-        };
+        let a = |token: &str| Assets::new(PathBuf::from("."), None, HaApi::new(&base, token));
         let path = "/api/media_player_proxy/x?token=t";
         let dl = |a: &Assets| a.download(&a.resolve(path).unwrap()).unwrap();
         let (good, bad) = (dl(&a("secret")), dl(&a("wrong")));

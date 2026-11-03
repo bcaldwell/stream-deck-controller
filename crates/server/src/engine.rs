@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use crate::assets::{Assets, Fetcher, HaApi, S3Config};
 use crate::ha::{HaCommand, HaEvent};
 use crate::lua_api::{Cell, CtxInfo, DeviceDef, Host, IdleConfig, LuaRuntime, SpanCell};
-use crate::render::{Color, RenderSpec, Renderer, SpanGeom};
+use crate::render::{encode_all, Color, Encoding, Grid, RenderSpec, Renderer};
 
 mod plugin;
 
@@ -207,7 +207,7 @@ pub struct Engine {
     slot_deps: SlotDeps,
     /// Keys and plugin slots showing the press flash, with when it ends.
     flashes: HashMap<(ClientId, FlashKey), Instant>,
-    /// Wakes the event loop when a flash is due (set by [`Engine::enable_fetch`]).
+    /// Wakes the event loop when a flash is due (set by [`Engine::new`]).
     timer: Option<(Handle, mpsc::WeakUnboundedSender<EngineEvent>)>,
 }
 
@@ -219,18 +219,32 @@ enum FlashKey {
 }
 
 impl Engine {
-    pub fn new(config_path: PathBuf, ha_tx: UnboundedSender<HaCommand>) -> Self {
+    /// Remote images download in the background on `handle`; results come back as
+    /// [`EngineEvent::ImageFetched`] on `events` (held weakly, so it does not keep the event loop
+    /// alive).
+    pub fn new(
+        config_path: PathBuf,
+        ha_tx: UnboundedSender<HaCommand>,
+        handle: Handle,
+        events: &UnboundedSender<EngineEvent>,
+    ) -> Self {
         let base = config_path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
+        let ha =
+            HaApi::from_env().unwrap_or_else(|| HaApi::new("http://homeassistant.invalid", ""));
+        let fetch_events = events.downgrade();
+        let fetcher = Fetcher::new(handle.clone(), move |(key, result)| {
+            if let Some(tx) = fetch_events.upgrade() {
+                let _ = tx.send(EngineEvent::ImageFetched { key, result });
+            }
+        });
         Self {
             config_path,
             host: Host::new(ha_tx),
             runtime: None,
-            renderer: Renderer::with_assets(
-                Assets::new(base, S3Config::from_env()).with_ha(HaApi::from_env()),
-            ),
+            renderer: Renderer::new(Assets::new(base, S3Config::from_env(), ha), fetcher),
             clients: BTreeMap::new(),
             remembered: HashMap::new(),
             key_deps: HashMap::new(),
@@ -238,22 +252,8 @@ impl Engine {
             plugins: BTreeMap::new(),
             slot_deps: SlotDeps::default(),
             flashes: HashMap::new(),
-            timer: None,
+            timer: Some((handle, events.downgrade())),
         }
-    }
-
-    /// Lets the renderer download remote images in the background on `handle`; results come
-    /// back as [`EngineEvent::ImageFetched`] on `events` (held weakly, so it does not keep the
-    /// event loop alive).
-    pub fn enable_fetch(&mut self, handle: Handle, events: &UnboundedSender<EngineEvent>) {
-        self.timer = Some((handle.clone(), events.downgrade()));
-        let events = events.downgrade();
-        self.renderer
-            .set_fetcher(Some(Fetcher::new(handle, move |(key, result)| {
-                if let Some(tx) = events.upgrade() {
-                    let _ = tx.send(EngineEvent::ImageFetched { key, result });
-                }
-            })));
     }
 
     /// Remote images still downloading.
@@ -266,7 +266,7 @@ impl Engine {
         let rt = LuaRuntime::load(&self.config_path, self.host.clone())?;
         tracing::info!("loaded {}", self.config_path.display());
         let rt = &*self.runtime.insert(rt);
-        self.renderer.clear_icon_cache();
+        self.renderer.reload();
         self.key_deps.clear();
         self.rev_deps.clear();
         self.slot_deps.clear();
@@ -612,10 +612,10 @@ impl Engine {
                     info.page,
                     if down { "press" } else { "release" }
                 );
-                let jpeg = self.renderer.render_for(
+                let jpeg = self.renderer.render(
                     &RenderSpec::error(),
                     c.device.key_size_px,
-                    c.device.native.as_ref(),
+                    Encoding::Jpeg(c.device.native.as_ref()),
                 );
                 self.send_if_changed(id, key, jpeg);
             }
@@ -744,16 +744,16 @@ impl Engine {
                     if failed {
                         // the red ERR tile on every key of the span
                         for k in members {
-                            jobs.push(self.renderer.prepare(&RenderSpec::error(), size));
+                            jobs.push(self.renderer.prepare(&RenderSpec::error(), Grid::one(size)));
                             groups.push((vec![k], deps.clone()));
                         }
                     } else {
-                        let geom = SpanGeom {
+                        let grid = Grid {
                             cols: sp.size.cols as u32,
                             rows: sp.size.rows as u32,
                             key: size,
                         };
-                        jobs.push(self.renderer.prepare_span(&spec, geom));
+                        jobs.push(self.renderer.prepare(&spec, grid));
                         groups.push((members, deps));
                     }
                     continue;
@@ -767,14 +767,11 @@ impl Engine {
                     .into_iter()
                     .map(|k| format!("img:{k}")),
             );
-            jobs.push(self.renderer.prepare(&spec, size));
+            jobs.push(self.renderer.prepare(&spec, Grid::one(size)));
             groups.push((vec![key], deps));
         }
         let page = c.page.clone();
-        let mut jpegs = self
-            .renderer
-            .encode_all(jobs, c.device.native.as_ref())
-            .into_iter();
+        let mut jpegs = encode_all(jobs, Encoding::Jpeg(c.device.native.as_ref())).into_iter();
         tracing::debug!(
             client = id,
             page,
@@ -918,8 +915,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("sdc-engine".into())
         .spawn(move || {
-            let mut engine = Engine::new(config_path, ha_tx);
-            engine.enable_fetch(handle, &events);
+            let mut engine = Engine::new(config_path, ha_tx, handle, &events);
             drop(events);
             if let Err(e) = engine.reload() {
                 tracing::error!("failed to load config: {e:#}");
@@ -1008,6 +1004,14 @@ mod tests {
             .collect()
     }
 
+    /// An engine on a shared test runtime (image downloads report to a dropped channel).
+    fn new_engine(path: PathBuf, ha_tx: UnboundedSender<HaCommand>) -> Engine {
+        static RT: std::sync::LazyLock<tokio::runtime::Runtime> =
+            std::sync::LazyLock::new(|| tokio::runtime::Runtime::new().unwrap());
+        let (events, _) = mpsc::unbounded_channel();
+        Engine::new(path, ha_tx, RT.handle().clone(), &events)
+    }
+
     fn setup(
         src: &str,
     ) -> (
@@ -1019,7 +1023,7 @@ mod tests {
         let dir = tempdir::Dir::new();
         let path = write_config(dir.path(), src);
         let (ha_tx, ha_rx) = mpsc::unbounded_channel();
-        let mut e = Engine::new(path, ha_tx);
+        let mut e = new_engine(path, ha_tx);
         e.reload().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         e.handle(EngineEvent::ClientConnected {
@@ -1093,10 +1097,11 @@ mod tests {
 
     #[test]
     fn error_tile_on_render_error() {
-        let (mut e, mut rx, _ha, d) = setup(CONFIG);
+        let (mut e, mut rx, _ha, _d) = setup(CONFIG);
         // key 3 errored at connect; its frame equals the error tile
-        let mut r = Renderer::new(d.path().to_path_buf());
-        let err = r.render(&RenderSpec::error(), 72);
+        let err = e
+            .renderer
+            .render(&RenderSpec::error(), 72, Encoding::Jpeg(None));
         e.handle(EngineEvent::Reload);
         assert!(drain(&mut rx).is_empty()); // unchanged => nothing re-sent
         let c = e.clients.get(&1).unwrap();
@@ -1432,7 +1437,7 @@ mod tests {
     fn device_engine(src: &str) -> (Engine, tempdir::Dir) {
         let dir = tempdir::Dir::new();
         let path = write_config(dir.path(), src);
-        let mut e = Engine::new(path, mpsc::unbounded_channel().0);
+        let mut e = new_engine(path, mpsc::unbounded_channel().0);
         e.reload().unwrap();
         (e, dir)
     }
@@ -1641,8 +1646,7 @@ mod tests {
             ),
         );
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
-        let mut e = Engine::new(cfg, mpsc::unbounded_channel().0);
-        e.enable_fetch(Handle::current(), &ev_tx);
+        let mut e = Engine::new(cfg, mpsc::unbounded_channel().0, Handle::current(), &ev_tx);
         e.reload().unwrap(); // prefetches both static images
         assert_eq!(e.pending_fetches(), 2);
 
@@ -1753,7 +1757,9 @@ mod tests {
     #[test]
     fn span_off_grid_or_overlapping_shows_err_on_its_keys() {
         let (mut e, mut rx, mut ha, _d) = setup(SPAN_CONFIG);
-        let err = e.renderer.render(&RenderSpec::error(), 72);
+        let err = e
+            .renderer
+            .render(&RenderSpec::error(), 72, Encoding::Jpeg(None));
         e.goto_page(1, "off");
         let f = drain(&mut rx);
         // only the key that is on the grid exists; it shows ERR, and pressing it does nothing

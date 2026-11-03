@@ -12,7 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::{ClientId, Engine, EngineEvent, FlashKey};
 use crate::lua_api::{CtxInfo, DialInput, Export, DIAL_SETTLE};
-use crate::render::RenderSpec;
+use crate::render::{Encoding, RenderSpec};
 
 /// Slots a single plugin connection may hold.
 const MAX_SLOTS: usize = 256;
@@ -283,7 +283,7 @@ impl Engine {
                         .into_iter()
                         .map(|k| format!("img:{k}")),
                 );
-                let png = self.renderer.render_png(&r.spec, size);
+                let png = self.renderer.render(&r.spec, size, Encoding::Png);
                 (png.clone(), deps, PluginOut::KeyImage { slot: slot_s, png })
             }
             (Some(Export::Dial(def)), SlotKind::Dial) => {
@@ -306,7 +306,7 @@ impl Engine {
                             .into_iter()
                             .map(|k| format!("img:{k}")),
                     );
-                    self.renderer.render_png(&spec, DIAL_ICON_PX)
+                    self.renderer.render(&spec, DIAL_ICON_PX, Encoding::Png)
                 });
                 let mut fp = format!("{}\0{}\0{}\0", d.title, d.value, d.indicator).into_bytes();
                 fp.extend(icon_png.iter().flatten());
@@ -395,7 +395,9 @@ impl Engine {
                 else {
                     return;
                 };
-                let png = self.renderer.render_png(&RenderSpec::error(), size);
+                let png = self
+                    .renderer
+                    .render(&RenderSpec::error(), size, Encoding::Png);
                 self.send_slot(
                     id,
                     slot,
