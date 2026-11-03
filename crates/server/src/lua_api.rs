@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use mlua::{serde::SerializeOptions, Function, Lua, LuaSerdeExt, Table, Value};
+use mlua::{serde::SerializeOptions, FromLua, Function, Lua, LuaSerdeExt, Table, UserData, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 use sdc_protocol::{ExportItem, SlotKind, DEVICE_TYPES};
@@ -68,7 +68,11 @@ pub struct ButtonDef {
     pub feedback: bool,
     /// Set for `sdc.span{...}`: the button covers a rectangle of keys.
     pub span: Option<SpanDef>,
+    /// Name shown in the plugin's export dropdown.
+    label: Option<String>,
 }
+
+impl UserData for ButtonDef {}
 
 impl ButtonDef {
     /// Whether the button has a press handler (a press without one is not worth a flash).
@@ -85,7 +89,10 @@ pub struct DialDef {
     press: Option<Function>,
     release: Option<Function>,
     touch: Option<Function>,
+    label: Option<String>,
 }
+
+impl UserData for DialDef {}
 
 /// What `sdc.export` registered: a button or span (shown as an image) or a dial.
 #[derive(Clone)]
@@ -229,7 +236,7 @@ struct Registry {
     /// `sdc.default_device`: device type (or `*`) -> device name.
     default_devices: Vec<(String, String)>,
     settings: Settings,
-    exports: Vec<(String, Export, Option<String>)>,
+    exports: Vec<(String, Export)>,
 }
 
 /// Per-call context handed to Lua as `ctx`.
@@ -402,7 +409,8 @@ impl LuaRuntime {
             .collect()
     }
 
-    pub fn button(&self, page: &str, key: u8) -> Option<ButtonDef> {
+    #[cfg(test)]
+    fn button(&self, page: &str, key: u8) -> Option<ButtonDef> {
         let r = self.registry.borrow();
         let (_, keys) = r.pages.iter().find(|(n, _)| n == page)?;
         keys.get(key as usize)?.clone()
@@ -491,29 +499,48 @@ impl LuaRuntime {
     /// Runs a button's render, recording the entities it reads. Never fails: errors
     /// are reported in the outcome (and the spec is the error tile).
     pub fn render(&self, btn: &ButtonDef, info: &CtxInfo) -> RenderOutcome {
-        *self.host.tracking.borrow_mut() = Some(HashSet::new());
-        let res = self.eval_render(btn, info);
-        let deps = self.host.tracking.borrow_mut().take().unwrap_or_default();
-        match res {
-            Ok(spec) => RenderOutcome {
-                spec,
-                deps,
-                error: None,
-            },
-            Err(e) => RenderOutcome {
-                spec: RenderSpec::error(),
-                deps,
-                error: Some(e.to_string()),
-            },
-        }
+        let (res, deps) = self.tracked(&btn.render, info, parse_spec);
+        let (spec, error) = match res {
+            Ok(spec) => (spec, None),
+            Err(e) => (RenderSpec::error(), Some(e.to_string())),
+        };
+        RenderOutcome { spec, deps, error }
     }
 
-    fn eval_render(&self, btn: &ButtonDef, info: &CtxInfo) -> mlua::Result<RenderSpec> {
-        let v = match &btn.render {
-            Value::Function(f) => f.call::<Value>(self.make_ctx(info)?)?,
-            other => other.clone(),
+    /// Runs a dial's render, recording the entities it reads (like [`LuaRuntime::render`]).
+    pub fn render_dial(&self, dial: &DialDef, info: &CtxInfo) -> DialOutcome {
+        let (res, deps) = self.tracked(&dial.render, info, parse_dial_spec);
+        let (spec, error) = match res {
+            Ok(spec) => (spec, None),
+            Err(e) => (
+                DialSpec {
+                    title: "ERR".into(),
+                    bg: crate::render::ERR_BG,
+                    ..DialSpec::default()
+                },
+                Some(e.to_string()),
+            ),
         };
-        parse_spec(&v)
+        DialOutcome { spec, deps, error }
+    }
+
+    /// Evaluates a `render` (a function of `ctx`, or a static value) through `parse`, together
+    /// with the entities read through `ha.state` meanwhile.
+    fn tracked<T>(
+        &self,
+        render: &Value,
+        info: &CtxInfo,
+        parse: fn(&Value) -> mlua::Result<T>,
+    ) -> (mlua::Result<T>, HashSet<String>) {
+        *self.host.tracking.borrow_mut() = Some(HashSet::new());
+        let res = (|| match render {
+            Value::Function(f) => parse(&f.call::<Value>(self.make_ctx(info)?)?),
+            other => parse(other),
+        })();
+        (
+            res,
+            self.host.tracking.borrow_mut().take().unwrap_or_default(),
+        )
     }
 
     /// Runs the press (`down`) or release handler. Returns a requested page switch.
@@ -533,13 +560,16 @@ impl LuaRuntime {
             .borrow()
             .exports
             .iter()
-            .map(|(id, e, label)| ExportItem {
+            .map(|(id, e)| ExportItem {
                 id: id.clone(),
                 kind: match e {
                     Export::Button(_) => SlotKind::Key,
                     Export::Dial(_) => SlotKind::Dial,
                 },
-                label: label.clone(),
+                label: match e {
+                    Export::Button(b) => b.label.clone(),
+                    Export::Dial(d) => d.label.clone(),
+                },
             })
             .collect()
     }
@@ -548,40 +578,11 @@ impl LuaRuntime {
         let r = self.registry.borrow();
         r.exports
             .iter()
-            .find(|(i, ..)| i == id)
-            .map(|(_, e, _)| e.clone())
+            .find(|(i, _)| i == id)
+            .map(|(_, e)| e.clone())
     }
 
-    /// Runs a dial's render, recording the entities it reads (like [`LuaRuntime::render`]).
-    pub fn render_dial(&self, dial: &DialDef, info: &CtxInfo) -> DialOutcome {
-        *self.host.tracking.borrow_mut() = Some(HashSet::new());
-        let res = (|| {
-            let v = match &dial.render {
-                Value::Function(f) => f.call::<Value>(self.make_ctx(info)?)?,
-                other => other.clone(),
-            };
-            parse_dial_spec(&v)
-        })();
-        let deps = self.host.tracking.borrow_mut().take().unwrap_or_default();
-        match res {
-            Ok(spec) => DialOutcome {
-                spec,
-                deps,
-                error: None,
-            },
-            Err(e) => DialOutcome {
-                spec: DialSpec {
-                    title: "ERR".into(),
-                    bg: crate::render::ERR_BG,
-                    ..DialSpec::default()
-                },
-                deps,
-                error: Some(e.to_string()),
-            },
-        }
-    }
-
-    /// Runs the dial handler for `input` (none set = nothing happens). A `goto_page` is dropped:
+    /// Runs the dial handler for `input` (none set = nothing happens). A `goto_page` is ignored:
     /// plugins have no pages.
     pub fn dial_input(&self, dial: &DialDef, info: &CtxInfo, input: DialInput) -> Result<()> {
         let f = match input {
@@ -598,9 +599,6 @@ impl LuaRuntime {
             _ => f.call::<()>(ctx),
         }
         .map_err(lerr)?;
-        if let Some(page) = self.host.pending_goto.borrow_mut().take() {
-            tracing::debug!("goto_page({page}) from a plugin dial ignored");
-        }
         Ok(())
     }
 
@@ -690,62 +688,57 @@ fn install(
 
     sdc.set(
         "button",
-        lua.create_function(|_, t: Table| {
-            check_button_table(&t, "sdc.button")?;
-            t.set("__sdc", "button")?;
-            Ok(t)
-        })?,
+        lua.create_function(|_, t: Table| button_def(&t, "sdc.button", None))?,
     )?;
 
     sdc.set(
         "span",
         lua.create_function(|_, t: Table| {
-            check_button_table(&t, "sdc.span")?;
-            for field in ["cols", "rows"] {
-                let v: Value = t.get(field)?;
-                if !matches!(v, Value::Integer(1..=32)) {
-                    return Err(mlua::Error::runtime(format!(
-                        "sdc.span: '{field}' must be an integer 1-32"
-                    )));
+            let what = "sdc.span";
+            let size = |name| -> mlua::Result<u8> {
+                let n: u8 = field(&t, what, name)?;
+                if (1..=32).contains(&n) {
+                    Ok(n)
+                } else {
+                    Err(mlua::Error::runtime(format!(
+                        "{what}: '{name}' must be an integer 1-32"
+                    )))
                 }
+            };
+            let gap: Option<u32> = field(&t, what, "gap")?;
+            if gap.is_some_and(|g| g > 72) {
+                return Err(mlua::Error::runtime(format!(
+                    "{what}: 'gap' must be an integer 0-72 (px at 72 px keys)"
+                )));
             }
-            let gap: Value = t.get("gap")?;
-            if !matches!(gap, Value::Nil | Value::Integer(0..=72)) {
-                return Err(mlua::Error::runtime(
-                    "sdc.span: 'gap' must be an integer 0-72 (px at 72 px keys)",
-                ));
-            }
-            t.set("__sdc", "span")?;
-            Ok(t)
+            let size = SpanDef {
+                cols: size("cols")?,
+                rows: size("rows")?,
+                gap,
+            };
+            button_def(&t, what, Some(size))
         })?,
     )?;
 
     sdc.set(
         "dial",
         lua.create_function(|_, t: Table| {
-            for field in ["rotate", "press", "release", "touch"] {
-                let v: Value = t.get(field)?;
-                if !matches!(v, Value::Nil | Value::Function(_)) {
-                    return Err(mlua::Error::runtime(format!(
-                        "sdc.dial: '{field}' must be a function"
-                    )));
-                }
-            }
-            let r: Value = t.get("render")?;
-            if !matches!(r, Value::Function(_) | Value::Table(_)) {
-                return Err(mlua::Error::runtime(
-                    "sdc.dial: 'render' (a function or a table) is required",
-                ));
-            }
-            t.set("__sdc", "dial")?;
-            Ok(t)
+            let what = "sdc.dial";
+            Ok(DialDef {
+                render: t.get("render")?,
+                rotate: field(&t, what, "rotate")?,
+                press: field(&t, what, "press")?,
+                release: field(&t, what, "release")?,
+                touch: field(&t, what, "touch")?,
+                label: field(&t, what, "label")?,
+            })
         })?,
     )?;
 
     let reg = registry.clone();
     sdc.set(
         "export",
-        lua.create_function(move |_, (id, item): (String, Table)| {
+        lua.create_function(move |_, (id, item): (String, Value)| {
             if id.is_empty()
                 || id.len() > 64
                 || !id
@@ -756,32 +749,22 @@ fn install(
                     "sdc.export: invalid id {id:?} (1-64 characters of A-Z a-z 0-9 _ - .)"
                 )));
             }
-            let export = match item.get::<Option<String>>("__sdc")?.as_deref() {
-                Some("button" | "span") => Export::Button(button_def(&item)?),
-                Some("dial") => Export::Dial(DialDef {
-                    render: item.get("render")?,
-                    rotate: item.get("rotate")?,
-                    press: item.get("press")?,
-                    release: item.get("release")?,
-                    touch: item.get("touch")?,
-                }),
-                _ => {
-                    return Err(mlua::Error::runtime(format!(
-                        "sdc.export('{id}'): second argument is not an sdc.button, sdc.span or sdc.dial"
-                    )))
-                }
-            };
-            let label = match item.get::<Value>("label")? {
-                Value::String(s) => Some(s.to_str()?.to_string()),
-                _ => None,
+            let export = if let Some(b) = userdata::<ButtonDef>(&item) {
+                Export::Button(b)
+            } else if let Some(d) = userdata::<DialDef>(&item) {
+                Export::Dial(d)
+            } else {
+                return Err(mlua::Error::runtime(format!(
+                    "sdc.export('{id}'): second argument is not an sdc.button, sdc.span or sdc.dial"
+                )));
             };
             let mut r = reg.borrow_mut();
-            if r.exports.iter().any(|(i, ..)| *i == id) {
+            if r.exports.iter().any(|(i, _)| *i == id) {
                 return Err(mlua::Error::runtime(format!(
                     "sdc.export: duplicate id '{id}'"
                 )));
             }
-            r.exports.push((id, export, label));
+            r.exports.push((id, export));
             Ok(item)
         })?,
     )?;
@@ -816,23 +799,26 @@ fn install(
                 let (k, v) = pair?;
                 let idx = match k {
                     Value::Integer(i) if i >= 1 => i as usize - 1,
-                    _ => return Err(mlua::Error::runtime(format!("page '{name}': keys must be positive integers"))),
-                };
-                let def = match v {
-                    Value::Nil | Value::Boolean(false) => None,
-                    Value::Table(t) if matches!(t.get::<Option<String>>("__sdc")?.as_deref(), Some("button" | "span")) => Some(button_def(&t)?),
-                    Value::Table(t) if t.get::<Option<String>>("__sdc")?.as_deref() == Some("dial") => {
-                        return Err(mlua::Error::runtime(format!(
-                            "page '{name}': item {} is an sdc.dial, which only works as an export for the Elgato plugin (sdc.export)",
-                            idx + 1
-                        )))
-                    }
                     _ => {
                         return Err(mlua::Error::runtime(format!(
-                            "page '{name}': item {} is not an sdc.button(...) or sdc.span(...) (use false for an empty key)",
-                            idx + 1
+                            "page '{name}': keys must be positive integers"
                         )))
                     }
+                };
+                let def = if matches!(v, Value::Boolean(false)) {
+                    None
+                } else if let Some(b) = userdata::<ButtonDef>(&v) {
+                    Some(b)
+                } else if userdata::<DialDef>(&v).is_some() {
+                    return Err(mlua::Error::runtime(format!(
+                        "page '{name}': item {} is an sdc.dial, which only works as an export for the Elgato plugin (sdc.export)",
+                        idx + 1
+                    )));
+                } else {
+                    return Err(mlua::Error::runtime(format!(
+                        "page '{name}': item {} is not an sdc.button(...) or sdc.span(...) (use false for an empty key)",
+                        idx + 1
+                    )));
                 };
                 if keys.len() <= idx {
                     keys.resize(idx + 1, None);
@@ -848,25 +834,11 @@ fn install(
         })?,
     )?;
 
-    for name in ["default_page", "idle", "brightness"] {
-        sdc.set(
-            name,
-            lua.create_function(move |_, _: mlua::MultiValue| -> mlua::Result<()> {
-                Err(mlua::Error::runtime(format!(
-                    "sdc.{name} was removed; set it on the sdc.device instead"
-                )))
-            })?,
-        )?;
-    }
-
     let reg = registry.clone();
     sdc.set(
         "device",
         lua.create_function(move |lua, (name, t): (String, Table)| {
             let what = format!("sdc.device('{name}')");
-            if name.is_empty() {
-                return Err(mlua::Error::runtime("sdc.device: name must not be empty"));
-            }
             if reg.borrow().devices.iter().any(|d| d.name == name) {
                 return Err(mlua::Error::runtime(format!(
                     "sdc.device: duplicate device '{name}'"
@@ -878,45 +850,24 @@ fn install(
             let mut idle = IdleConfig::default();
             for pair in t.pairs::<String, Value>() {
                 let (k, v) = pair?;
-                match (k.as_str(), v) {
-                    ("pages", Value::Table(list)) => {
-                        for (i, p) in list_items(&list, &format!("{what}: 'pages'"))?
-                            .iter()
-                            .enumerate()
-                        {
+                let field = format!("{what}: '{k}'");
+                match k.as_str() {
+                    "pages" => {
+                        let Value::Table(list) = &v else {
+                            return Err(mlua::Error::runtime(format!(
+                                "{field} must be a list of pages (handles or names)"
+                            )));
+                        };
+                        for (i, p) in list_items(list, &field)?.iter().enumerate() {
                             let p = name_ref(p, "page", &format!("{what}: pages[{}]", i + 1))?;
                             if !pages.contains(&p) {
                                 pages.push(p);
                             }
                         }
                     }
-                    ("home", h @ (Value::String(_) | Value::Table(_))) => {
-                        home = Some(name_ref(&h, "page", &format!("{what}: 'home'"))?)
-                    }
-                    ("brightness", Value::Integer(i)) => {
-                        brightness = percent_arg(&format!("{what}: 'brightness'"), i)?
-                    }
-                    ("idle", Value::Table(i)) => idle = idle_arg(&what, &i)?,
-                    ("pages", _) => {
-                        return Err(mlua::Error::runtime(format!(
-                            "{what}: 'pages' must be a list of pages (handles or names)"
-                        )))
-                    }
-                    ("home", _) => {
-                        return Err(mlua::Error::runtime(format!(
-                            "{what}: 'home' must be a page (handle or name)"
-                        )))
-                    }
-                    ("brightness", _) => {
-                        return Err(mlua::Error::runtime(format!(
-                            "{what}: 'brightness' must be an integer 0-100"
-                        )))
-                    }
-                    ("idle", _) => {
-                        return Err(mlua::Error::runtime(format!(
-                            "{what}: 'idle' must be a table like {{ dim_after = 120, off_after = 600 }}"
-                        )))
-                    }
+                    "home" => home = Some(name_ref(&v, "page", &field)?),
+                    "brightness" => brightness = percent_arg(&field, &v)?,
+                    "idle" => idle = idle_arg(&what, &v)?,
                     _ => {
                         return Err(mlua::Error::runtime(format!(
                             "{what}: unknown field '{k}' (use pages, home, brightness, idle)"
@@ -947,21 +898,15 @@ fn install(
         "default_device",
         lua.create_function(move |_, t: Table| {
             let mut map = Vec::new();
-            for pair in t.pairs::<Value, Value>() {
+            for pair in t.pairs::<String, Value>() {
                 let (k, v) = pair?;
-                let Value::String(k) = &k else {
-                    return Err(mlua::Error::runtime(
-                        "sdc.default_device: expected { <device type or \"*\"> = <device> }",
-                    ));
-                };
-                let k = k.to_str()?.to_string();
-                let v = name_ref(&v, "device", &format!("sdc.default_device: '{k}'"))?;
                 if k != "*" && !DEVICE_TYPES.contains(&k.as_str()) {
                     return Err(mlua::Error::runtime(format!(
                         "sdc.default_device: unknown device type '{k}' (use {} or \"*\")",
                         DEVICE_TYPES.join(", ")
                     )));
                 }
+                let v = name_ref(&v, "device", &format!("sdc.default_device: '{k}'"))?;
                 map.push((k, v));
             }
             reg.borrow_mut().default_devices = map;
@@ -1040,24 +985,41 @@ fn install(
     Ok(())
 }
 
-/// The definition behind a table made by `sdc.button` or `sdc.span`.
-fn button_def(t: &Table) -> mlua::Result<ButtonDef> {
-    let is_span = t.get::<String>("__sdc")? == "span";
+/// Builds the button of `sdc.button` / `sdc.span` from its table.
+fn button_def(t: &Table, what: &str, span: Option<SpanDef>) -> mlua::Result<ButtonDef> {
     Ok(ButtonDef {
         render: t.get("render")?,
-        press: t.get("press")?,
-        release: t.get("release")?,
-        feedback: t.get::<Option<bool>>("feedback")?.unwrap_or(true),
-        span: is_span
-            .then(|| -> mlua::Result<SpanDef> {
-                Ok(SpanDef {
-                    cols: t.get("cols")?,
-                    rows: t.get("rows")?,
-                    gap: t.get("gap")?,
-                })
-            })
-            .transpose()?,
+        press: field(t, what, "press")?,
+        release: field(t, what, "release")?,
+        feedback: field::<Option<bool>>(t, what, "feedback")?.unwrap_or(true),
+        span,
+        label: field(t, what, "label")?,
     })
+}
+
+/// Reads `t[name]`, naming the constructor and field when the value has the wrong type.
+fn field<T: FromLua>(t: &Table, what: &str, name: &str) -> mlua::Result<T> {
+    t.get(name)
+        .map_err(|e| mlua::Error::runtime(format!("{what}: '{name}': {e}")))
+}
+
+/// The `T` behind a value made by `sdc.button` / `sdc.span` / `sdc.dial`, if it is one.
+fn userdata<T: UserData + Clone + 'static>(v: &Value) -> Option<T> {
+    v.as_userdata()?.borrow::<T>().ok().map(|t| t.clone())
+}
+
+/// A text field of a render table: a string or a number.
+fn text_field(t: &Table, name: &str) -> mlua::Result<Option<String>> {
+    match t.get::<Value>(name)? {
+        Value::Nil => Ok(None),
+        Value::String(s) => Ok(Some(s.to_str()?.to_string())),
+        Value::Integer(i) => Ok(Some(i.to_string())),
+        Value::Number(n) => Ok(Some(n.to_string())),
+        other => Err(mlua::Error::runtime(format!(
+            "'{name}' must be a string, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 fn parse_dial_spec(v: &Value) -> mlua::Result<DialSpec> {
@@ -1068,20 +1030,8 @@ fn parse_dial_spec(v: &Value) -> mlua::Result<DialSpec> {
             v.type_name()
         )));
     };
-    let text = |v: Value, what: &str| -> mlua::Result<String> {
-        match v {
-            Value::Nil => Ok(String::new()),
-            Value::String(s) => Ok(s.to_str()?.to_string()),
-            Value::Integer(i) => Ok(i.to_string()),
-            Value::Number(n) => Ok(n.to_string()),
-            other => Err(mlua::Error::runtime(format!(
-                "'{what}' must be a string, got {}",
-                other.type_name()
-            ))),
-        }
-    };
-    spec.title = text(t.get("title")?, "title")?;
-    spec.value = text(t.get("value")?, "value")?;
+    spec.title = text_field(t, "title")?.unwrap_or_default();
+    spec.value = text_field(t, "value")?.unwrap_or_default();
     spec.indicator = match t.get::<Value>("indicator")? {
         Value::Nil => 0,
         Value::Integer(i) => i.clamp(0, 100) as u8,
@@ -1102,35 +1052,32 @@ fn parse_dial_spec(v: &Value) -> mlua::Result<DialSpec> {
     Ok(spec)
 }
 
-fn percent_arg(what: &str, v: i64) -> mlua::Result<u8> {
-    u8::try_from(v)
-        .ok()
-        .filter(|p| *p <= 100)
-        .ok_or_else(|| mlua::Error::runtime(format!("{what}: {v} is not a percentage (0-100)")))
+fn percent_arg(what: &str, v: &Value) -> mlua::Result<u8> {
+    match v {
+        Value::Integer(i) if (0..=100).contains(i) => Ok(*i as u8),
+        _ => Err(mlua::Error::runtime(format!(
+            "{what} must be an integer 0-100"
+        ))),
+    }
 }
 
 /// Parses a device's `idle` table.
-fn idle_arg(what: &str, t: &Table) -> mlua::Result<IdleConfig> {
-    let mut idle = IdleConfig {
-        dim_brightness: DEFAULT_DIM_BRIGHTNESS,
-        ..Default::default()
+fn idle_arg(what: &str, v: &Value) -> mlua::Result<IdleConfig> {
+    let Value::Table(t) = v else {
+        return Err(mlua::Error::runtime(format!(
+            "{what}: 'idle' must be a table like {{ dim_after = 120, off_after = 600 }}"
+        )));
     };
+    let mut idle = IdleConfig::default();
     for pair in t.pairs::<String, Value>() {
         let (k, v) = pair?;
         match k.as_str() {
             "dim_after" => idle.dim_after = Some(seconds_arg(what, &k, &v)?),
             "off_after" => idle.off_after = Some(seconds_arg(what, &k, &v)?),
             "home_after" => idle.home_after = Some(seconds_arg(what, &k, &v)?),
-            "dim_brightness" => match v {
-                Value::Integer(i) => {
-                    idle.dim_brightness = percent_arg(&format!("{what}: 'dim_brightness'"), i)?
-                }
-                _ => {
-                    return Err(mlua::Error::runtime(format!(
-                        "{what}: 'dim_brightness' must be an integer 0-100"
-                    )))
-                }
-            },
+            "dim_brightness" => {
+                idle.dim_brightness = percent_arg(&format!("{what}: 'dim_brightness'"), &v)?
+            }
             _ => {
                 return Err(mlua::Error::runtime(format!(
                     "{what}: unknown field '{k}' (use dim_after, dim_brightness, off_after, home_after)"
@@ -1156,32 +1103,6 @@ fn seconds_arg(what: &str, field: &str, v: &Value) -> mlua::Result<Duration> {
     }
 }
 
-fn check_button_table(t: &Table, what: &str) -> mlua::Result<()> {
-    for field in ["press", "release"] {
-        let v: Value = t.get(field)?;
-        if !matches!(v, Value::Nil | Value::Function(_)) {
-            return Err(mlua::Error::runtime(format!(
-                "{what}: '{field}' must be a function"
-            )));
-        }
-    }
-    if !matches!(t.get::<Value>("feedback")?, Value::Nil | Value::Boolean(_)) {
-        return Err(mlua::Error::runtime(format!(
-            "{what}: 'feedback' must be true or false"
-        )));
-    }
-    let r: Value = t.get("render")?;
-    if !matches!(
-        r,
-        Value::Nil | Value::Function(_) | Value::Table(_) | Value::String(_)
-    ) {
-        return Err(mlua::Error::runtime(format!(
-            "{what}: 'render' must be a function or a table"
-        )));
-    }
-    Ok(())
-}
-
 fn parse_spec(v: &Value) -> mlua::Result<RenderSpec> {
     let mut spec = RenderSpec::default();
     let t = match v {
@@ -1198,18 +1119,7 @@ fn parse_spec(v: &Value) -> mlua::Result<RenderSpec> {
             )))
         }
     };
-    spec.text = match t.get::<Value>("text")? {
-        Value::Nil => None,
-        Value::String(s) => Some(s.to_str()?.to_string()),
-        Value::Integer(i) => Some(i.to_string()),
-        Value::Number(n) => Some(n.to_string()),
-        other => {
-            return Err(mlua::Error::runtime(format!(
-                "'text' must be a string, got {}",
-                other.type_name()
-            )))
-        }
-    };
+    spec.text = text_field(t, "text")?;
     for (field, slot) in [("bg", &mut spec.bg), ("fg", &mut spec.fg)] {
         if let Some(s) = t.get::<Option<String>>(field)? {
             *slot = Color::parse(&s).ok_or_else(|| {
@@ -1499,24 +1409,6 @@ mod tests {
     }
 
     #[test]
-    fn removed_functions_are_errors() {
-        for f in ["default_page", "idle", "brightness"] {
-            for args in ["()", "('x')", "{ dim_after = 5 }", "(40)"] {
-                let src = format!(
-                    r#"sdc.page("p", {{}}) sdc.device("d", {{ pages = {{ "p" }} }}) sdc.{f}{args}"#
-                );
-                let e = LuaRuntime::load_raw(&src, Host::new(None)).err().unwrap();
-                assert!(
-                    format!("{e:#}").contains(&format!(
-                        "sdc.{f} was removed; set it on the sdc.device instead"
-                    )),
-                    "{src}: {e:#}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn devices_parse_and_resolve() {
         let rt = LuaRuntime::load_str(
             r#"
@@ -1575,7 +1467,7 @@ mod tests {
             ),
             (
                 r#"sdc.device("a", { pages = { "p" }, brightness = 101 })"#,
-                "not a percentage",
+                "must be an integer 0-100",
             ),
             (
                 r#"sdc.device("a", { pages = { "p" }, idle = { dim_after = 0 } })"#,
@@ -1718,7 +1610,6 @@ mod tests {
             r#"sdc.export("has space", sdc.button{})"#,
             r#"sdc.export("a/b", sdc.button{})"#,
             r#"sdc.export("a", {})"#,
-            r#"sdc.dial{}"#,
             r#"sdc.dial{ render = function() end, rotate = 1 }"#,
             r#"sdc.page("p", { sdc.dial{ render = function() end } })"#,
         ] {

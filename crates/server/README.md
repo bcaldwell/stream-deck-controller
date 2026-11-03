@@ -78,88 +78,22 @@ browser cannot take over a physical deck's identity.
 
 ## Lua API
 
-```lua
-local sdc = require("sdc")
+The config API (`sdc.page`, `sdc.button`, `sdc.span`, `sdc.device`, `sdc.default_device`, `sdc.feedback`, the
+render descriptor, `ctx`, `ha.state`/`ha.call`, idle and page memory, icons and images) is described in
+[docs/configuration.md](../../docs/configuration.md). Implementation notes:
 
-sdc.page("home", {                -- list index = key index, row-major, key 1 (Lua) = top-left
-  sdc.button {
-    render = function(ctx)        -- or a static table / string
-      local l = ha.state("light.office")      -- {entity_id, state, attributes} or nil
-      return { text = "Office", bg = (l and l.state == "on") and "#f5b400" or "#222222",
-               fg = "#ffffff", icon = "icons/bulb.png", font_size = 18 }
-    end,
-    press   = function(ctx) ha.call("light", "toggle", { entity_id = "light.office" }) end,
-    release = function(ctx) end,              -- optional
-  },
-  false,                          -- empty key (nil/false)
-  sdc.button { render = { text = "Media" }, press = function(ctx) ctx.goto_page("media") end },
-})
-sdc.device("deck", { pages = { "home" } })   -- required: at least one; brightness and idle are set here (see Devices)
-sdc.key_gap(18)                   -- optional; gap between keys for spans (px at 72 px keys, default 0)
-sdc.feedback(true)                -- optional; flash a key briefly after its press ran OK (default true)
-```
-
-- Render descriptor: `text` (`\n` allowed; wraps and auto-shrinks), `bg`/`fg` (`#rgb`, `#rrggbb`),
-  `icon` and `image` (see [Icons and images](#icons-and-images)), `tint` (`#rrggbb`, recolours the icon), `font_size` (px at a 72 px key, scaled with the key's size; auto-fit when absent),
-  `chevron = true | "forward" | "back"` (a faint "›" in the bottom-right corner for a key that opens another page, or "‹" in the top-left for one that goes back; on an icon-only key the icon shrinks slightly and moves away from it).
-- Press feedback: after a `press` handler finishes without a Lua error, the key shows a white ring for 400 ms (physical, browser and
-  Elgato plugin keys). Not shown for presses that only wake the display, that call `ctx.goto_page`, for buttons without `press`, for
-  spans, or when turned off globally with `sdc.feedback(false)` or per button with `feedback = false` in `sdc.button{}`.
-- `ctx`: `client_id`, `key` (0-based), `page`, `rows`, `cols`, `goto_page(page)` (a page handle or name); for spans also
-  `span_cols`, `span_rows` and, in `press`/`release`, `span_index` (see [Spans](#spans)).
-- `ha` (also `sdc.ha`): `ha.state(entity_id)` and fire-and-forget `ha.call(domain, service, data)`.
-- Dependency tracking is automatic: every entity passed to `ha.state` during a render is recorded
-  for that (client, key). A `state_changed` re-renders only those keys, and a frame is sent only if
-  the encoded image actually changed.
-- A Lua error in `render`/`press` is logged and shows a red `ERR` tile; the server keeps running.
-- Other `.lua` files next to the config can be loaded with `require`.
-- Idle (the `idle` table of an `sdc.device`): without it a deck never idles. Otherwise, after `dim_after` seconds without a key press the
-  server sends brightness `dim_brightness` (default 10), and after `off_after` seconds brightness 0
-  (backlight off; key images are left alone). Both are optional. The next key press restores the active
-  brightness (the device's `brightness`, default 60, sent on connect and on wake) and is consumed: it only wakes the deck, its press and release
-  handlers do not run. Any press while awake restarts the timer. Clients are checked once a second; a config
-  reload re-reads the settings without waking or dimming anyone (a changed setting takes effect on the next check).
-- Pages: the server remembers each client's page by `client_id` (in memory), so a client that reconnects (server
-  deploy, client self-update) returns to the page it was on, unless that page no longer exists. Waking an idle
-  deck also keeps its page. `home_after` (optional) switches a client to its device's home page after that many seconds
-  without a key press, rendering it even while the display is off, so waking shows home; a disconnected client's
-  remembered page expires after the same time. Without `home_after` pages are remembered until the server restarts.
+- Dependency tracking: every entity passed to `ha.state` during a render is recorded for that (client, key). A
+  `state_changed` re-renders only those keys, and a frame is sent only if the encoded image actually changed.
+- Idle: clients are checked once a second; a config reload re-reads the settings without waking or dimming anyone
+  (a changed setting takes effect on the next check). A disconnected client's remembered page expires after
+  `home_after`; without it pages are remembered until the server restarts.
 - Rendering: Lua `render` functions run one after the other, then the keys of a page (connect, page switch,
   reload) are rasterized and JPEG-encoded in parallel. Pictures are premultiplied and shrunk (shorter side
   <= 256 px) when decoded, and scaled once per key size and cached until the next config reload.
   `RUST_LOG=sdc_server=debug` logs how long each render took.
-
-## Devices
-
-Pages are global; a *device* picks which of them a deck shows, where it starts and how it idles.
-
-```lua
-local home = sdc.page("home", { ... })   -- sdc.page / sdc.device return handles; names work too
-local living = sdc.device("living-room", {
-  pages = { home, "lights", "music" },  -- page handles or names (must exist); order irrelevant
-  home = home,                          -- start/default page, must be in pages (default: the first of pages)
-  brightness = 60,                      -- optional, 0-100 (default 60)
-  idle = { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 }, -- optional; absent: never idles
-})
-sdc.default_device { mk2 = living, plus = "office-plus", ["*"] = living }   -- device handles or names
-```
-
-- Device types for `sdc.default_device`: `original` (Original, OriginalV2), `mk2` (Mk2 and its scissor/module
-  variants), `mini`, `xl`, `plus`, `plus-xl`, `neo`, `pedal`, derived from the model name the client sends, and
-  `browser` for `/deck` clients. `"*"` is the fallback.
-- A connecting client gets, in order: the device it asked for (`sdc-client --device <name>` /
-  `SDC_DEVICE`, `Hello.device_name`; an unknown name is logged as a warning and skipped), the
-  `sdc.default_device` entry for its type, the `"*"` entry, the first `sdc.device` defined.
-- A config must define at least one `sdc.device` (otherwise it fails to load). `sdc.default_page`, `sdc.idle` and
-  `sdc.brightness` were removed (calling them is an error); a device's `idle` and `brightness` replace them, and a
-  device without them never idles and uses brightness 60. `sdc.key_gap` and `sdc.feedback` stay global.
-- `ctx.goto_page` to a page outside the client's device is logged and ignored. The device's `home` is the start page, the
-  target of `home_after` and the fallback when a remembered page is not on the device (also after a config
-  reload). A reconnecting client that lands on a different device than before starts at that device's home.
-- Config reload re-resolves every connected client's device. Mirror viewers use the mirrored deck's device. The
-  Elgato plugin (`sdc.export`) is not affected.
-- Config errors fail the load (the previous config stays active): unknown page in `pages`, `home` not in
-  `pages`, duplicate device names, `sdc.default_device` naming an unknown device or type.
+- Images: downloaded images are cached decoded in memory (the 128 most recently rendered, failed downloads
+  included, so changing sources such as artwork do not pile up). S3 uses path-style addressing and presigned GET
+  requests. `sdc-server render` waits for downloads before writing the PNGs.
 
 ## Exports and dials (Elgato plugin)
 
@@ -168,32 +102,15 @@ sdc.default_device { mk2 = living, plus = "office-plus", ["*"] = living }   -- d
 things are visible to plugins. `id` is 1-64 characters of `A-Z a-z 0-9 _ - .` and must be unique; an invalid or
 duplicate id fails the config load (the previous config stays active). An optional `label = "..."` field on the
 button or dial is shown in the plugin's dropdown.
-```lua
-sdc.export("living_light", toggle("light.living_room", "Living", "#a87308"))
-
-sdc.export("living_dimmer", sdc.dial {
-  label = "Living room",
-  render = function(ctx)                       -- required; same dependency tracking as a button
-    local l = ha.state("light.living_room")
-    local pct = l and l.attributes.brightness and math.floor(l.attributes.brightness / 2.55 + 0.5) or 0
-    return { title = "Living", value = (l and l.state == "on") and (pct .. "%") or "off",
-             indicator = pct, icon = "icons/bulb.png", bg = "#000000" }
-  end,
-  rotate  = function(ctx, ticks)               -- once per plugin message (ticks batched over ~100 ms), may be negative
-    ha.call("light", "turn_on", { entity_id = "light.living_room", brightness_step_pct = ticks * 5 })
-  end,
-  press   = function(ctx) ha.call("light", "toggle", { entity_id = "light.living_room" }) end,
-  release = function(ctx) end,                 -- optional
-  touch   = function(ctx) end,                 -- optional: tap on the touch strip
-})
-```
+See [Exports and dials](../../docs/configuration.md#exports-and-dials-elgato-plugin) for examples.
 - `sdc.light_dial { entity, label?, icon?, modes?, step? }` and `sdc.volume_dial { entity, label?, icon?, step? }`
   are built-in dials (`crates/server/src/lua/dials.lua`). While being turned they step from their own value, not
   HA's lagging state, send absolute values and show their value at once; `DIAL_SETTLE` (1.5 s) after the last turn
   the engine redraws the slot and HA's state shows again. A light dial's press cycles brightness, warmth and hue
   (those the light's `supported_color_modes` allow) and a tap toggles; a volume dial's press mutes. `sdc.now()`
   gives milliseconds on a monotonic clock.
-- `sdc.dial { render, rotate, press, release, touch }`: all handlers optional except `render`. `render` returns
+- `sdc.dial { render, rotate, press, release, touch, label }`: all handlers optional except `render`. `rotate(ctx, ticks)`
+  runs once per plugin message (ticks batched over ~100 ms, may be negative); `touch` is a tap on the touch strip. `render` returns
   `title`, `value` (strings or numbers), `indicator` (0-100, clamped), `icon` (same sources as button icons) and
   `bg` (`#rrggbb`, behind the icon; default black). A Lua error shows `ERR` as the title and is logged. A dial
   cannot be placed in a page (the config fails to load with a message saying so); it is only for export.
@@ -222,76 +139,23 @@ Images and feedback are only sent when they differ from what that slot last got.
 kind, or for an unknown slot, is ignored. A press handler that raises an error turns that key's image into the
 red ERR tile until its next render. A connection may hold 256 slots; `size_px` must be 1-1024.
 
-## Icons and images
-
-- `icon`: a picture fitted inside the key (with padding, aspect ratio kept) over `bg`; with `text`, the
-  picture takes the top ~58% of the key and the text sits in a band along the bottom edge (a label that
-  wraps onto two lines gets a taller band, so the icon shrinks a little). Transparent PNGs show `bg` through. `tint = "#rrggbb"` recolours the icon's visible pixels to that colour,
-  keeping their alpha (an icon without transparency uses its luminance as alpha); it never affects `image`.
-- `image`: a full-bleed picture, scaled to cover the whole key (center-cropped). `text` is drawn on top
-  along the bottom, over a subtle dark gradient and shadow so it stays legible. `icon` can still be
-  combined with it.
-- Both take the same string, resolved in this order: `http://` / `https://` URL (downloaded); a path starting
-  with `/api/` (fetched from Home Assistant, see below); else a file that exists relative to the config directory; else, when the `SDC_ASSETS_S3_*` variables are set, an
-  object key in the assets bucket (path-style addressing, presigned GET requests); else an error.
-  ```lua
-  { text = "Movies", image = "tv/popcorn.png" }                         -- bucket object
-  { text = "Lamp", icon = "https://example.com/bulb.png", bg = "#FFA000" }
-  ```
-- Home Assistant paths: a source starting with `/api/` is fetched from `HA_URL` + the path with
-  `Authorization: Bearer <HA_TOKEN>`; without `HA_URL`/`HA_TOKEN` it is an error source. This is how media
-  artwork works (`attributes.entity_picture` is such a path and changes with every track):
-  ```lua
-  sdc.button { render = function()
-    local p = ha.state("media_player.living_room_2")
-    local art = p and p.state == "playing" and p.attributes.entity_picture
-    return art and { image = art } or { icon = "tv/play_pause.png", bg = "#000000" }
-  end }
-  ```
-  Artwork that cannot be fetched (404, player stopped) is logged at debug level and rendered as if no
-  picture was given, not as an `ERR` tile; `image = nil` is likewise just no picture.
-- Rendering never waits for the network. Downloaded images are cached decoded in memory (the 128 most recently
-  rendered, failed downloads included, so changing sources such as artwork do not pile up); a key whose image is not there yet renders without it, and is re-rendered as soon as the
-  download completes. A failed download is logged once and shown as a red `ERR` tile in the picture's area
-  only (icon area, or the top half of the key for `image`); it is retried after 60 s, or on a config reload.
-  Static `icon`/`image` strings in the config are prefetched on every (re)load. `sdc-server render` waits
-  for downloads before writing the PNGs.
-
 ## Spans
 
-`sdc.span { cols, rows, render, press, release, gap }` is a button that covers a rectangle of keys and shows
-one picture or text across all of them, e.g. album art over 2x2 keys. The page list is row-major key slots: a
-span in slot k occupies k..k+cols-1 on that row and the same columns on the following rows, and the other
-slots it covers must be `false`/`nil`.
-```lua
-sdc.page("music", {
-  sdc.button { render = { text = "Back" } },       -- key 0
-  sdc.span { cols = 2, rows = 2,                   -- keys 1, 2, 6, 7
-    render = function(ctx)
-      local p = ha.state("media_player.living_room_2")
-      local art = p and p.attributes.entity_picture
-      return art and { image = art } or { text = "Nothing playing" }
-    end,
-    press = function(ctx) print(ctx.key, ctx.span_index) end },   -- pressed key; 0..n-1 row-major
-  false, false, false,                             -- keys 3, 4, 5
-  false, false, false,                             -- keys 8, 9, 10 (key 6, 7 are the span's second row)
-})
-```
-- The grid size is per client, so spans are placed when a client renders: a span that runs off the client's
-  rows/cols, or covers a slot holding a button or another span, is logged and shows the red `ERR` tile on its
-  keys (as does a Lua error in its `render`). Pressing an ERR span does nothing.
+A span (`sdc.span { cols, rows, render, press, release, gap }`, see
+[Spans](../../docs/configuration.md#spans)) is placed when a client renders, because the grid size is per client:
+a span that runs off the client's rows/cols, or covers a slot holding a button or another span, is logged and
+shows the red `ERR` tile on its keys (as does a Lua error in its `render`). Pressing an ERR span does nothing.
+
 - `render` returns the usual descriptor, laid out once on a canvas of `cols*key + (cols-1)*gap` by
   `rows*key + (rows-1)*gap` px, which then is cut into one tile per key (tile (c, r) starts at
-  `(c*(key+gap), r*(key+gap))`), so the picture continues across the physical space between keys. `image`
-  covers the whole canvas (center-cropped to its aspect); `icon`/`text` are placed on the whole canvas, with
-  padding and text size following its shorter side.
+  `(c*(key+gap), r*(key+gap))`). `image` covers the whole canvas (center-cropped to its aspect); `icon`/`text`
+  are placed on the whole canvas, with padding and text size following its shorter side.
 - `gap` (per span) or `sdc.key_gap(px)` (global) is in px at 72 px keys and scales with the client's key size;
-  the default is 0 (plain tiles). About 18 matches the bezel of a Stream Deck MK.2, so lines continue
-  straight across keys, at the cost of hiding the strip of the picture behind the bezel.
-- Dependencies: entities read by a span's `render` and its image downloads re-render all of its keys. Each tile
-  is still only sent when its JPEG changed. Scaled pictures are cached per canvas size.
+  the default is 0 (plain tiles).
+- Entities read by a span's `render` and its image downloads re-render all of its keys. Each tile is still only
+  sent when its JPEG changed. Scaled pictures are cached per canvas size.
 - `ctx` in `render` has `key` = the span's top-left key; in `press`/`release`, `key` is the pressed key and
-  `span_index` its position in the span. Idle wake, `home_after` and page memory work as for buttons.
+  `span_index` its position in the span.
 
 ## Layout
 
