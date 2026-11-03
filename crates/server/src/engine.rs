@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{self, UnboundedSender, WeakUnboundedSender};
 
 use crate::assets::{Assets, Fetcher, S3Config};
 use crate::ha::{HaCommand, HaConfig, HaEvent};
-use crate::lua_api::{Cell, DeviceDef, Host, LuaRuntime};
+use crate::lua_api::{Cell, CtxAt, CtxInfo, CtxSpan, DeviceDef, Host, LuaRuntime};
 use crate::render::Renderer;
 
 mod plugin;
@@ -145,7 +145,7 @@ struct Client {
     /// What each key shows on `page`.
     cells: Vec<Cell>,
     /// One render target per key.
-    keys: Vec<Target>,
+    keys: Vec<Target<Vec<u8>>>,
     /// Last key press (or connect): drives dim/off.
     last_activity: Instant,
     /// Last key press, carried across reconnects: drives `home_after`.
@@ -166,6 +166,20 @@ impl Client {
         self.layout(rt);
         for key in &mut self.keys {
             key.flash_until = None;
+        }
+    }
+
+    /// The `ctx` Lua gets for `key` (`span`: when it is part of a multi-key button).
+    fn ctx(&self, key: u8, span: Option<CtxSpan>) -> CtxInfo {
+        CtxInfo {
+            client_id: self.client_id.clone(),
+            at: CtxAt::Key {
+                key,
+                page: self.page.clone(),
+                rows: self.device.rows,
+                cols: self.device.cols,
+                span,
+            },
         }
     }
 
@@ -374,7 +388,7 @@ impl Engine {
         let mut client = Client {
             client_id,
             web,
-            keys: (0..device.key_count()).map(|_| Target::default()).collect(),
+            keys: (0..device.key_count()).map(|_| Target::new()).collect(),
             cells: Vec::new(),
             device,
             want_device,
@@ -1426,7 +1440,7 @@ mod tests {
         assert!(
             matches!(&outs(&mut rx)[..], [PluginOut::DialFeedback { title, .. }] if title == "Warm")
         );
-        r.e.turn(&TargetId::Slot(7, "k".into()), DialInput::Press);
+        r.e.turn(7, "k", DialInput::Press);
         assert!(outs(&mut rx).is_empty());
 
         // unsubscribing and disconnecting forget the dependencies; a late redraw is ignored

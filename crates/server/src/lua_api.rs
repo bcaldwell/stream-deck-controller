@@ -224,16 +224,28 @@ struct Registry {
 #[derive(Debug, Clone)]
 pub struct CtxInfo {
     pub client_id: String,
-    pub key: u8,
-    pub page: String,
-    pub rows: u8,
+    pub at: CtxAt,
+}
+
+/// Where the call happens: a key of a deck's page, or an Elgato plugin slot.
+#[derive(Debug, Clone)]
+pub enum CtxAt {
+    Key {
+        key: u8,
+        page: String,
+        rows: u8,
+        cols: u8,
+        span: Option<CtxSpan>,
+    },
+    Slot(String),
+}
+
+/// The multi-key button a call is for: its size and (for presses) the pressed key's position.
+#[derive(Debug, Clone, Copy)]
+pub struct CtxSpan {
     pub cols: u8,
-    /// Set when the call is for a span: its size and (for presses) the pressed key's position.
-    pub span: Option<(u8, u8)>,
-    pub span_index: Option<u8>,
-    /// Set when the call is for an Elgato plugin slot: `ctx` then has `slot` (and no `key`,
-    /// `page`, `rows`, `cols`).
-    pub slot: Option<String>,
+    pub rows: u8,
+    pub index: Option<u8>,
 }
 
 /// A button or dial, which draws itself from its `render`.
@@ -585,20 +597,27 @@ impl LuaRuntime {
     fn make_ctx(&self, info: &CtxInfo) -> mlua::Result<Table> {
         let t = self.lua.create_table()?;
         t.set("client_id", info.client_id.as_str())?;
-        if let Some(slot) = &info.slot {
-            t.set("slot", slot.as_str())?;
-        } else {
-            t.set("key", info.key)?;
-            t.set("page", info.page.as_str())?;
-            t.set("rows", info.rows)?;
-            t.set("cols", info.cols)?;
-        }
-        if let Some((cols, rows)) = info.span {
-            t.set("span_cols", cols)?;
-            t.set("span_rows", rows)?;
-        }
-        if let Some(i) = info.span_index {
-            t.set("span_index", i)?;
+        match &info.at {
+            CtxAt::Slot(slot) => t.set("slot", slot.as_str())?,
+            CtxAt::Key {
+                key,
+                page,
+                rows,
+                cols,
+                span,
+            } => {
+                t.set("key", *key)?;
+                t.set("page", page.as_str())?;
+                t.set("rows", *rows)?;
+                t.set("cols", *cols)?;
+                if let Some(span) = span {
+                    t.set("span_cols", span.cols)?;
+                    t.set("span_rows", span.rows)?;
+                    if let Some(i) = span.index {
+                        t.set("span_index", i)?;
+                    }
+                }
+            }
         }
         let host = self.host.clone();
         t.set(
@@ -1109,20 +1128,20 @@ mod tests {
     fn info(page: &str, key: u8) -> CtxInfo {
         CtxInfo {
             client_id: "c".into(),
-            key,
-            page: page.into(),
-            rows: 3,
-            cols: 5,
-            span: None,
-            span_index: None,
-            slot: None,
+            at: CtxAt::Key {
+                key,
+                page: page.into(),
+                rows: 3,
+                cols: 5,
+                span: None,
+            },
         }
     }
 
     fn slot_info(slot: &str) -> CtxInfo {
         CtxInfo {
-            slot: Some(slot.into()),
-            ..info("", 0)
+            client_id: "c".into(),
+            at: CtxAt::Slot(slot.into()),
         }
     }
 

@@ -3,19 +3,18 @@
 //! Both are "something that renders a button or dial through Lua, depends on entities and
 //! images, shows only what changed, can flash after a press, can be redrawn later and answers
 //! presses (with an ERR tile when the handler fails)". This module is the one implementation of
-//! that; the engine's clients and plugins only say which targets exist and where their output goes.
+//! that bookkeeping. What differs is the drawing: a deck rasterizes the page's cells into JPEGs
+//! for its keys, a slot draws its export into a PNG or dial feedback; each has its own render.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::time::{Duration, Instant};
 
 use sdc_protocol::SlotKind;
 
 use super::{ClientId, Engine, EngineEvent, Frame, Out, PluginOut};
-use crate::lua_api::{
-    ButtonDef, Cell, CtxInfo, DialDef, DialInput, DialSpec, Export, SpanCell, DIAL_SETTLE,
-};
-use crate::render::{encode_all, Color, Encoding, Grid, RenderSpec};
+use crate::lua_api::{ButtonDef, Cell, CtxInfo, CtxSpan, DialDef, DialInput, Export, DIAL_SETTLE};
+use crate::render::{encode_all, Color, Encoding, Grid, RenderSpec, Renderer};
 
 /// How long a target shows the press flash.
 const FLASH: Duration = Duration::from_millis(400);
@@ -38,48 +37,19 @@ impl TargetId {
     }
 }
 
-/// The state every target has.
-#[derive(Default)]
-pub(super) struct Target {
-    /// What was last sent, to suppress identical output.
-    last: Option<Shown>,
+/// The state every target has; `T` is what it last sent (a deck key's JPEG, a slot's message).
+pub(super) struct Target<T> {
+    /// To suppress identical output.
+    last: Option<T>,
     /// While set (and in the future) the target shows the press flash.
     pub(super) flash_until: Option<Instant>,
 }
 
-/// A target's output, ready to send.
-#[derive(Clone, PartialEq)]
-enum Shown {
-    /// An encoded image: a JPEG on a deck, a PNG on a plugin.
-    Tile(Vec<u8>),
-    Dial {
-        title: String,
-        value: String,
-        indicator: u8,
-        icon_png: Option<Vec<u8>>,
-    },
-    /// A slot that cannot show anything (its export is missing or of the wrong kind).
-    Error(String),
-}
-
-impl Shown {
-    fn into_plugin(self, slot: &str) -> PluginOut {
-        let slot = slot.to_string();
-        match self {
-            Shown::Tile(png) => PluginOut::KeyImage { slot, png },
-            Shown::Dial {
-                title,
-                value,
-                indicator,
-                icon_png,
-            } => PluginOut::DialFeedback {
-                slot,
-                title,
-                value,
-                indicator,
-                icon_png,
-            },
-            Shown::Error(message) => PluginOut::SlotError { slot, message },
+impl<T> Target<T> {
+    pub(super) fn new() -> Self {
+        Target {
+            last: None,
+            flash_until: None,
         }
     }
 }
@@ -154,336 +124,287 @@ impl Deps {
     }
 }
 
-/// What a target is set to show.
-enum Content {
-    Empty,
-    Button(ButtonDef),
-    /// A key covered by a multi-key button (which may not fit its page: `error`).
-    Span(SpanCell),
+/// What a plugin slot shows: its export, when that exists and is of the slot's kind.
+enum SlotContent {
+    Key(ButtonDef),
     Dial(DialDef),
-    /// A slot whose export is missing or of the wrong kind.
-    Invalid(String),
-}
-
-/// What Lua asked a target to draw.
-enum Art {
-    Tile(RenderSpec),
-    /// One picture over all keys of a span.
-    Span(RenderSpec, Grid),
-    Dial {
-        spec: DialSpec,
-        icon: Option<RenderSpec>,
-    },
-    /// Cannot be shown: ERR on a deck's keys, a `SlotError` for a plugin.
-    Error(String),
-}
-
-impl Art {
-    /// The spec whose pictures the output depends on.
-    fn spec(&self) -> Option<&RenderSpec> {
-        match self {
-            Art::Tile(s) | Art::Span(s, _) => Some(s),
-            Art::Dial { icon, .. } => icon.as_ref(),
-            Art::Error(_) => None,
-        }
-    }
-}
-
-/// One Lua render: the targets it produces output for (a span has several), what they read, and
-/// what to draw.
-struct Drawn {
-    ids: Vec<TargetId>,
-    deps: HashSet<String>,
-    art: Art,
 }
 
 fn fail(info: &CtxInfo, what: &str, e: impl Display) {
-    tracing::error!(client = %info.client_id, page = %info.page, key = info.key, slot = ?info.slot, "{what}: {e}");
+    tracing::error!(client = %info.client_id, at = ?info.at, "{what}: {e}");
+}
+
+/// The dependency ids of the remote images `spec` shows (see [`Deps`]).
+fn image_deps(renderer: &mut Renderer, spec: &RenderSpec) -> Vec<String> {
+    renderer
+        .remote_keys(spec)
+        .into_iter()
+        .map(|k| format!("img:{k}"))
+        .collect()
 }
 
 impl Engine {
-    fn target(&mut self, id: &TargetId) -> Option<&mut Target> {
+    /// The flash state of `id`; `None` if the target is gone.
+    fn flash_until(&mut self, id: &TargetId) -> Option<&mut Option<Instant>> {
         match id {
-            TargetId::Key(c, key) => self.clients.get_mut(c).map(|c| &mut c.keys[*key as usize]),
+            TargetId::Key(c, key) => self
+                .clients
+                .get_mut(c)
+                .map(|c| &mut c.keys[*key as usize].flash_until),
             TargetId::Slot(c, slot) => self
                 .plugins
                 .get_mut(c)
                 .and_then(|p| p.slots.get_mut(slot))
-                .map(|s| &mut s.target),
+                .map(|s| &mut s.target.flash_until),
         }
     }
 
-    fn content(&self, id: &TargetId) -> Content {
-        match id {
-            TargetId::Key(c, key) => match &self.clients[c].cells[*key as usize] {
-                Cell::Empty => Content::Empty,
-                Cell::Button(b) => Content::Button(b.clone()),
-                Cell::Span(sp) => Content::Span(sp.clone()),
-            },
-            TargetId::Slot(c, slot) => {
-                let s = &self.plugins[c].slots[slot];
-                match (self.rt.export(&s.export), s.kind) {
-                    (Some(Export::Button(b)), SlotKind::Key) => Content::Button(b),
-                    (Some(Export::Dial(d)), SlotKind::Dial) => Content::Dial(d),
-                    (found, _) => Content::Invalid(match found {
-                        None => format!("no export '{}'", s.export),
-                        Some(Export::Button(_)) => {
-                            format!("export '{}' is a button, not a dial", s.export)
-                        }
-                        Some(Export::Dial(_)) => {
-                            format!("export '{}' is a dial, not a key", s.export)
-                        }
-                    }),
-                }
+    fn slot_content(&self, conn: ClientId, slot: &str) -> Result<SlotContent, String> {
+        let s = &self.plugins[&conn].slots[slot];
+        match (self.rt.export(&s.export), s.kind) {
+            (Some(Export::Button(b)), SlotKind::Key) => Ok(SlotContent::Key(b)),
+            (Some(Export::Dial(d)), SlotKind::Dial) => Ok(SlotContent::Dial(d)),
+            (None, _) => Err(format!("no export '{}'", s.export)),
+            (Some(Export::Button(_)), _) => {
+                Err(format!("export '{}' is a button, not a dial", s.export))
+            }
+            (Some(Export::Dial(_)), _) => {
+                Err(format!("export '{}' is a dial, not a key", s.export))
             }
         }
     }
 
-    /// The `ctx` Lua gets for `id`.
-    fn ctx(&self, id: &TargetId, content: &Content) -> CtxInfo {
-        let mut info = match id {
-            TargetId::Key(c, key) => {
-                let c = &self.clients[c];
-                CtxInfo {
-                    client_id: c.client_id.clone(),
-                    key: *key,
-                    page: c.page.clone(),
-                    rows: c.device.rows,
-                    cols: c.device.cols,
-                    span: None,
-                    span_index: None,
-                    slot: None,
+    /// Re-renders `ids`; whatever changed is sent.
+    pub(super) fn render(&mut self, ids: Vec<TargetId>) {
+        let mut decks: BTreeMap<ClientId, BTreeSet<u8>> = BTreeMap::new();
+        let mut slots = BTreeSet::new();
+        for id in ids {
+            match id {
+                TargetId::Key(c, key) => {
+                    decks.entry(c).or_default().insert(key);
+                }
+                TargetId::Slot(c, slot) => {
+                    slots.insert((c, slot));
                 }
             }
-            TargetId::Slot(c, slot) => CtxInfo {
-                client_id: self.plugins[c].client_id.clone(),
-                key: 0,
-                page: String::new(),
-                rows: 0,
-                cols: 0,
-                span: None,
-                span_index: None,
-                slot: Some(slot.clone()),
-            },
-        };
-        if let Content::Span(sp) = content {
-            info.span = Some((sp.size.cols, sp.size.rows));
-            info.span_index = Some(sp.index);
         }
-        info
-    }
-
-    /// Re-renders `ids`: Lua runs one target after the other on this thread, then the pictures
-    /// are rasterized (a deck's keys in parallel) and whatever changed is sent.
-    pub(super) fn render(&mut self, mut ids: Vec<TargetId>) {
-        ids.sort_unstable();
-        ids.dedup();
-        for conn in ids.chunk_by(|a, b| a.conn() == b.conn()) {
-            self.render_conn(conn);
+        for (conn, keys) in decks {
+            self.render_deck(conn, keys);
+        }
+        for (conn, slot) in slots {
+            self.render_slot(conn, &slot);
         }
     }
 
-    fn render_conn(&mut self, ids: &[TargetId]) {
+    /// Renders keys of a deck: Lua runs one key after the other on this thread (a span is drawn
+    /// once for all its keys), then the pictures are rasterized in parallel.
+    fn render_deck(&mut self, conn: ClientId, keys: BTreeSet<u8>) {
         let started = Instant::now();
+        let client = &self.clients[&conn];
+        let size = client.device.key_size_px;
         let mut spans = HashSet::new();
-        let drawn: Vec<Drawn> = ids
-            .iter()
-            .filter_map(|id| self.draw(id, &mut spans))
-            .collect();
-        let mut shown = self.rasterize(ids[0].conn(), &drawn).into_iter();
-        for d in drawn {
-            for id in d.ids {
-                self.deps.set(id.clone(), d.deps.clone());
-                self.show(&id, shown.next().expect("one output per target"));
+        // The key of each picture in `jobs`, in order.
+        let mut order = Vec::new();
+        let mut jobs = Vec::new();
+        for &key in &keys {
+            // The keys drawn, what they read, and the picture (`None`: the ERR tile on each key).
+            let (members, mut deps, art) = match &client.cells[key as usize] {
+                Cell::Empty => (
+                    vec![key],
+                    HashSet::new(),
+                    Some((
+                        RenderSpec {
+                            bg: Color::BLACK,
+                            ..RenderSpec::default()
+                        },
+                        Grid::one(size),
+                    )),
+                ),
+                Cell::Button(btn) => {
+                    let info = client.ctx(key, None);
+                    let out = self.rt.render(btn, &info);
+                    if let Some(e) = &out.error {
+                        fail(&info, "render", e);
+                    }
+                    let mut spec = out.spec;
+                    spec.flash = client.keys[key as usize].flash_until.is_some();
+                    (vec![key], out.deps, Some((spec, Grid::one(size))))
+                }
+                Cell::Span(sp) => {
+                    if !spans.insert(sp.origin) {
+                        continue;
+                    }
+                    let members = client
+                        .cells
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, cell)| matches!(cell, Cell::Span(o) if o.origin == sp.origin))
+                        .map(|(k, _)| k as u8)
+                        .collect();
+                    // The origin renders for the whole span.
+                    let info = client.ctx(
+                        sp.origin,
+                        Some(CtxSpan {
+                            cols: sp.size.cols,
+                            rows: sp.size.rows,
+                            index: None,
+                        }),
+                    );
+                    let grid = Grid {
+                        cols: sp.size.cols as u32,
+                        rows: sp.size.rows as u32,
+                        key: size,
+                    };
+                    if let Some(e) = &sp.error {
+                        fail(&info, "render", e);
+                        (members, HashSet::new(), None)
+                    } else {
+                        let out = self.rt.render(&sp.def, &info);
+                        match out.error {
+                            Some(e) => {
+                                fail(&info, "render", e);
+                                (members, out.deps, None)
+                            }
+                            None => (members, out.deps, Some((out.spec, grid))),
+                        }
+                    }
+                }
+            };
+            match art {
+                Some((spec, grid)) => {
+                    deps.extend(image_deps(&mut self.renderer, &spec));
+                    jobs.push(self.renderer.prepare(&spec, grid));
+                }
+                None => jobs.extend(
+                    members
+                        .iter()
+                        .map(|_| self.renderer.prepare(&RenderSpec::error(), Grid::one(size))),
+                ),
             }
+            for &k in &members {
+                self.deps.set(TargetId::Key(conn, k), deps.clone());
+            }
+            order.extend(members);
+        }
+        let jpegs = encode_all(jobs, Encoding::Jpeg(client.device.native.as_ref()));
+        for (key, jpeg) in order.into_iter().zip(jpegs) {
+            self.send_key(conn, key, jpeg);
         }
         tracing::debug!(
-            conn = ids[0].conn(),
-            targets = ids.len(),
+            conn,
+            keys = keys.len(),
             ms = started.elapsed().as_secs_f64() * 1000.0,
             "rendered"
         );
     }
 
-    /// Runs the Lua render of `id`. A span is drawn once for all its keys (`spans`: the origins
-    /// done so far).
-    fn draw(&mut self, id: &TargetId, spans: &mut HashSet<u8>) -> Option<Drawn> {
-        let content = self.content(id);
-        let mut info = self.ctx(id, &content);
-        let (ids, deps, art) = match content {
-            Content::Empty => (
-                vec![id.clone()],
-                HashSet::new(),
-                Art::Tile(RenderSpec {
-                    bg: Color::BLACK,
-                    ..RenderSpec::default()
-                }),
-            ),
-            Content::Invalid(msg) => {
-                fail(&info, "render", &msg);
-                (vec![id.clone()], HashSet::new(), Art::Error(msg))
-            }
-            Content::Button(btn) => {
-                let out = self.rt.render(&btn, &info);
-                if let Some(e) = &out.error {
+    /// Renders a plugin slot from its export, at the size the plugin asked for.
+    pub(super) fn render_slot(&mut self, conn: ClientId, slot: &str) {
+        let plugin = &self.plugins[&conn];
+        let info = plugin.ctx(slot);
+        let size = plugin.slots[slot].size;
+        let flash = plugin.slots[slot].target.flash_until.is_some();
+        let slot_name = slot.to_string();
+        let mut deps = HashSet::new();
+        let out = match self.slot_content(conn, slot) {
+            Ok(SlotContent::Key(btn)) => {
+                let r = self.rt.render(&btn, &info);
+                if let Some(e) = &r.error {
                     fail(&info, "render", e);
                 }
-                let mut spec = out.spec;
-                spec.flash = self
-                    .target(id)
-                    .expect("rendered target exists")
-                    .flash_until
-                    .is_some();
-                (vec![id.clone()], out.deps, Art::Tile(spec))
-            }
-            Content::Span(sp) => {
-                if !spans.insert(sp.origin) {
-                    return None;
-                }
-                // The origin renders for the whole span.
-                info.key = sp.origin;
-                info.span_index = None;
-                let TargetId::Key(c, _) = id else {
-                    unreachable!("only decks have spans")
-                };
-                let client = &self.clients[c];
-                let ids = client
-                    .cells
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, cell)| matches!(cell, Cell::Span(o) if o.origin == sp.origin))
-                    .map(|(k, _)| TargetId::Key(*c, k as u8))
-                    .collect();
-                let grid = Grid {
-                    cols: sp.size.cols as u32,
-                    rows: sp.size.rows as u32,
-                    key: client.device.key_size_px,
-                };
-                if let Some(e) = &sp.error {
-                    fail(&info, "render", e);
-                    (ids, HashSet::new(), Art::Error(e.clone()))
-                } else {
-                    let out = self.rt.render(&sp.def, &info);
-                    match out.error {
-                        Some(e) => {
-                            fail(&info, "render", &e);
-                            (ids, out.deps, Art::Error(e))
-                        }
-                        None => (ids, out.deps, Art::Span(out.spec, grid)),
-                    }
+                let mut spec = r.spec;
+                spec.flash = flash;
+                deps = r.deps;
+                deps.extend(image_deps(&mut self.renderer, &spec));
+                PluginOut::KeyImage {
+                    slot: slot_name,
+                    png: self.renderer.render(&spec, size, Encoding::Png),
                 }
             }
-            Content::Dial(dial) => {
-                let out = self.rt.render(&dial, &info);
-                if let Some(e) = &out.error {
+            Ok(SlotContent::Dial(dial)) => {
+                let r = self.rt.render(&dial, &info);
+                if let Some(e) = &r.error {
                     fail(&info, "render", e);
                 }
-                let icon = out.spec.icon.as_ref().map(|name| RenderSpec {
+                deps = r.deps;
+                let icon = r.spec.icon.as_ref().map(|name| RenderSpec {
                     icon: Some(name.clone()),
-                    bg: out.spec.bg,
+                    bg: r.spec.bg,
                     ..RenderSpec::default()
                 });
-                (
-                    vec![id.clone()],
-                    out.deps,
-                    Art::Dial {
-                        spec: out.spec,
-                        icon,
-                    },
-                )
+                if let Some(icon) = &icon {
+                    deps.extend(image_deps(&mut self.renderer, icon));
+                }
+                PluginOut::DialFeedback {
+                    slot: slot_name,
+                    title: r.spec.title,
+                    value: r.spec.value,
+                    indicator: r.spec.indicator,
+                    icon_png: icon.map(|s| self.renderer.render(&s, DIAL_ICON_PX, Encoding::Png)),
+                }
+            }
+            Err(message) => {
+                fail(&info, "render", &message);
+                PluginOut::SlotError {
+                    slot: slot_name,
+                    message,
+                }
             }
         };
-        let mut deps = deps;
-        if let Some(spec) = art.spec() {
-            deps.extend(
-                self.renderer
-                    .remote_keys(spec)
-                    .into_iter()
-                    .map(|k| format!("img:{k}")),
-            );
-        }
-        Some(Drawn { ids, deps, art })
+        self.deps.set(TargetId::Slot(conn, slot.to_string()), deps);
+        self.send_slot(conn, slot, out);
     }
 
-    /// Turns what was drawn for the targets of connection `conn` into output, one per target in
-    /// order.
-    fn rasterize(&mut self, conn: ClientId, drawn: &[Drawn]) -> Vec<Shown> {
-        if let Some(c) = self.clients.get(&conn) {
-            let size = c.device.key_size_px;
-            let jobs = drawn
-                .iter()
-                .flat_map(|d| match &d.art {
-                    Art::Tile(spec) => vec![self.renderer.prepare(spec, Grid::one(size))],
-                    Art::Span(spec, grid) => vec![self.renderer.prepare(spec, *grid)],
-                    Art::Error(_) => d
-                        .ids
-                        .iter()
-                        .map(|_| self.renderer.prepare(&RenderSpec::error(), Grid::one(size)))
-                        .collect(),
-                    Art::Dial { .. } => unreachable!("decks have no dials"),
-                })
-                .collect();
-            return encode_all(jobs, Encoding::Jpeg(c.device.native.as_ref()))
-                .into_iter()
-                .map(Shown::Tile)
-                .collect();
-        }
-        drawn
-            .iter()
-            .map(|d| {
-                let TargetId::Slot(_, slot) = &d.ids[0] else {
-                    unreachable!("a connection is a deck or a plugin")
-                };
-                let size = self.plugins[&conn].slots[slot].size;
-                match &d.art {
-                    Art::Tile(spec) => Shown::Tile(self.renderer.render(spec, size, Encoding::Png)),
-                    Art::Dial { spec, icon } => Shown::Dial {
-                        title: spec.title.clone(),
-                        value: spec.value.clone(),
-                        indicator: spec.indicator,
-                        icon_png: icon
-                            .as_ref()
-                            .map(|s| self.renderer.render(s, DIAL_ICON_PX, Encoding::Png)),
-                    },
-                    Art::Error(message) => Shown::Error(message.clone()),
-                    Art::Span(..) => unreachable!("slots have no spans"),
-                }
-            })
-            .collect()
-    }
-
-    /// Sends `shown` unless it is what the target already has.
-    fn show(&mut self, id: &TargetId, shown: Shown) {
-        let target = self.target(id).expect("rendered target exists");
-        if target.last.as_ref() == Some(&shown) {
+    /// Sends a key's picture unless it is what the key already shows.
+    fn send_key(&mut self, conn: ClientId, key: u8, jpeg: Vec<u8>) {
+        let c = self.clients.get_mut(&conn).expect("rendered client exists");
+        let target = &mut c.keys[key as usize];
+        if target.last.as_ref() == Some(&jpeg) {
             return;
         }
-        target.last = Some(shown.clone());
+        target.last = Some(jpeg.clone());
         // A closed receiver just means the connection is on its way out.
-        match id {
-            TargetId::Key(c, key) => {
-                let Shown::Tile(jpeg) = shown else {
-                    unreachable!("decks only show tiles")
-                };
-                let _ = self.clients[c]
-                    .tx
-                    .send(Out::Frame(Frame { key: *key, jpeg }));
-            }
-            TargetId::Slot(c, slot) => {
-                let _ = self.plugins[c].tx.send(shown.into_plugin(slot));
-            }
-        }
+        let _ = c.tx.send(Out::Frame(Frame { key, jpeg }));
     }
 
-    /// Replaces the output of `id` with the red ERR tile (until its next render).
+    /// Sends `out` unless it is what the slot already shows.
+    fn send_slot(&mut self, conn: ClientId, slot: &str, out: PluginOut) {
+        let p = self.plugins.get_mut(&conn).expect("rendered plugin exists");
+        let target = &mut p.slots.get_mut(slot).expect("rendered slot exists").target;
+        if target.last.as_ref() == Some(&out) {
+            return;
+        }
+        target.last = Some(out.clone());
+        let _ = p.tx.send(out);
+    }
+
+    /// Replaces what `id` shows with the red ERR tile (until its next render).
     fn show_error_tile(&mut self, id: &TargetId) {
-        let drawn = [Drawn {
-            ids: vec![id.clone()],
-            deps: HashSet::new(),
-            art: Art::Tile(RenderSpec::error()),
-        }];
-        let shown = self.rasterize(id.conn(), &drawn).remove(0);
-        self.show(id, shown);
+        match id {
+            TargetId::Key(c, key) => {
+                let device = &self.clients[c].device;
+                let job = self
+                    .renderer
+                    .prepare(&RenderSpec::error(), Grid::one(device.key_size_px));
+                let jpeg = encode_all(vec![job], Encoding::Jpeg(device.native.as_ref())).remove(0);
+                self.send_key(*c, *key, jpeg);
+            }
+            TargetId::Slot(c, slot) => {
+                let size = self.plugins[c].slots[slot].size;
+                let png = self
+                    .renderer
+                    .render(&RenderSpec::error(), size, Encoding::Png);
+                let slot_name = slot.clone();
+                self.send_slot(
+                    *c,
+                    slot,
+                    PluginOut::KeyImage {
+                        slot: slot_name,
+                        png,
+                    },
+                );
+            }
+        }
     }
 
     /// Re-renders the targets that read `dep`.
@@ -494,12 +415,26 @@ impl Engine {
 
     /// Runs the press (`down`) or release handler of a key or key slot.
     pub(super) fn press(&mut self, id: &TargetId, down: bool, now: Instant) {
-        let content = self.content(id);
-        let info = self.ctx(id, &content);
-        let (btn, in_span) = match content {
-            Content::Button(b) => (b, false),
-            Content::Span(sp) if sp.error.is_none() => (sp.def, true),
-            _ => return,
+        let (btn, info, in_span) = match id {
+            TargetId::Key(c, key) => {
+                let client = &self.clients[c];
+                match &client.cells[*key as usize] {
+                    Cell::Button(b) => (b.clone(), client.ctx(*key, None), false),
+                    Cell::Span(sp) if sp.error.is_none() => {
+                        let span = CtxSpan {
+                            cols: sp.size.cols,
+                            rows: sp.size.rows,
+                            index: Some(sp.index),
+                        };
+                        (sp.def.clone(), client.ctx(*key, Some(span)), true)
+                    }
+                    _ => return,
+                }
+            }
+            TargetId::Slot(c, slot) => match self.slot_content(*c, slot) {
+                Ok(SlotContent::Key(b)) => (b, self.plugins[c].ctx(slot), false),
+                _ => return,
+            },
         };
         match self.rt.press(&btn, &info, down) {
             Ok(Some(page)) => match id {
@@ -525,20 +460,24 @@ impl Engine {
     }
 
     /// Runs a dial slot's handler for `input`, then redraws it.
-    pub(super) fn turn(&mut self, id: &TargetId, input: DialInput) {
-        let content = self.content(id);
-        let info = self.ctx(id, &content);
-        let Content::Dial(dial) = content else { return };
+    pub(super) fn turn(&mut self, conn: ClientId, slot: &str, input: DialInput) {
+        let Ok(SlotContent::Dial(dial)) = self.slot_content(conn, slot) else {
+            return;
+        };
+        let info = self.plugins[&conn].ctx(slot);
         if let Err(e) = self.rt.dial_input(&dial, &info, input) {
             fail(&info, &format!("{input:?}"), format!("{e:#}"));
         }
         // Handlers may change Lua state that `render` reads (a dial's mode, say); unchanged
         // output is not resent.
-        self.render(vec![id.clone()]);
+        self.render_slot(conn, slot);
         if matches!(input, DialInput::Rotate(_)) {
             // Built-in dials show their own value while being turned; redraw once that is over so
             // the slot shows Home Assistant's state again even if no state change arrives.
-            self.redraw_later(id.clone(), DIAL_SETTLE + Duration::from_millis(50));
+            self.redraw_later(
+                TargetId::Slot(conn, slot.to_string()),
+                DIAL_SETTLE + Duration::from_millis(50),
+            );
         }
     }
 
@@ -547,7 +486,7 @@ impl Engine {
         if !self.rt.feedback() {
             return;
         }
-        self.target(id).expect("pressed target exists").flash_until = Some(now + FLASH);
+        *self.flash_until(id).expect("pressed target exists") = Some(now + FLASH);
         self.render(vec![id.clone()]);
         self.redraw_later(id.clone(), FLASH);
     }
@@ -566,11 +505,11 @@ impl Engine {
     /// A scheduled redraw: ends the target's flash if it is over, then renders it.
     pub(super) fn redraw(&mut self, id: TargetId, now: Instant) {
         // The one place a target may have gone since the event was scheduled.
-        let Some(target) = self.target(&id) else {
+        let Some(flash_until) = self.flash_until(&id) else {
             return;
         };
-        if target.flash_until.is_some_and(|until| until <= now) {
-            target.flash_until = None;
+        if flash_until.is_some_and(|until| until <= now) {
+            *flash_until = None;
         }
         self.render(vec![id]);
     }
