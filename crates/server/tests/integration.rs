@@ -117,7 +117,7 @@ async fn start_server_deck(
     let dir = TempDir::new(tag);
     let cfg = dir.0.join("config.lua");
     std::fs::write(&cfg, CONFIG).unwrap();
-    let engine_tx = engine::spawn(cfg, Some(ha_tx));
+    let engine_tx = engine::spawn(cfg, ha_tx);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
     tokio::spawn(http::serve(
@@ -642,7 +642,7 @@ async fn start_deck_server_with(
     let cfg = dir.0.join("config.lua");
     std::fs::write(&cfg, config).unwrap();
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
-    let engine_tx = engine::spawn(cfg, Some(ha_tx));
+    let engine_tx = engine::spawn(cfg, ha_tx);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
     tokio::spawn(http::serve(

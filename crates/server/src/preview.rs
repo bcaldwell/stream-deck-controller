@@ -26,7 +26,7 @@ pub async fn run(
     states: Option<PathBuf>,
 ) -> Result<()> {
     let (ha_cmd_tx, ha_cmd_rx) = mpsc::unbounded_channel();
-    let mut engine = Engine::new(config, Some(ha_cmd_tx));
+    let mut engine = Engine::new(config, ha_cmd_tx);
     // Image downloads report back here; unlike the server, we wait for them below.
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     engine.enable_fetch(Handle::current(), &ev_tx);

@@ -109,7 +109,7 @@ sdc.page("media", {
 })
 
 -- Pages are global; a device picks which ones a deck shows. Clients get the device named by
--- --device / SDC_DEVICE, else the sdc.default_device entry for their type, else "*".
+-- --device / SDC_DEVICE, else the sdc.default_device entry for their type, else the first device defined.
 sdc.device("office", {
   pages = { "home", "media" },
   home = "home",
@@ -118,4 +118,3 @@ sdc.device("office", {
   -- (on the page it was left on). After an hour without a press the deck goes back to its home page.
   idle = { dim_after = 120, dim_brightness = 10, off_after = 600, home_after = 3600 },
 })
-sdc.default_device { ["*"] = "office" }
