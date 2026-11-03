@@ -12,7 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::target::{Target, TargetId};
 use super::{ClientId, Engine};
-use crate::lua_api::DialInput;
+use crate::lua_api::{CtxAt, CtxInfo, DialInput};
 
 /// What the engine sends to a plugin connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +46,17 @@ pub(super) struct Slot {
     pub(super) kind: SlotKind,
     /// Image size in px.
     pub(super) size: u32,
-    pub(super) target: Target,
+    pub(super) target: Target<PluginOut>,
+}
+
+impl Plugin {
+    /// The `ctx` Lua gets for `slot`.
+    pub(super) fn ctx(&self, slot: &str) -> CtxInfo {
+        CtxInfo {
+            client_id: self.client_id.clone(),
+            at: CtxAt::Slot(slot.to_string()),
+        }
+    }
 }
 
 impl Engine {
@@ -100,10 +110,10 @@ impl Engine {
                             export,
                             kind,
                             size: size_px,
-                            target: Target::default(),
+                            target: Target::new(),
                         },
                     );
-                self.render(vec![slot(name)]);
+                self.render_slot(id, &name);
             }
             M::Unsubscribe { slot: name } => {
                 self.plugins
@@ -115,10 +125,10 @@ impl Engine {
             }
             M::SlotDown { slot: s } => self.press(&slot(s), true, now),
             M::SlotUp { slot: s } => self.press(&slot(s), false, now),
-            M::DialRotate { slot: s, ticks } => self.turn(&slot(s), DialInput::Rotate(ticks)),
-            M::DialDown { slot: s } => self.turn(&slot(s), DialInput::Press),
-            M::DialUp { slot: s } => self.turn(&slot(s), DialInput::Release),
-            M::TouchTap { slot: s } => self.turn(&slot(s), DialInput::Touch),
+            M::DialRotate { slot: s, ticks } => self.turn(id, &s, DialInput::Rotate(ticks)),
+            M::DialDown { slot: s } => self.turn(id, &s, DialInput::Press),
+            M::DialUp { slot: s } => self.turn(id, &s, DialInput::Release),
+            M::TouchTap { slot: s } => self.turn(id, &s, DialInput::Touch),
         }
     }
 
