@@ -47,9 +47,7 @@ pub async fn run(
         info!(server = %cfg.server, "connecting");
         let started = Instant::now();
         let res = serve(&cfg, &device, &events, &mut keys).await;
-        if events.send(LinkEvent::Down).await.is_err() {
-            return;
-        }
+        let _ = events.send(LinkEvent::Down).await;
         match res {
             Ok(why) => warn!("disconnected from server: {why}"),
             Err(e) => warn!("server connection failed: {e:#}"),
@@ -114,22 +112,19 @@ async fn serve(
         client_id: cfg.client_id.clone(),
         device: device.clone(),
         client_target: sdc_protocol::client_target().map(str::to_string),
-        client_sha256: cfg.client_sha256.clone(),
+        client_sha256: Some(cfg.client_sha256.clone()),
         device_name: cfg.device.clone(),
     };
     tx.send(Message::text(serde_json::to_string(&hello)?))
         .await?;
-    let deck_gone = || anyhow!("deck loop ended");
-    events.send(LinkEvent::Up).await.map_err(|_| deck_gone())?;
+    // Send failures below mean the deck loop ended, and this task is aborted with it.
+    let _ = events.send(LinkEvent::Up).await;
 
     let mut ping = interval(PING_EVERY);
     let mut last_rx = Instant::now();
-    // One update attempt per connection, so an unwritable install does not retry in a loop.
-    let mut update_tried = false;
     loop {
         tokio::select! {
-            msg = keys.recv() => {
-                let msg = msg.ok_or_else(deck_gone)?;
+            Some(msg) = keys.recv() => {
                 debug!(?msg, "key event");
                 tx.send(Message::text(serde_json::to_string(&msg)?)).await?;
             }
@@ -139,31 +134,20 @@ async fn serve(
                 last_rx = Instant::now();
                 match m {
                     Message::Text(t) => match serde_json::from_str::<ServerMessage>(&t) {
-                        Ok(ServerMessage::Welcome { protocol_version, .. }) => {
-                            if protocol_version != PROTOCOL_VERSION {
-                                warn!(protocol_version, ours = PROTOCOL_VERSION, "protocol version mismatch");
-                            }
-                        }
+                        Ok(ServerMessage::Welcome { .. }) => {}
                         Ok(ServerMessage::Brightness { percent }) => {
                             info!(percent, "brightness");
-                            events.send(LinkEvent::Brightness(percent.min(100))).await.map_err(|_| deck_gone())?;
+                            let _ = events.send(LinkEvent::Brightness(percent)).await;
                         }
-                        Ok(ServerMessage::Update { path, sha256 }) => {
-                            if !update_tried {
-                                update_tried = true;
-                                update(cfg, path, sha256).await;
-                            }
-                        }
+                        Ok(ServerMessage::Update { path, sha256 }) => update(cfg, path, sha256).await,
                         Ok(ServerMessage::Error { message }) => error!("server error: {message}"),
                         Err(e) => warn!("bad server message {t:?}: {e}"),
                     },
-                    Message::Binary(b) => match ImageFrame::decode(&b) {
-                        Some(f) => events
-                            .send(LinkEvent::Image(f.key, f.image.to_vec()))
-                            .await
-                            .map_err(|_| deck_gone())?,
-                        None => warn!("empty binary frame"),
-                    },
+                    Message::Binary(b) => {
+                        if let Some(f) = ImageFrame::decode(&b) {
+                            let _ = events.send(LinkEvent::Image(f.key, f.image.to_vec())).await;
+                        }
+                    }
                     Message::Close(f) => return Ok(format!("close frame: {f:?}")),
                     _ => {}
                 }
@@ -183,9 +167,6 @@ async fn serve(
 async fn update(cfg: &Config, path: String, sha256: String) {
     if !cfg.auto_update {
         info!("server offers a client update; ignored (--no-update)");
-        return;
-    }
-    if cfg.client_sha256.as_deref() == Some(sha256.as_str()) {
         return;
     }
     info!(%path, "server offers a new client binary, updating");

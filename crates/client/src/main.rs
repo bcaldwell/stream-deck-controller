@@ -66,23 +66,13 @@ struct Args {
 }
 
 fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_else(|| "unknown".into())
+    let name = std::fs::read_to_string("/etc/hostname").or_else(|_| {
+        let out = std::process::Command::new("hostname").output()?;
+        Ok::<_, std::io::Error>(String::from_utf8_lossy(&out.stdout).into_owned())
+    });
+    name.expect("cannot determine the hostname; pass --client-id")
+        .trim()
+        .to_string()
 }
 
 #[tokio::main]
@@ -138,16 +128,14 @@ async fn main() -> Result<()> {
         client_id: args.client_id.unwrap_or_else(hostname),
         device: args.device.filter(|d| !d.is_empty()),
         brightness: args.brightness,
-        client_sha256: update::exe_sha256()
-            .map_err(|e| warn!("cannot hash own executable, self-update disabled: {e:#}"))
-            .ok(),
+        client_sha256: update::exe_sha256()?,
         auto_update: !args.no_update,
         usb_suspend: args.usb_suspend,
     };
     info!(
         server = %cfg.server,
         client_id = %cfg.client_id,
-        sha256 = cfg.client_sha256.as_deref().map(|s| &s[..12.min(s.len())]),
+        sha256 = &cfg.client_sha256[..12],
         auto_update = cfg.auto_update,
         "sdc-client starting"
     );

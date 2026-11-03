@@ -17,31 +17,24 @@ use sdc_protocol::sha256_hex;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Hex sha256 of the file at `path`.
-pub fn file_sha256(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+/// Hex sha256 of the running executable.
+pub fn exe_sha256() -> Result<String> {
+    let exe = std::env::current_exe().context("locating current executable")?;
+    let bytes = std::fs::read(&exe).with_context(|| format!("reading {}", exe.display()))?;
     Ok(sha256_hex(&bytes))
 }
 
-/// Hex sha256 of the running executable.
-pub fn exe_sha256() -> Result<String> {
-    file_sha256(&std::env::current_exe().context("locating current executable")?)
-}
-
-/// `ws://host:7700/ws` -> `http://host:7700` (`wss` -> `https`; http(s) URLs pass through).
-pub fn http_base(server: &str) -> Result<String> {
+/// `ws://host:7700/ws` -> `http://host:7700` (`wss` -> `https`).
+fn http_base(server: &str) -> Result<String> {
     let (scheme, rest) = server
         .split_once("://")
         .ok_or_else(|| anyhow!("server URL {server:?} has no scheme"))?;
     let scheme = match scheme {
-        "ws" | "http" => "http",
-        "wss" | "https" => "https",
+        "ws" => "http",
+        "wss" => "https",
         other => bail!("unsupported server URL scheme {other:?}"),
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.is_empty() {
-        bail!("server URL {server:?} has no host");
-    }
     Ok(format!("{scheme}://{authority}"))
 }
 
@@ -50,10 +43,6 @@ pub fn http_base(server: &str) -> Result<String> {
 pub fn apply(server: &str, token: Option<&str>, path: &str, sha256: &str) -> Result<()> {
     let url = format!("{}{path}", http_base(server)?);
     let exe = std::env::current_exe().context("locating current executable")?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| anyhow!("executable has no directory"))?;
-    check_writable(dir)?;
 
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(HTTP_TIMEOUT))
@@ -73,26 +62,14 @@ pub fn apply(server: &str, token: Option<&str>, path: &str, sha256: &str) -> Res
     replace_exe(&exe, &bytes, sha256)
 }
 
-/// Fail early with a clear message instead of downloading into a read-only location.
-fn check_writable(dir: &Path) -> Result<()> {
-    let probe = dir.join(format!(".sdc-client.probe.{}", std::process::id()));
-    std::fs::File::create(&probe)
-        .map_err(|e| anyhow!("{} is not writable ({e})", dir.display()))?;
-    let _ = std::fs::remove_file(&probe);
-    Ok(())
-}
-
 /// Verify `bytes` against `sha256` and atomically replace the file at `exe` with them.
 /// The temp file lives in the same directory so the final rename never crosses filesystems.
 pub fn replace_exe(exe: &Path, bytes: &[u8], sha256: &str) -> Result<()> {
     let got = sha256_hex(bytes);
-    if !got.eq_ignore_ascii_case(sha256) {
+    if got != sha256 {
         bail!("checksum mismatch: server said {sha256}, downloaded {got}");
     }
-    let dir = exe
-        .parent()
-        .ok_or_else(|| anyhow!("executable has no directory"))?;
-    let tmp: PathBuf = dir.join(format!(".sdc-client.update.{}", std::process::id()));
+    let tmp: PathBuf = exe.with_file_name(format!(".sdc-client.update.{}", std::process::id()));
     let result = (|| -> Result<()> {
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
@@ -130,22 +107,8 @@ mod tests {
             "https://deck.example.com"
         );
         assert_eq!(http_base("ws://h:1").unwrap(), "http://h:1");
-        assert_eq!(http_base("http://h:2/x?y").unwrap(), "http://h:2");
         assert!(http_base("h:7700/ws").is_err());
         assert!(http_base("ftp://h/ws").is_err());
-        assert!(http_base("ws:///ws").is_err());
-    }
-
-    #[test]
-    fn hashes_files() {
-        let d = tempdir("hash");
-        let f = d.join("f");
-        std::fs::write(&f, b"abc").unwrap();
-        assert_eq!(
-            file_sha256(&f).unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use elgato_streamdeck::{
     asynchronous::AsyncStreamDeck,
     info::{ImageMirroring, ImageMode, ImageRotation, Kind},
@@ -55,7 +55,7 @@ pub struct Detected {
 }
 
 fn supported(kind: Kind) -> bool {
-    kind.is_visual() && matches!(kind.key_image_format().mode, ImageMode::JPEG)
+    matches!(kind.key_image_format().mode, ImageMode::JPEG)
 }
 
 /// Linux: find the decks in sysfs. hidapi's own enumeration takes seconds on a Pi Zero, and
@@ -104,7 +104,7 @@ fn connect(kind: Kind, serial: &str) -> Result<AsyncStreamDeck> {
     let (_, node) = scan()?
         .into_iter()
         .find(|(d, _)| d.serial == serial)
-        .ok_or_else(|| anyhow!("Stream Deck {serial} not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("Stream Deck {serial} not found"))?;
     let deck = elgato_streamdeck::StreamDeck::connect_path(kind, &node)?;
     Ok(AsyncStreamDeck::from(deck))
 }
@@ -198,13 +198,13 @@ impl Deck {
         Ok(())
     }
 
-    fn dev(&self) -> Result<&AsyncStreamDeck> {
-        self.dev.as_ref().ok_or_else(|| anyhow!("deck is released"))
+    fn dev(&self) -> &AsyncStreamDeck {
+        self.dev.as_ref().expect("deck is released")
     }
 
     /// Show a frame from the server: a JPEG already in the deck's native format.
     pub async fn write_frame(&self, key: u8, jpeg: &[u8]) -> Result<()> {
-        let dev = self.dev()?;
+        let dev = self.dev();
         dev.write_image(key, jpeg).await?;
         Ok(dev.flush().await?)
     }
@@ -213,17 +213,17 @@ impl Deck {
     pub async fn fill(&self, key: u8, rgb: [u8; 3]) -> Result<()> {
         let size = self.info.key_size_px;
         let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(size, size, Rgb(rgb)));
-        let dev = self.dev()?;
+        let dev = self.dev();
         dev.set_button_image(key, img).await?;
         Ok(dev.flush().await?)
     }
 
     pub async fn set_brightness(&self, percent: u8) -> Result<()> {
-        Ok(self.dev()?.set_brightness(percent.min(100)).await?)
+        Ok(self.dev().set_brightness(percent).await?)
     }
 
     pub async fn clear(&self) -> Result<()> {
-        Ok(self.dev()?.clear_all_button_images().await?)
+        Ok(self.dev().clear_all_button_images().await?)
     }
 }
 
@@ -300,7 +300,6 @@ mod tests {
         assert!(supported(Kind::Mk2));
         assert!(supported(Kind::Plus));
         assert!(!supported(Kind::Original)); // BMP
-        assert!(!supported(Kind::Mini));
         assert!(!supported(Kind::Pedal)); // no screens
     }
 }

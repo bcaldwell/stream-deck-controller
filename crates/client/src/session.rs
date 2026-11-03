@@ -30,8 +30,8 @@ pub struct Config {
     pub brightness: u8,
     /// Requested server-side device layout (`sdc.device` name), sent in Hello.
     pub device: Option<String>,
-    /// Hash of the running executable, reported in Hello (None: could not read it).
-    pub client_sha256: Option<String>,
+    /// Hash of the running executable, reported in Hello.
+    pub client_sha256: String,
     /// Apply `Update` messages from the server (`--no-update` turns this off).
     pub auto_update: bool,
     /// Release the device while the screen is off so it can USB-suspend (Linux only).
@@ -74,9 +74,6 @@ async fn serve(
     keys: mpsc::UnboundedSender<ClientMessage>,
 ) -> Result<Infallible> {
     let usb_suspend = cfg.usb_suspend && deck.status_path.is_some();
-    if cfg.usb_suspend && !usb_suspend {
-        info!("USB suspend not available for this device, keeping it open");
-    }
     let mut st = State {
         connected: false,
         sleeper: Sleeper::new(usb_suspend),
