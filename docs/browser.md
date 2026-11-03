@@ -6,24 +6,18 @@ same protocol as the Pi client over `/deck/ws`.
 
 ![The browser deck on a desktop](images/deck-desktop.png)
 
-## Own deck and mirror mode
+## Own deck and layouts
 
-- **Own deck** (the default). The browser is a client of its own with the id `web-<random>` (kept in
-  `localStorage`), and has its own page, idle state and brightness. Keys are rendered at 144 or 192 px depending on
-  the screen's pixel ratio.
-- **Mirror**. The dot on the bezel opens a device menu listing the connected decks. Picking one makes the browser show
-  that deck's current page at the browser's own key size, and presses act on the real deck (page changes, waking it
-  from idle). Brightness and idle messages of the real deck are not sent to the viewer. If the deck is not connected,
-  the browser falls back to its own deck. The choice is remembered in `localStorage`.
+The browser is a client of its own with the id `web-<random>` (kept in `localStorage`), and has its own page, idle
+state and brightness. Keys are rendered at 144 or 192 px depending on the screen's pixel ratio.
 
-![The device menu lists the connected decks](images/deck-menu.png)
-- **Layout**. When the config defines [devices](configuration.md#devices), the menu also has a Layout section listing
-  "Default" and each device name. Picking one makes this browser's own deck use that device's pages, home page,
-  brightness and idle settings; the choice is remembered in `localStorage` and the deck reconnects.
+When the config defines [devices](configuration.md#devices), the dot on the bezel opens a menu listing "Default" and
+each device name. Picking one makes this browser's deck use that device's pages, home page, brightness and idle
+settings; the choice is remembered in `localStorage` and the deck reconnects.
 
-The menu is fed by `GET /deck/api/clients`, which returns the connected decks as
-`[{client_id, model, rows, cols, page, web}]`. Other browsers' own decks appear with `web: true`; mirror viewers are
-not listed. The Layout section is fed by `GET /deck/api/devices` (`[{name, pages, home}]`, empty without devices).
+![The layout menu](images/deck-menu.png)
+
+The menu is fed by `GET /deck/api/devices` (`[{name, pages, home}]`, empty without devices).
 
 ## Phones
 

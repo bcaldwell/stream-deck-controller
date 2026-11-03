@@ -113,7 +113,7 @@ sdc.page("media", { ... })
 
 ## Spans
 
-`sdc.span { cols, rows, render, press, release, gap }` is a button covering a rectangle of keys and drawing one
+`sdc.span { cols, rows, render, press, release }` is a button covering a rectangle of keys and drawing one
 picture or text across all of them. A span in list slot `k` occupies `k .. k+cols-1` on that row and the same
 columns on the following rows. The other slots it covers must be `false`/`nil`.
 
@@ -141,9 +141,7 @@ Notes:
 
 - `attributes.entity_picture` is a Home Assistant path such as `/api/media_player_proxy/...`. The server fetches it
   with your `HA_TOKEN`; see [Icons and images](#icons-and-images).
-- The picture is laid out once on a canvas the size of the whole span and cut into one tile per key. With a gap
-  (`gap = 18` on the span, or `sdc.key_gap(18)` for every span) the picture continues across the space between
-  keys, as on a real Stream Deck MK.2, at the cost of hiding the strip behind the bezel. The default gap is 0.
+- The picture is laid out once on a canvas the size of the whole span and cut into one tile per key.
 - In `press`, `ctx.key` is the pressed key and `ctx.span_index` its position inside the span (0..n-1, row-major).
 - A span that runs off the deck or overlaps another button is logged and shown as `ERR` tiles. The grid size is per
   client, so this is checked when each deck renders.
@@ -232,7 +230,7 @@ Pages are global. A *device* is a named set of them: it says which pages a deck 
 optionally its own brightness and idle settings. Use devices when several decks share one config, for example a
 Stream Deck Plus in the office that needs different pages than the Mk.2 in the living room. A config must define at
 least one `sdc.device`; without one it fails to load. (`sdc.default_page`, `sdc.idle` and `sdc.brightness` no longer
-exist: calling them is an error, set the same things on the device. `sdc.key_gap` and `sdc.feedback` stay global.)
+exist: calling them is an error, set the same things on the device. `sdc.feedback` stays global.)
 
 ```lua
 local home  = sdc.page("home", { ... })   -- sdc.page and sdc.device return handles
@@ -276,7 +274,7 @@ Details:
 - The device's `home` is the start page, the target of `home_after`, and the fallback when a remembered page is not
   on the device (also after a config reload). A deck that reconnects and lands on a different device than before
   starts at the new device's home.
-- A config reload re-resolves the device of every connected client. A mirror viewer uses the mirrored deck's device.
+- A config reload re-resolves the device of every connected client.
   Elgato plugin exports are not affected by devices.
 - These fail the load, keeping the previous config: an unknown page in `pages`, a `home` not in `pages`, duplicate
   device names, a config without any `sdc.device`, or `sdc.default_device` naming an unknown device or type.

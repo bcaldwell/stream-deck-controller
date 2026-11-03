@@ -437,7 +437,6 @@ async fn session(
         device: deck.info.clone(),
         client_target: sdc_protocol::client_target().map(str::to_string),
         client_sha256: cfg.client_sha256.clone(),
-        mirror: None,
         device_name: cfg.device.clone(),
     };
     tx.send(Message::text(serde_json::to_string(&hello)?))
@@ -688,7 +687,6 @@ mod tests {
             device: crate::device::device_info(elgato_streamdeck::info::Kind::Original, None),
             client_target: Some("aarch64-linux".into()),
             client_sha256: None,
-            mirror: None,
             device_name: None,
         };
         let s = serde_json::to_string(&hello).unwrap();

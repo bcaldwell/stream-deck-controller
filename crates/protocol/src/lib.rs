@@ -23,7 +23,7 @@
 //! frames; images are base64 PNGs because the Elgato SDK takes data URLs.
 //!
 //! Browser decks use the same messages on `/deck/ws` (behind the cluster's SSO instead of the
-//! client token). `Hello.mirror` makes such a connection a viewer of another client's deck.
+//! client token).
 
 use serde::{Deserialize, Serialize};
 
@@ -164,10 +164,6 @@ pub enum ClientMessage {
         /// Hex sha256 of the running client executable; absent from older clients.
         #[serde(default)]
         client_sha256: Option<String>,
-        /// Browser deck only (`/deck/ws`): the `client_id` of a connected deck to mirror instead
-        /// of being a deck of its own. Ignored on `/ws`; absent from older clients.
-        #[serde(default)]
-        mirror: Option<String>,
         /// Name of the Lua device (`sdc.device`) this client wants; unknown or absent: the
         /// server picks one from `sdc.default_device`. (Not `device`: that is the hardware.)
         #[serde(default)]
@@ -344,15 +340,11 @@ mod tests {
             ClientMessage::Hello {
                 client_target,
                 client_sha256,
-                mirror,
                 device_name,
                 ..
-            } => assert!(
-                client_target.is_none()
-                    && client_sha256.is_none()
-                    && mirror.is_none()
-                    && device_name.is_none()
-            ),
+            } => {
+                assert!(client_target.is_none() && client_sha256.is_none() && device_name.is_none())
+            }
             _ => panic!("not hello"),
         }
     }

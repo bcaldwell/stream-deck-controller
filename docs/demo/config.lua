@@ -2,7 +2,6 @@
 -- Paths are relative to this file.
 local sdc = require("sdc")
 
-sdc.key_gap(18) -- continue pictures across the bezel between keys
 
 local ON, OFF = "#f5b400", "#2a2a2e"
 

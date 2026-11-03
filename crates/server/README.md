@@ -54,14 +54,7 @@ installable on a phone). It speaks the normal client protocol over `/deck/ws`.
 - **Own deck** (default): the browser is a client of its own (`client_id` `web-<random>`, kept in
   localStorage) with its own page, idle state and brightness, rendered at 144 or 192 px per key
   depending on `devicePixelRatio`.
-- **Mirror**: the dot on the bezel opens a device menu (`GET /deck/api/clients`: connected decks as
-  `[{client_id, model, rows, cols, page, web}]`; `web: true` marks other browsers' own decks, mirror
-  viewers are not listed). Picking a deck sends `Hello.mirror = <client_id>`: the browser then shows
-  that deck's page at its own key size and its presses act on the real deck (page changes, idle
-  wake). The real deck's brightness/idle messages are not sent to the viewer. If the deck is not
-  connected the server answers `Error` and the UI shows its own deck instead. The choice is kept in
-  localStorage.
-- **Layout** (own-deck mode only): when the config has `sdc.device`s, the menu also lists "Default" plus
+- **Layout**: when the config has `sdc.device`s, the dot on the bezel opens a menu listing "Default" plus
   every device name (`GET /deck/api/devices`: `[{name, pages, home}]`, same SSO auth, `[]` without
   devices). The choice is kept in localStorage and sent as `Hello.device_name`; changing it reconnects.
 - Phones: a portrait viewport rotates the deck 90 degrees; the bezel has a fullscreen button
@@ -95,7 +88,6 @@ sdc.page("home", {                -- list index = key index, row-major, key 1 (L
   sdc.button { render = { text = "Media" }, press = function(ctx) ctx.goto_page("media") end },
 })
 sdc.device("deck", { pages = { "home" } })   -- required: at least one; brightness and idle are set here (see Devices)
-sdc.key_gap(18)                   -- optional; gap between keys for spans (px at 72 px keys, default 0)
 sdc.feedback(true)                -- optional; flash a key briefly after its press ran OK (default true)
 ```
 
@@ -152,11 +144,11 @@ sdc.default_device { mk2 = living, plus = "office-plus", ["*"] = living }   -- d
   `sdc.default_device` entry for its type, the `"*"` entry, the first `sdc.device` defined.
 - A config must define at least one `sdc.device` (otherwise it fails to load). `sdc.default_page`, `sdc.idle` and
   `sdc.brightness` were removed (calling them is an error); a device's `idle` and `brightness` replace them, and a
-  device without them never idles and uses brightness 60. `sdc.key_gap` and `sdc.feedback` stay global.
+  device without them never idles and uses brightness 60. `sdc.feedback` stays global.
 - `ctx.goto_page` to a page outside the client's device is logged and ignored. The device's `home` is the start page, the
   target of `home_after` and the fallback when a remembered page is not on the device (also after a config
   reload). A reconnecting client that lands on a different device than before starts at that device's home.
-- Config reload re-resolves every connected client's device. Mirror viewers use the mirrored deck's device. The
+- Config reload re-resolves every connected client's device. The
   Elgato plugin (`sdc.export`) is not affected.
 - Config errors fail the load (the previous config stays active): unknown page in `pages`, `home` not in
   `pages`, duplicate device names, `sdc.default_device` naming an unknown device or type.
@@ -259,7 +251,7 @@ red ERR tile until its next render. A connection may hold 256 slots; `size_px` m
 
 ## Spans
 
-`sdc.span { cols, rows, render, press, release, gap }` is a button that covers a rectangle of keys and shows
+`sdc.span { cols, rows, render, press, release }` is a button that covers a rectangle of keys and shows
 one picture or text across all of them, e.g. album art over 2x2 keys. The page list is row-major key slots: a
 span in slot k occupies k..k+cols-1 on that row and the same columns on the following rows, and the other
 slots it covers must be `false`/`nil`.
@@ -280,14 +272,10 @@ sdc.page("music", {
 - The grid size is per client, so spans are placed when a client renders: a span that runs off the client's
   rows/cols, or covers a slot holding a button or another span, is logged and shows the red `ERR` tile on its
   keys (as does a Lua error in its `render`). Pressing an ERR span does nothing.
-- `render` returns the usual descriptor, laid out once on a canvas of `cols*key + (cols-1)*gap` by
-  `rows*key + (rows-1)*gap` px, which then is cut into one tile per key (tile (c, r) starts at
-  `(c*(key+gap), r*(key+gap))`), so the picture continues across the physical space between keys. `image`
+- `render` returns the usual descriptor, laid out once on a canvas of `cols*key` by `rows*key` px, which then is cut into
+  one tile per key, so the picture continues across the keys. `image`
   covers the whole canvas (center-cropped to its aspect); `icon`/`text` are placed on the whole canvas, with
   padding and text size following its shorter side.
-- `gap` (per span) or `sdc.key_gap(px)` (global) is in px at 72 px keys and scales with the client's key size;
-  the default is 0 (plain tiles). About 18 matches the bezel of a Stream Deck MK.2, so lines continue
-  straight across keys, at the cost of hiding the strip of the picture behind the bezel.
 - Dependencies: entities read by a span's `render` and its image downloads re-render all of its keys. Each tile
   is still only sent when its JPEG changed. Scaled pictures are cached per canvas size.
 - `ctx` in `render` has `key` = the span's top-left key; in `press`/`release`, `key` is the pressed key and
