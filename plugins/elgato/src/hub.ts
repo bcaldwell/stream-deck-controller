@@ -4,10 +4,15 @@
 
 import WebSocket from "ws";
 
-import type { ClientMessage, DialFeedback, ExportItem, ServerMessage, SlotKind, Subscribe } from "./protocol";
-
-/** No built-in server: nothing connects until a server URL is set in the action settings. */
-export const DEFAULT_URL = "";
+import {
+	PROTOCOL_VERSION,
+	type ClientMessage,
+	type DialFeedback,
+	type ExportItem,
+	type ServerMessage,
+	type SlotKind,
+	type Subscribe,
+} from "./protocol";
 
 /**
  * The plugin endpoint for whatever was typed: a bare host, an https:// URL or the deck's `/ws` all
@@ -27,14 +32,14 @@ export function pluginUrl(input: string): string {
 	if (path === "" || path === "/ws") u.pathname = "/plugin/ws";
 	return u.toString();
 }
-const PROTOCOL_VERSION = 1;
+
 const MIN_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
 const HEARTBEAT_MS = 20_000;
 /** Dial ticks are batched this long before they are sent as one message. */
 const ROTATE_BATCH_MS = 100;
 /** Keys are rendered by the server at this size; Stream Deck scales it to the hardware. */
-export const KEY_SIZE_PX = 144;
+const KEY_SIZE_PX = 144;
 
 /** What a subscribed slot (an action instance) receives. */
 export interface SlotHandler {
@@ -49,28 +54,21 @@ export interface Logger {
 	error(...args: unknown[]): void;
 }
 
-export interface Connection {
-	url?: string;
-	token?: string;
-}
-
 export class Hub {
 	#log: Logger;
 	#clientId: string;
-	#url = DEFAULT_URL;
+	#url = "";
 	#token = "";
 	#ws: WebSocket | undefined;
 	#online = false;
-	#started = false;
 	#backoff = MIN_BACKOFF_MS;
 	#retry: ReturnType<typeof setTimeout> | undefined;
 	#heartbeat: ReturnType<typeof setInterval> | undefined;
 	#alive = true;
-	#subs = new Map<string, Subscribe>();
-	#handlers = new Map<string, SlotHandler>();
+	#slots = new Map<string, { sub: Subscribe; handler: SlotHandler }>();
 	#exports: ExportItem[] = [];
-	#exportsKnown = false;
-	#exportListeners = new Set<() => void>();
+	#gotExports!: () => void;
+	#exportsReady = new Promise<void>((resolve) => (this.#gotExports = resolve));
 	#pendingTicks = new Map<string, number>();
 	#rotateTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -79,61 +77,35 @@ export class Hub {
 		this.#clientId = clientId;
 	}
 
-	/** Whether the server accepted us (welcome received) and the socket is still open. */
-	get online(): boolean {
-		return this.#online;
-	}
-
-	/** The last export list the server sent (empty until the first connect). */
-	get exports(): readonly ExportItem[] {
-		return this.#exports;
-	}
-
-	/** Sets the server and token and (re)connects if they changed; no URL = stay offline. */
-	configure({ url, token }: Connection): void {
-		const nextUrl = pluginUrl(url?.trim() || DEFAULT_URL);
+	/** Sets the server and token and reconnects if they changed; no URL = stay offline. */
+	configure({ url, token }: { url?: string; token?: string }): void {
+		const nextUrl = pluginUrl(url?.trim() ?? "");
 		const nextToken = token?.trim() ?? "";
-		const changed = nextUrl !== this.#url || nextToken !== this.#token;
+		if (nextUrl === this.#url && nextToken === this.#token) return;
 		this.#url = nextUrl;
 		this.#token = nextToken;
-		if (!this.#started) {
-			this.#started = true;
-			this.#connect();
-		} else if (changed) {
-			this.reconnect();
-		}
+		this.reconnect();
 	}
 
 	/** Drops the connection (if any) and connects again right away, e.g. after the computer woke. */
 	reconnect(): void {
 		clearTimeout(this.#retry);
 		this.#backoff = MIN_BACKOFF_MS;
-		this.#ws?.removeAllListeners();
-		this.#ws?.terminate();
+		const old = this.#ws;
 		this.#down();
+		old?.terminate();
 		this.#connect();
-	}
-
-	close(): void {
-		this.#started = false;
-		clearTimeout(this.#retry);
-		clearTimeout(this.#rotateTimer);
-		this.#ws?.removeAllListeners();
-		this.#ws?.close();
-		this.#down();
 	}
 
 	/** Shows export `exportId` in `slot`; resent automatically after reconnects. */
 	subscribe(slot: string, exportId: string, kind: SlotKind, handler: SlotHandler): void {
 		const sub: Subscribe = { type: "subscribe", slot, export: exportId, kind, size_px: KEY_SIZE_PX };
-		this.#subs.set(slot, sub);
-		this.#handlers.set(slot, handler);
+		this.#slots.set(slot, { sub, handler });
 		this.send(sub);
 	}
 
 	unsubscribe(slot: string): void {
-		if (this.#subs.delete(slot)) {
-			this.#handlers.delete(slot);
+		if (this.#slots.delete(slot)) {
 			this.#pendingTicks.delete(slot);
 			this.send({ type: "unsubscribe", slot });
 		}
@@ -141,8 +113,8 @@ export class Hub {
 
 	/** Sends `msg` if online; false if it was dropped (the caller shows an alert). */
 	send(msg: ClientMessage): boolean {
-		if (!this.#online || this.#ws?.readyState !== WebSocket.OPEN) return false;
-		this.#ws.send(JSON.stringify(msg));
+		if (!this.#online) return false;
+		this.#ws?.send(JSON.stringify(msg));
 		return true;
 	}
 
@@ -154,24 +126,10 @@ export class Hub {
 		return true;
 	}
 
-	/** Resolves with the export list once the server has sent one, or after `timeoutMs`. */
+	/** The server's export list: waits up to `timeoutMs` for the first one, empty if it never came. */
 	async waitForExports(timeoutMs: number): Promise<readonly ExportItem[]> {
-		if (this.#exportsKnown) return this.#exports;
-		await new Promise<void>((resolve) => {
-			const done = (): void => {
-				clearTimeout(timer);
-				this.#exportListeners.delete(done);
-				resolve();
-			};
-			const timer = setTimeout(done, timeoutMs);
-			this.#exportListeners.add(done);
-		});
+		await Promise.race([this.#exportsReady, new Promise((resolve) => setTimeout(resolve, timeoutMs))]);
 		return this.#exports;
-	}
-
-	/** Calls `listener` whenever the server sends an export list. */
-	onExports(listener: () => void): void {
-		this.#exportListeners.add(listener);
 	}
 
 	#flushTicks(): void {
@@ -184,7 +142,7 @@ export class Hub {
 	}
 
 	#connect(): void {
-		if (!this.#started || !this.#url) return;
+		if (!this.#url) return;
 		const headers: Record<string, string> = {};
 		if (this.#token) headers["Authorization"] = `Bearer ${this.#token}`;
 		let ws: WebSocket;
@@ -203,7 +161,7 @@ export class Hub {
 				JSON.stringify({ type: "plugin_hello", protocol_version: PROTOCOL_VERSION, client_id: this.#clientId }),
 			);
 		});
-		ws.on("message", (data) => this.#onMessage(data.toString()));
+		ws.on("message", (data) => this.#onMessage(JSON.parse(data.toString()) as ServerMessage));
 		ws.on("pong", () => (this.#alive = true));
 		ws.on("unexpected-response", (_req, res) => {
 			this.#log.warn(`server refused the connection: HTTP ${res.statusCode} (check the token)`);
@@ -211,14 +169,12 @@ export class Hub {
 		});
 		ws.on("error", (e) => this.#log.warn(`websocket error: ${e.message}`));
 		ws.on("close", () => {
-			if (this.#ws !== ws) return;
+			if (this.#ws !== ws) return; // replaced by reconnect()
 			this.#log.info("disconnected");
 			this.#down();
 			this.#scheduleRetry();
 		});
-		clearInterval(this.#heartbeat);
 		this.#heartbeat = setInterval(() => {
-			if (this.#ws !== ws) return;
 			if (!this.#alive) {
 				this.#log.warn("no answer to ping, dropping the connection");
 				ws.terminate();
@@ -236,41 +192,31 @@ export class Hub {
 	}
 
 	#scheduleRetry(): void {
-		if (!this.#started) return;
-		clearTimeout(this.#retry);
 		const wait = this.#backoff * (0.8 + Math.random() * 0.4);
 		this.#backoff = Math.min(this.#backoff * 2, MAX_BACKOFF_MS);
 		this.#retry = setTimeout(() => this.#connect(), wait);
 	}
 
-	#onMessage(text: string): void {
-		let msg: ServerMessage;
-		try {
-			msg = JSON.parse(text) as ServerMessage;
-		} catch {
-			this.#log.warn("unparseable message from the server");
-			return;
-		}
+	#onMessage(msg: ServerMessage): void {
 		switch (msg.type) {
 			case "plugin_welcome":
 				this.#online = true;
 				this.#backoff = MIN_BACKOFF_MS;
 				this.#log.info("connected");
-				for (const sub of this.#subs.values()) this.send(sub);
+				for (const { sub } of this.#slots.values()) this.send(sub);
 				break;
 			case "exports":
 				this.#exports = msg.items;
-				this.#exportsKnown = true;
-				for (const l of [...this.#exportListeners]) l();
+				this.#gotExports();
 				break;
 			case "key_image":
-				this.#handlers.get(msg.slot)?.keyImage?.(msg.png_base64);
+				this.#slots.get(msg.slot)?.handler.keyImage?.(msg.png_base64);
 				break;
 			case "dial_feedback":
-				this.#handlers.get(msg.slot)?.dialFeedback?.(msg);
+				this.#slots.get(msg.slot)?.handler.dialFeedback?.(msg);
 				break;
 			case "slot_error":
-				this.#handlers.get(msg.slot)?.error?.(msg.message);
+				this.#slots.get(msg.slot)?.handler.error?.(msg.message);
 				break;
 			case "error":
 				this.#log.error(`server error: ${msg.message}`);

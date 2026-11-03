@@ -1,50 +1,62 @@
-import { streamDeck, type SendToPluginEvent } from "@elgato/streamdeck";
-import type { JsonObject, JsonValue } from "@elgato/utils";
+import {
+	streamDeck,
+	SingletonAction,
+	type DialAction,
+	type DidReceiveSettingsEvent,
+	type KeyAction,
+	type WillAppearEvent,
+	type WillDisappearEvent,
+} from "@elgato/streamdeck";
 
 import type { Hub } from "../hub";
-import type { ExportItem, SlotKind } from "../protocol";
+import type { SlotKind } from "../protocol";
 
 /** Per-action settings, written by the property inspector. */
-export type ExportSettings = {
-	/** Picked from the server's list. */
-	export?: string;
-	/** Typed by hand; wins over `export` (for when the list is unavailable). */
-	exportManual?: string;
-};
-
-/** The export id an action instance shows, if any. */
-export const exportId = (s: ExportSettings): string | undefined => s.exportManual?.trim() || s.export?.trim() || undefined;
+export type ExportSettings = { export?: string };
 
 /** How long the property inspector's dropdown waits for the server's list. */
 const EXPORTS_WAIT_MS = 4_000;
 
-const itemsOf = (exports: readonly ExportItem[], kind: SlotKind) =>
-	exports
-		.filter((e) => e.kind === kind)
-		.map((e) => ({ label: e.label ? `${e.label} (${e.id})` : e.id, value: e.id }));
+/** Subscribes the action instance to its chosen export and unsubscribes when it goes away. */
+export abstract class ExportAction<
+	A extends KeyAction<ExportSettings> | DialAction<ExportSettings>,
+> extends SingletonAction<ExportSettings> {
+	protected readonly hub: Hub;
+	readonly #kind: SlotKind;
 
-/** Answers the property inspector's `getExports` data source request with the exports of `kind`. */
-export async function answerExports(hub: Hub, ev: SendToPluginEvent<JsonValue, JsonObject>, kind: SlotKind): Promise<void> {
-	const payload = ev.payload;
-	if (typeof payload !== "object" || payload === null || Array.isArray(payload) || payload["event"] !== "getExports") return;
-	const exports = await hub.waitForExports(EXPORTS_WAIT_MS);
-	await streamDeck.ui.sendToPropertyInspector({ event: "getExports", items: itemsOf(exports, kind) });
-}
+	constructor(hub: Hub, kind: SlotKind) {
+		super();
+		this.hub = hub;
+		this.#kind = kind;
+	}
 
-/** Re-sends the list to an open property inspector (the dropdown has `hot-reload`). */
-export function pushExports(hub: Hub, kind: SlotKind): void {
-	if (!streamDeck.ui.action) return;
-	void streamDeck.ui.sendToPropertyInspector({ event: "getExports", items: itemsOf(hub.exports, kind) });
-}
+	/** Draws the placeholder if `exportId` is undefined, otherwise `hub.subscribe`s. */
+	protected abstract show(action: A, exportId: string | undefined): void;
 
-/** Limits how often `fn` runs, for alerts on a dial that is turned many times. */
-export function throttled(fn: () => void, ms: number): () => void {
-	let last = 0;
-	return () => {
-		const now = Date.now();
-		if (now - last >= ms) {
-			last = now;
-			fn();
-		}
-	};
+	override onWillAppear(ev: WillAppearEvent<ExportSettings>): void {
+		this.#attach(ev.action, ev.payload.settings);
+	}
+
+	override onDidReceiveSettings(ev: DidReceiveSettingsEvent<ExportSettings>): void {
+		this.#attach(ev.action, ev.payload.settings);
+	}
+
+	override onWillDisappear(ev: WillDisappearEvent<ExportSettings>): void {
+		this.hub.unsubscribe(ev.action.id);
+	}
+
+	/** The property inspector's dropdown (`datasource="getExports"`) asks for the exports of our kind. */
+	override async onSendToPlugin(): Promise<void> {
+		const exports = await this.hub.waitForExports(EXPORTS_WAIT_MS);
+		const items = exports
+			.filter((e) => e.kind === this.#kind)
+			.map((e) => ({ label: e.label ? `${e.label} (${e.id})` : e.id, value: e.id }));
+		await streamDeck.ui.sendToPropertyInspector({ event: "getExports", items });
+	}
+
+	#attach(action: WillAppearEvent<ExportSettings>["action"], settings: ExportSettings): void {
+		this.hub.unsubscribe(action.id);
+		// The manifest limits each action to one controller type, so `action` is an `A`.
+		this.show(action as unknown as A, settings.export || undefined);
+	}
 }

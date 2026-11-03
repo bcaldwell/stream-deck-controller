@@ -35,7 +35,7 @@ const done = new Promise((resolve) => {
 });
 
 const timeout = setTimeout(() => {
-	console.error("timed out; online =", hub.online, "got =", Object.keys(got).filter((k) => got[k]));
+	console.error("timed out; got =", Object.keys(got).filter((k) => got[k]));
 	process.exit(1);
 }, 10_000);
 await done;
@@ -61,5 +61,4 @@ hub.rotate("dial-1", 1);
 hub.send({ type: "dial_down", slot: "dial-1" });
 await new Promise((r) => setTimeout(r, 500));
 console.log("slot errors:", got.errors);
-hub.close();
 process.exit(got.errors.length === 1 ? 0 : 1);

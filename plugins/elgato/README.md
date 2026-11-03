@@ -23,14 +23,13 @@ Needs Elgato's Stream Deck app 7.1 or newer (macOS 12+, Windows 10+).
    or build it (below).
 2. Double-click it; the Stream Deck app installs it.
 3. Drag "SDC Button" or "SDC Dial" onto a key or dial. In its settings:
-   - **Server URL** (shared by all actions): your server's `/plugin/ws`, e.g. `wss://your-server/plugin/ws`.
+   - **Server URL** (shared by all actions): your server, e.g. `your-server.example.com` (a bare host or `https://` URL means `wss://host/plugin/ws`).
      Nothing connects until it is set.
    - **Token** (shared): the server's `SDC_CLIENT_TOKEN`. Stream Deck stores plugin global settings in its
      preferences as plain text, so treat the laptop like any other place you keep that token. Leave empty if the
      server has no token.
    - **Export**: a dropdown with the server's exports of the right kind (buttons for a key, dials for a dial).
-     If the server is unreachable the list is empty: type the id into **Or type id** instead (it wins over the
-     dropdown).
+     The list is empty while the server is unreachable.
 
 The first connection can take a moment; keys keep their last image while the server is away and flash the
 alert (yellow triangle) when pressed offline. The plugin reconnects with backoff (1 s up to 30 s), re-subscribes
@@ -77,7 +76,7 @@ task plugin:link      # build and `streamdeck link` it into the local Stream Dec
 `ca.bcaldwell.sdc.sdPlugin/logs/` (linked install) or the Stream Deck app's log folder.
 
 Layout: `src/hub.ts` the single websocket (reconnect, subscriptions, tick batching; no Stream Deck imports),
-`src/actions/` the two actions and the property inspector's data source, `src/protocol.ts` the message types
+`src/actions/` the two actions (a shared base subscribes them and feeds the property inspector's dropdown), `src/protocol.ts` the message types
 (mirror of `crates/protocol`), `ca.bcaldwell.sdc.sdPlugin/` manifest, property inspector pages (`ui/`, built on
 the sdpi-components script from Elgato's CDN, like Elgato's own template) and icons (`scripts/gen-icons.py`
 regenerates them, stdlib only).
