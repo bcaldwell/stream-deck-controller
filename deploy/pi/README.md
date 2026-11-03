@@ -40,7 +40,7 @@ screen off (`sdc.idle` `off_after`, brightness 0) the client waits ~1s, then clo
 nothing holds it open. The udev rule in `50-streamdeck.rules` sets `power/control=auto` and
 `power/autosuspend_delay_ms=2000` on the deck, so the kernel suspends it about 2s later (the screen
 is dark, the images are kept). The client then only reads `/sys/bus/usb/devices/*/power/runtime_status`
-(every 250ms, no privileges needed, does not wake the deck). A key press makes the deck wake itself
+(every 100ms, no privileges needed, does not wake the deck). A key press makes the deck wake itself
 (`active`); the client reopens it, redraws any images that changed meanwhile, and sends the server a
 `wake` message, which restores the brightness and restarts the idle timers. The press that woke the
 deck is not delivered as a key press, the same as any press on a dimmed deck. A brightness above 0

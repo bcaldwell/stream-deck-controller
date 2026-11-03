@@ -1857,7 +1857,6 @@ mod tests {
 
     fn native(rotation: u16, mirror: NativeMirror) -> NativeImage {
         NativeImage {
-            mode: sdc_protocol::NativeMode::Jpeg,
             size: (72, 72),
             rotation,
             mirror,

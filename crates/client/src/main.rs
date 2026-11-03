@@ -1,11 +1,11 @@
 //! sdc-client: connects a local Stream Deck to an sdc-server over WebSocket.
 
 mod device;
+mod link;
 mod session;
 mod sleep;
 mod update;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -38,17 +38,6 @@ struct Args {
           value_parser = clap::value_parser!(u8).range(0..=100))]
     brightness: u8,
 
-    /// Seconds without a server connection before the deck switches to its dimmed offline
-    /// screen; until then (also at startup) it keeps showing the last images, and a key
-    /// press flashes an offline marker on that key
-    #[arg(
-        long,
-        env = "SDC_OFFLINE_AFTER",
-        default_value_t = 1800,
-        value_name = "SECONDS"
-    )]
-    offline_after: u64,
-
     /// Hardware smoke test: paint each key a distinct colour, log key presses for N seconds, exit
     #[arg(long, value_name = "SECONDS")]
     test_pattern: Option<u64>,
@@ -56,15 +45,6 @@ struct Args {
     /// List detected Stream Decks and exit
     #[arg(long)]
     list: bool,
-
-    /// Pretend to be a 3x5 72px deck (no hardware); key events are read from stdin
-    /// as `press N`, `down N`, `up N`
-    #[arg(long, env = "SDC_FAKE_DEVICE")]
-    fake_device: bool,
-
-    /// With --fake-device: write received images to this directory as key-<n>.jpg
-    #[arg(long, env = "SDC_FAKE_OUT")]
-    fake_out: Option<PathBuf>,
 
     /// While the server has the screen off, close the device so the Stream Deck can USB-suspend
     /// (saves power on battery; needs the udev rule from deploy/pi). A key press wakes it. Linux
@@ -118,7 +98,7 @@ async fn main() -> Result<()> {
             println!("no Stream Deck devices found");
         }
         for d in found {
-            let i = device::device_info(d.kind, Some(d.serial.clone()));
+            let i = device::device_info(d.kind, d.serial.clone());
             println!(
                 "{:?} serial={} {}x{} keys, {}px",
                 d.kind, d.serial, i.rows, i.cols, i.key_size_px
@@ -130,15 +110,10 @@ async fn main() -> Result<()> {
     if let Some(secs) = args.test_pattern {
         let mut deck = device::Deck::open_first().await?;
         deck.set_brightness(args.brightness).await?;
-        for k in 0..deck.info.key_count() {
-            let hue = k as f32 / deck.info.key_count() as f32;
-            let px = device::hsv_tile(deck.info.key_size_px, hue);
-            let mut jpeg = Vec::new();
-            px.write_to(
-                &mut std::io::Cursor::new(&mut jpeg),
-                image::ImageFormat::Jpeg,
-            )?;
-            deck.set_image_jpeg(k, &jpeg).await?;
+        let keys = deck.info.key_count();
+        for k in 0..keys {
+            deck.fill(k, device::hsv_color(k as f32 / keys as f32))
+                .await?;
         }
         info!("test pattern shown; logging key events for {secs}s");
         let end = tokio::time::sleep(Duration::from_secs(secs));
@@ -163,7 +138,6 @@ async fn main() -> Result<()> {
         client_id: args.client_id.unwrap_or_else(hostname),
         device: args.device.filter(|d| !d.is_empty()),
         brightness: args.brightness,
-        offline_after: Duration::from_secs(args.offline_after),
         client_sha256: update::exe_sha256()
             .map_err(|e| warn!("cannot hash own executable, self-update disabled: {e:#}"))
             .ok(),
@@ -178,30 +152,17 @@ async fn main() -> Result<()> {
         "sdc-client starting"
     );
 
-    let mut fake = if args.fake_device {
-        Some(device::Deck::fake(args.fake_out)?)
-    } else {
-        None
-    };
-
     loop {
-        let mut real;
-        let deck = match fake.as_mut() {
-            Some(d) => d,
-            None => match device::Deck::open_first().await {
-                Ok(d) => {
-                    real = d;
-                    &mut real
-                }
-                Err(e) => {
-                    warn!("{e:#}; retrying in 2s");
-                    device::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            },
-        };
-        let why = session::run(&cfg, deck).await;
-        warn!("device lost: {why}; looking for a Stream Deck again");
-        device::sleep(Duration::from_secs(1)).await;
+        match device::Deck::open_first().await {
+            Ok(mut deck) => {
+                let why = session::run(&cfg, &mut deck).await;
+                warn!("device lost: {why}; looking for a Stream Deck again");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => {
+                warn!("{e:#}; retrying in 2s");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
     }
 }

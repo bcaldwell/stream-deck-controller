@@ -47,12 +47,11 @@ On the Pi, settings are in `/etc/sdc-client.env` (root-only, read by systemd). A
 | `SDC_CLIENT_ID` | Name the server knows this deck by (default: hostname). Pages are remembered per id |
 | `SDC_DEVICE` | Name of an `sdc.device` this deck should use (also `sdc-client --device <name>`). Unset: the server picks by deck model, see [Devices](configuration.md#devices) |
 | `SDC_BRIGHTNESS` | Fallback brightness (60); the `brightness` of the deck's `sdc.device` overrides it |
-| `SDC_OFFLINE_AFTER` | Seconds without a server connection before the deck shows its dimmed offline screen (1800). Until then it keeps the last images and a press flashes a red-barred "offline" on the key |
 | `SDC_USB_SUSPEND` | `false` disables USB suspend (see below) |
 | `SDC_NO_UPDATE` | Set to `1` to pin this build and ignore updates |
 | `RUST_LOG` | Log filter |
 
-Unplugging and replugging the deck, or restarting the server, is handled automatically.
+Unplugging and replugging the deck, or restarting the server, is handled automatically. While the server is unreachable the deck keeps showing its last images, and a key press flashes that key red.
 
 ## Power saving
 
@@ -63,9 +62,10 @@ Two layers keep a battery-powered Pi cheap to run, both driven by the `idle` set
 - **USB suspend**: when the screen has been off for about a second, the client closes the device so nothing holds
   it open. The udev rule (`50-streamdeck.rules`) sets `power/control=auto` and `autosuspend_delay_ms=2000`, so the
   kernel suspends the deck two seconds later. The images are kept. The client then only polls
-  `/sys/bus/usb/devices/*/power/runtime_status`, which does not wake the deck.
+  `/sys/bus/usb/devices/*/power/runtime_status` (every 100 ms), which does not wake the deck. The deck cannot
+  suspend while any process has it open, so closing it is required.
 
-A key press wakes the deck itself; the client reopens it, redraws anything that changed in the meantime and tells the
+A key press wakes the deck itself; the client notices within 100 ms, reopens it (about a millisecond), redraws anything that changed in the meantime and tells the
 server, which restores the brightness and restarts the idle timers. The press that woke the deck is not delivered as
 a key press, the same as for any dimmed deck.
 
@@ -87,7 +87,6 @@ refresh the udev rule or unit). Set `SDC_NO_UPDATE=1` to pin a build.
 The service runs as a dedicated `sdc` system user that owns `/var/lib/sdc-client`, with hardening
 (`ProtectSystem=strict`, `NoNewPrivileges`, `ProtectHome`).
 
-## Without hardware
+## Detecting decks
 
-`task run-fake-client` runs the client with no deck: frames are written to `tmp/fake/key-N.jpg` and you type
-`press 3` on stdin. `task list-devices` shows which decks are detected on the machine.
+`task list-devices` shows which decks are detected on the machine. Only decks that take JPEG key images (MK.2 and newer) are supported.

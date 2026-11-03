@@ -102,17 +102,6 @@ pub struct DeviceInfo {
     pub native: Option<NativeImage>,
 }
 
-/// Encoding of a deck's native key images (mirrors `elgato-streamdeck`'s `ImageMode`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NativeMode {
-    Jpeg,
-    Bmp,
-    /// Anything a newer peer sends that this one does not know.
-    #[serde(other)]
-    Other,
-}
-
 /// Mirroring a deck wants applied after rotation (mirrors `ImageMirroring`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -123,11 +112,10 @@ pub enum NativeMirror {
     Both,
 }
 
-/// The image format a deck takes on its keys: the upright image is rotated clockwise by
-/// `rotation` degrees, resized to `size`, mirrored, then encoded as `mode`.
+/// The JPEG format a deck takes on its keys: the upright image is rotated clockwise by
+/// `rotation` degrees, resized to `size`, mirrored, then encoded as JPEG.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeImage {
-    pub mode: NativeMode,
     pub size: (u32, u32),
     /// 0, 90, 180 or 270 degrees clockwise.
     pub rotation: u16,
@@ -135,12 +123,10 @@ pub struct NativeImage {
 }
 
 impl NativeImage {
-    /// Whether the server can produce these frames for a square `key_size_px` key: JPEG,
-    /// a size equal to the key size and a right-angle rotation.
+    /// Whether the server can produce these frames for a square `key_size_px` key: a size
+    /// equal to the key size and a right-angle rotation.
     pub fn server_can_produce(&self, key_size_px: u32) -> bool {
-        self.mode == NativeMode::Jpeg
-            && self.size == (key_size_px, key_size_px)
-            && matches!(self.rotation, 0 | 90 | 180 | 270)
+        self.size == (key_size_px, key_size_px) && matches!(self.rotation, 0 | 90 | 180 | 270)
     }
 }
 
@@ -188,7 +174,7 @@ pub enum ServerMessage {
         protocol_version: u32,
         /// Binary frames are device-ready JPEGs in the `DeviceInfo::native` format the client
         /// sent (rotated, mirrored, encoded once), to be written to the deck as they are.
-        /// Absent/false: upright JPEGs the client converts itself.
+        /// Absent/false: upright JPEGs (browser decks).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         native_frames: bool,
     },
@@ -385,27 +371,19 @@ mod tests {
             cols: 5,
             key_size_px: 72,
             native: Some(NativeImage {
-                mode: NativeMode::Jpeg,
                 size: (72, 72),
                 rotation: 180,
                 mirror: NativeMirror::None,
             }),
         };
         let j = serde_json::to_string(&d).unwrap();
-        assert!(
-            j.contains(r#""native":{"mode":"jpeg","size":[72,72],"rotation":180,"mirror":"none"}"#)
-        );
+        assert!(j.contains(r#""native":{"size":[72,72],"rotation":180,"mirror":"none"}"#));
         assert_eq!(serde_json::from_str::<DeviceInfo>(&j).unwrap(), d);
         let mut old = d.clone();
         old.native = None;
         assert!(!serde_json::to_string(&old).unwrap().contains("native"));
-        let unknown: NativeImage =
-            serde_json::from_str(r#"{"mode":"png","size":[1,1],"rotation":0,"mirror":"x"}"#)
-                .unwrap();
-        assert_eq!(unknown.mode, NativeMode::Other);
         assert!(d.native.unwrap().server_can_produce(72));
         assert!(!d.native.unwrap().server_can_produce(96));
-        assert!(!unknown.server_can_produce(1));
     }
 
     #[test]

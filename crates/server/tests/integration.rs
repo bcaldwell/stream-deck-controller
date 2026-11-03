@@ -1169,11 +1169,10 @@ async fn plugin_subscribe_render_dependencies_and_input() {
 
 #[tokio::test]
 async fn native_frames_are_rotated_once_and_confirmed() {
-    use sdc_protocol::{NativeImage, NativeMirror, NativeMode};
+    use sdc_protocol::{NativeImage, NativeMirror};
     let (ha_tx, _ha_rx) = mpsc::unbounded_channel();
     let (_engine, url, _dir) = start_server("native", ha_tx).await;
-    let fmt = |size, mode| NativeImage {
-        mode,
+    let fmt = |size| NativeImage {
         size: (size, size),
         rotation: 0,
         mirror: NativeMirror::Both, // MK.2
@@ -1186,7 +1185,7 @@ async fn native_frames_are_rotated_once_and_confirmed() {
 
     // MK.2-style client: confirmed, and every frame is the upright one rotated 180 degrees
     let mut dev = device();
-    dev.native = Some(fmt(72, NativeMode::Jpeg));
+    dev.native = Some(fmt(72));
     let (mut mk2, native_frames) = connect_with(&url, None, None, dev).await;
     assert!(native_frames);
     let native = initial_frames(&mut mk2).await;
@@ -1214,12 +1213,10 @@ async fn native_frames_are_rotated_once_and_confirmed() {
     }
     assert!(differing > 0);
 
-    // a format the server cannot produce (BMP, or a size that is not the key size) is declined
-    for bad in [fmt(72, NativeMode::Bmp), fmt(80, NativeMode::Jpeg)] {
-        let mut dev = device();
-        dev.native = Some(bad);
-        let (mut c, native_frames) = connect_with(&url, None, None, dev).await;
-        assert!(!native_frames);
-        initial_frames(&mut c).await;
-    }
+    // a size that is not the key size is declined
+    let mut dev = device();
+    dev.native = Some(fmt(80));
+    let (mut c, native_frames) = connect_with(&url, None, None, dev).await;
+    assert!(!native_frames);
+    initial_frames(&mut c).await;
 }

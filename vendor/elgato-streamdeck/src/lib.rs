@@ -133,6 +133,29 @@ impl StreamDeck {
     }
 }
 
+/// The process-wide HidApi used by [`StreamDeck::connect_path`]. Creating one enumerates every
+/// HID device, which takes over a second on a Raspberry Pi Zero (hidapi reads all sysfs
+/// attributes of the deck's parents, including the slow ones of the USB controller), so it is
+/// done once; opening a known path afterwards is instant.
+static SHARED_HIDAPI: std::sync::Mutex<Option<HidApi>> = std::sync::Mutex::new(None);
+
+impl StreamDeck {
+    /// Opens the hidraw node at `path` using the shared [`HidApi`].
+    pub fn connect_path(kind: Kind, path: &std::ffi::CStr) -> Result<StreamDeck, StreamDeckError> {
+        let mut shared = SHARED_HIDAPI.lock()?;
+        if shared.is_none() {
+            *shared = Some(HidApi::new()?);
+        }
+        let device = shared.as_ref().expect("just set").open_path(path)?;
+
+        Ok(StreamDeck {
+            kind,
+            device,
+            image_cache: RwLock::new(vec![]),
+        })
+    }
+}
+
 /// Instance methods of the struct
 impl StreamDeck {
     /// Returns kind of the Stream Deck

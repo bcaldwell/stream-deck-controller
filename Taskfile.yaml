@@ -42,11 +42,6 @@ tasks:
     cmds:
       - cargo run -p sdc-client -- {{.CLI_ARGS}}
 
-  run-fake-client:
-    desc: Run the client without hardware; images go to ./tmp/fake, type "press 3" on stdin
-    cmds:
-      - cargo run -p sdc-client -- --fake-device --fake-out tmp/fake {{.CLI_ARGS}}
-
   list-devices:
     desc: List attached Stream Decks
     cmds:

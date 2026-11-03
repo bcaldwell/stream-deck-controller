@@ -1,6 +1,6 @@
 //! Self-update: download the client binary the server offers and replace the running one.
 //!
-//! On `ServerMessage::Update` the session calls [`apply`], which downloads over HTTP from the
+//! On `ServerMessage::Update` the link calls [`apply`], which downloads over HTTP from the
 //! same host:port as the WebSocket, checks the sha256, and atomically renames the new file
 //! over the current executable. The process then exits and the service manager (systemd
 //! `Restart=always`) starts the new version; a clean exit 0 is used so it is not a failure.
