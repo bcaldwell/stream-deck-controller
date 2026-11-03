@@ -17,6 +17,14 @@ export type ExportSettings = { export?: string };
 /** How long the property inspector's dropdown waits for the server's list. */
 const EXPORTS_WAIT_MS = 4_000;
 
+/** Sends the exports of `kind` to the open property inspector's dropdown. */
+export async function sendExports(hub: Hub, kind: SlotKind): Promise<void> {
+	const items = hub.exports
+		.filter((e) => e.kind === kind)
+		.map((e) => ({ label: e.label ? `${e.label} (${e.id})` : e.id, value: e.id }));
+	await streamDeck.ui.sendToPropertyInspector({ event: "getExports", items });
+}
+
 /** Subscribes the action instance to its chosen export and unsubscribes when it goes away. */
 export abstract class ExportAction<
 	A extends KeyAction<ExportSettings> | DialAction<ExportSettings>,
@@ -47,11 +55,8 @@ export abstract class ExportAction<
 
 	/** The property inspector's dropdown (`datasource="getExports"`) asks for the exports of our kind. */
 	override async onSendToPlugin(): Promise<void> {
-		const exports = await this.hub.waitForExports(EXPORTS_WAIT_MS);
-		const items = exports
-			.filter((e) => e.kind === this.#kind)
-			.map((e) => ({ label: e.label ? `${e.label} (${e.id})` : e.id, value: e.id }));
-		await streamDeck.ui.sendToPropertyInspector({ event: "getExports", items });
+		await this.hub.waitForExports(EXPORTS_WAIT_MS);
+		await sendExports(this.hub, this.#kind);
 	}
 
 	#attach(action: WillAppearEvent<ExportSettings>["action"], settings: ExportSettings): void {

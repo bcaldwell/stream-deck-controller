@@ -80,17 +80,3 @@ Layout: `src/hub.ts` the single websocket (reconnect, subscriptions, tick batchi
 (mirror of `crates/protocol`), `ca.bcaldwell.sdc.sdPlugin/` manifest, property inspector pages (`ui/`, built on
 the sdpi-components script from Elgato's CDN, like Elgato's own template) and icons (`scripts/gen-icons.py`
 regenerates them, stdlib only).
-
-### Headless smoke test
-
-The Stream Deck app is not needed to check the connection code against a real server:
-
-```sh
-docker run --rm -p 7700:7700 -e SDC_CLIENT_TOKEN=test \
-  -v "$PWD/scripts/smoke-config.lua:/config/config.lua:ro" -v "$PWD/../../icons:/config/icons:ro" \
-  stream-deck-controller:dev                      # task docker builds the image
-node scripts/smoke.mjs ws://127.0.0.1:7700/plugin/ws test    # node >= 22.18
-```
-It subscribes a key and a dial through `Hub`, prints the exports, the dial feedback and the slot error of an
-unknown export, writes the key PNG (and the dial icon) to `$TMPDIR`, and checks that three quick dial ticks reach
-the server as one `rotate(ctx, 3)`.

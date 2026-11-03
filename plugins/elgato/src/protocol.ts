@@ -1,5 +1,4 @@
-// The /plugin/ws messages, mirroring crates/protocol/src/lib.rs. Types only (erased at build
-// time) so that hub.ts can run unbundled under node's type stripping in scripts/smoke.mjs.
+// The /plugin/ws messages, mirroring crates/protocol/src/lib.rs.
 
 export const PROTOCOL_VERSION = 1;
 

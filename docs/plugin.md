@@ -25,6 +25,6 @@ indicator bar and icon).
 Only exported things are visible to the plugin. The token is stored in the Stream Deck app's preferences as plain
 text, so treat the laptop accordingly.
 
-Installation details, building the plugin and a headless smoke test are in
+Installation details and building the plugin are in
 [plugins/elgato/README.md](../plugins/elgato/README.md); the wire protocol is in
 [crates/server/README.md](../crates/server/README.md#plugin-websocket-pluginws).

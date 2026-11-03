@@ -7,8 +7,7 @@
     "watch": "rollup -c -w --watch.onEnd=\"streamdeck restart ca.bcaldwell.sdc\"",
     "typecheck": "tsc --noEmit",
     "pack": "npm run build && streamdeck validate ca.bcaldwell.sdc.sdPlugin && streamdeck pack ca.bcaldwell.sdc.sdPlugin --output . --force",
-    "link": "streamdeck link ca.bcaldwell.sdc.sdPlugin",
-    "smoke": "node scripts/smoke.mjs"
+    "link": "streamdeck link ca.bcaldwell.sdc.sdPlugin"
   },
   "dependencies": {
     "@elgato/streamdeck": "^3.0.4",

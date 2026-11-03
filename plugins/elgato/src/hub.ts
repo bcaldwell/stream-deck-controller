@@ -1,7 +1,7 @@
 // The plugin's single websocket to the server: reconnects with backoff, remembers what every
-// visible action subscribed and re-subscribes after a reconnect. Knows nothing about Stream Deck
-// (only `ws`), so scripts/smoke.mjs can drive it directly.
+// visible action subscribed and re-subscribes after a reconnect.
 
+import streamDeck from "@elgato/streamdeck";
 import WebSocket from "ws";
 
 import {
@@ -48,15 +48,10 @@ export interface SlotHandler {
 	error?(message: string): void;
 }
 
-export interface Logger {
-	info(...args: unknown[]): void;
-	warn(...args: unknown[]): void;
-	error(...args: unknown[]): void;
-}
-
 export class Hub {
-	#log: Logger;
 	#clientId: string;
+	/** Called whenever the server sends an export list. */
+	onExports: (() => void) | undefined;
 	#url = "";
 	#token = "";
 	#ws: WebSocket | undefined;
@@ -72,8 +67,7 @@ export class Hub {
 	#pendingTicks = new Map<string, number>();
 	#rotateTimer: ReturnType<typeof setTimeout> | undefined;
 
-	constructor(log: Logger, clientId: string) {
-		this.#log = log;
+	constructor(clientId: string) {
 		this.#clientId = clientId;
 	}
 
@@ -126,6 +120,10 @@ export class Hub {
 		return true;
 	}
 
+	get exports(): readonly ExportItem[] {
+		return this.#exports;
+	}
+
 	/** The server's export list: waits up to `timeoutMs` for the first one, empty if it never came. */
 	async waitForExports(timeoutMs: number): Promise<readonly ExportItem[]> {
 		await Promise.race([this.#exportsReady, new Promise((resolve) => setTimeout(resolve, timeoutMs))]);
@@ -149,12 +147,12 @@ export class Hub {
 		try {
 			ws = new WebSocket(this.#url, { headers, handshakeTimeout: 10_000 });
 		} catch (e) {
-			this.#log.error(`cannot connect to ${this.#url}: ${e}`);
+			streamDeck.logger.error(`cannot connect to ${this.#url}: ${e}`);
 			this.#scheduleRetry();
 			return;
 		}
 		this.#ws = ws;
-		this.#log.info(`connecting to ${this.#url}`);
+		streamDeck.logger.info(`connecting to ${this.#url}`);
 		ws.on("open", () => {
 			this.#alive = true;
 			ws.send(
@@ -164,19 +162,19 @@ export class Hub {
 		ws.on("message", (data) => this.#onMessage(JSON.parse(data.toString()) as ServerMessage));
 		ws.on("pong", () => (this.#alive = true));
 		ws.on("unexpected-response", (_req, res) => {
-			this.#log.warn(`server refused the connection: HTTP ${res.statusCode} (check the token)`);
+			streamDeck.logger.warn(`server refused the connection: HTTP ${res.statusCode} (check the token)`);
 			res.resume();
 		});
-		ws.on("error", (e) => this.#log.warn(`websocket error: ${e.message}`));
+		ws.on("error", (e) => streamDeck.logger.warn(`websocket error: ${e.message}`));
 		ws.on("close", () => {
 			if (this.#ws !== ws) return; // replaced by reconnect()
-			this.#log.info("disconnected");
+			streamDeck.logger.info("disconnected");
 			this.#down();
 			this.#scheduleRetry();
 		});
 		this.#heartbeat = setInterval(() => {
 			if (!this.#alive) {
-				this.#log.warn("no answer to ping, dropping the connection");
+				streamDeck.logger.warn("no answer to ping, dropping the connection");
 				ws.terminate();
 				return;
 			}
@@ -202,12 +200,13 @@ export class Hub {
 			case "plugin_welcome":
 				this.#online = true;
 				this.#backoff = MIN_BACKOFF_MS;
-				this.#log.info("connected");
+				streamDeck.logger.info("connected");
 				for (const { sub } of this.#slots.values()) this.send(sub);
 				break;
 			case "exports":
 				this.#exports = msg.items;
 				this.#gotExports();
+				this.onExports?.();
 				break;
 			case "key_image":
 				this.#slots.get(msg.slot)?.handler.keyImage?.(msg.png_base64);
@@ -219,7 +218,7 @@ export class Hub {
 				this.#slots.get(msg.slot)?.handler.error?.(msg.message);
 				break;
 			case "error":
-				this.#log.error(`server error: ${msg.message}`);
+				streamDeck.logger.error(`server error: ${msg.message}`);
 				break;
 		}
 	}
